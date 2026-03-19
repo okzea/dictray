@@ -23,6 +23,38 @@ function withTimeout(timeoutMs, parentSignal = null) {
   }
 }
 
+function normalizeThinkOption(value) {
+  if (typeof value === 'boolean') {
+    return value
+  }
+
+  const normalized = String(value || '').trim().toLowerCase()
+  if (!normalized || normalized === 'default' || normalized === 'auto') {
+    return undefined
+  }
+  if (['1', 'true', 'on', 'yes', 'enable', 'enabled'].includes(normalized)) {
+    return true
+  }
+  if (['0', 'false', 'off', 'no', 'disable', 'disabled'].includes(normalized)) {
+    return false
+  }
+  return undefined
+}
+
+function buildRequestBody(body = {}, config = {}) {
+  const requestBody = {
+    ...body,
+    keep_alive: body?.keep_alive ?? config.keepAlive
+  }
+  const think = normalizeThinkOption(body?.think ?? config.think)
+  if (think === undefined) {
+    delete requestBody.think
+  } else {
+    requestBody.think = think
+  }
+  return requestBody
+}
+
 export class OllamaClient {
   constructor(config) {
     this.config = config
@@ -54,10 +86,7 @@ export class OllamaClient {
   async requestChat(body, options = {}) {
     const timeout = withTimeout(this.config.timeoutMs, options?.signal || null)
     try {
-      const requestBody = {
-        ...body,
-        keep_alive: body?.keep_alive ?? this.config.keepAlive
-      }
+      const requestBody = buildRequestBody(body, this.config)
       const response = await fetch(`${this.config.baseUrl}/api/chat`, {
         method: 'POST',
         headers: {
@@ -79,10 +108,7 @@ export class OllamaClient {
   async requestGenerate(body, options = {}) {
     const timeout = withTimeout(this.config.timeoutMs, options?.signal || null)
     try {
-      const requestBody = {
-        ...body,
-        keep_alive: body?.keep_alive ?? this.config.keepAlive
-      }
+      const requestBody = buildRequestBody(body, this.config)
       const response = await fetch(`${this.config.baseUrl}/api/generate`, {
         method: 'POST',
         headers: {
@@ -105,7 +131,7 @@ export class OllamaClient {
     return this.requestGenerate({
       model: modelName,
       prompt: '',
-      think: false,
+      think: options?.think ?? this.config.think,
       stream: false
     }, options)
   }

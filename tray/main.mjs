@@ -680,6 +680,10 @@ function rewriteStatusLabel() {
   return currentRewriteModel || rewriteProviderLabel()
 }
 
+function rewriteThinkSetting() {
+  return String(currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'default').trim() || 'default'
+}
+
 function rebuildMenu() {
   if (!tray) {
     return
@@ -1084,10 +1088,25 @@ async function startDockerStt({ notify = false, build = false, waitForHealthy = 
       showNotification(APP_NAME, build ? 'Starting and building the managed STT service.' : 'Starting the managed STT service.')
     }
     const result = await speech.startLocalService({ build })
+    let sttHealth = null
     if (waitForHealthy) {
-      await waitForSttHealthy().catch(() => null)
+      sttHealth = await waitForSttHealthy().catch(() => null)
     }
     await refreshRuntimeState(false)
+    if (waitForHealthy && !sttHealth?.ok) {
+      const message = compactText(
+        sttHealth?.error || latestHealth.stt?.error || 'Managed STT service did not become healthy in time.',
+        180
+      )
+      if (notify) {
+        showNotification(APP_NAME, `Managed STT service failed to become healthy: ${message}`)
+      }
+      return {
+        ...result,
+        ok: false,
+        error: message
+      }
+    }
     void scheduleSttWarmup({ waitForHealthy: true, notifyReady: notify }).catch(() => {})
     if (notify) {
       showNotification(APP_NAME, 'Managed STT service is up.')
@@ -1656,7 +1675,7 @@ async function rewriteTranscript(transcript, windowContext, options = {}) {
   const payload = await rewriteProvider.requestChat({
     model: currentRewriteModel || runtimeConfig.rewrite.ollama.model,
     stream: false,
-    think: false,
+    think: rewriteThinkSetting(),
     messages: [
       {
         role: 'system',

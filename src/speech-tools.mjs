@@ -363,7 +363,7 @@ export class SpeechTools {
           [
             `command -v ${escapeShellArg(stt.wsl.pythonBin)} >/dev/null`,
             `command -v ${escapeShellArg(stt.wsl.ffmpegBin)} >/dev/null`,
-            `test -x ${escapeShellArg(stt.wsl.transcribeScript)}`,
+            `test -f ${escapeShellArg(stt.wsl.transcribeScript)}`,
             'printf ok'
           ].join(' && ')
         ],
