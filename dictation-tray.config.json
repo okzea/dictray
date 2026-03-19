@@ -3,20 +3,16 @@
     "stateDir": "./local/state"
   },
   "stt": {
-    "provider": "local-http",
+    "provider": "local",
     "enabled": true,
     "timeoutMs": 120000,
     "keepWarmIntervalMs": 900000,
-    "http": {
-      "baseUrl": "http://127.0.0.1:4591",
-      "path": "/transcribe",
-      "healthPath": "/health",
-      "timeoutMs": 120000
-    },
-    "docker": {
-      "enabled": true,
-      "autoStart": true,
-      "composeFile": "./docker-compose.stt.yml"
+    "local": {
+      "pythonBin": "python",
+      "transcribeScript": "./scripts/faster_whisper_cli.py",
+      "model": "base.en",
+      "device": "auto",
+      "computeType": "auto"
     }
   },
   "rewrite": {

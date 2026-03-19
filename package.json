@@ -8,13 +8,11 @@
     "node": ">=20.0.0"
   },
   "scripts": {
+    "icon:export": "electron scripts/export-icon.mjs assets/app-icon.svg assets/app-icon.png assets/app-icon.ico",
     "start": "node scripts/start.mjs",
     "tray": "electron tray/main.mjs",
     "tray:dev": "electronmon tray/main.mjs",
-    "stt:docker:up": "docker compose -f docker-compose.stt.yml up -d --build",
-    "stt:docker:down": "docker compose -f docker-compose.stt.yml down",
-    "stt:docker:logs": "docker compose -f docker-compose.stt.yml logs -f",
-    "check": "node --check src/config.mjs && node --check src/docker-stt.mjs && node --check src/ollama-client.mjs && node --check src/rewrite-provider.mjs && node --check src/speech-lexicon.mjs && node --check src/speech-tools.mjs && node --check src/stt-provider.mjs && node --check src/system-volume.mjs && node --check src/ui-automation.mjs && node --check scripts/start.mjs && node --check tray/main.mjs && node --check tray/preload.mjs && node --check tray/voice-renderer.mjs",
+    "check": "node --check src/config.mjs && node --check src/ollama-client.mjs && node --check src/rewrite-provider.mjs && node --check src/speech-lexicon.mjs && node --check src/speech-tools.mjs && node --check src/stt-provider.mjs && node --check src/system-volume.mjs && node --check src/ui-automation.mjs && node --check scripts/export-icon.mjs && node --check scripts/start.mjs && node --check tray/main.mjs && node --check tray/onboarding-preload.mjs && node --check tray/onboarding-renderer.mjs && node --check tray/preload.mjs && node --check tray/voice-renderer.mjs",
     "build:helpers": "dotnet build scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj -c Release && dotnet build scripts/windows-ui-automation/WindowsUiAutomation.csproj -c Release && dotnet build scripts/windows-system-volume/WindowsSystemVolume.csproj -c Release"
   },
   "devDependencies": {

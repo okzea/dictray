@@ -7,13 +7,16 @@ const DEFAULTS = {
   },
   stt: {
     enabled: true,
-    provider: 'local-http',
+    provider: 'local',
     timeoutMs: 120000,
     keepWarmIntervalMs: 900000,
     local: {
       pythonBin: 'python',
       ffmpegBin: 'ffmpeg',
-      transcribeScript: '$HOME/.openclaw/tools/faster_whisper_cli.py'
+      transcribeScript: './scripts/faster_whisper_cli.py',
+      model: 'base.en',
+      device: 'auto',
+      computeType: 'auto'
     },
     wsl: {
       wslBin: 'wsl.exe',
@@ -26,11 +29,6 @@ const DEFAULTS = {
       path: '/transcribe',
       healthPath: '/health',
       timeoutMs: 120000
-    },
-    docker: {
-      enabled: true,
-      autoStart: true,
-      composeFile: './docker-compose.stt.yml'
     }
   },
   rewrite: {
@@ -110,7 +108,7 @@ export function normalizeSttProviderId(value) {
     case 'http':
     case 'local-http':
     case 'local_http':
-      return 'local-http'
+      return 'local'
     case 'local':
       return 'local'
     case 'wsl':
@@ -138,8 +136,7 @@ export function normalizeRewriteProviderId(value) {
 }
 
 export function legacySttProviderId(providerId) {
-  const normalized = normalizeSttProviderId(providerId)
-  return normalized === 'local-http' ? 'http' : normalized
+  return normalizeSttProviderId(providerId)
 }
 
 function normalizeOllamaConfig(input = {}, fallback = DEFAULTS.rewrite.ollama) {
@@ -178,7 +175,10 @@ export async function loadConfig(configPathArg) {
     local: {
       pythonBin: String(parsedStt?.local?.pythonBin || parsedLegacyStt?.local?.pythonBin || DEFAULTS.stt.local.pythonBin),
       ffmpegBin: String(parsedStt?.local?.ffmpegBin || parsedLegacyStt?.local?.ffmpegBin || DEFAULTS.stt.local.ffmpegBin),
-      transcribeScript: String(parsedStt?.local?.transcribeScript || parsedLegacyStt?.local?.transcribeScript || DEFAULTS.stt.local.transcribeScript)
+      transcribeScript: resolvePathLike(rootDir, parsedStt?.local?.transcribeScript || parsedLegacyStt?.local?.transcribeScript || DEFAULTS.stt.local.transcribeScript),
+      model: String(parsedStt?.local?.model || parsedLegacyStt?.local?.model || DEFAULTS.stt.local.model).trim() || DEFAULTS.stt.local.model,
+      device: String(parsedStt?.local?.device || parsedLegacyStt?.local?.device || DEFAULTS.stt.local.device).trim() || DEFAULTS.stt.local.device,
+      computeType: String(parsedStt?.local?.computeType || parsedLegacyStt?.local?.computeType || DEFAULTS.stt.local.computeType).trim() || DEFAULTS.stt.local.computeType
     },
     wsl: {
       wslBin: String(parsedStt?.wsl?.wslBin || parsedLegacyStt?.wsl?.wslBin || DEFAULTS.stt.wsl.wslBin),
@@ -186,18 +186,7 @@ export async function loadConfig(configPathArg) {
       ffmpegBin: String(parsedStt?.wsl?.ffmpegBin || parsedLegacyStt?.wsl?.ffmpegBin || DEFAULTS.stt.wsl.ffmpegBin),
       transcribeScript: String(parsedStt?.wsl?.transcribeScript || parsedLegacyStt?.wsl?.transcribeScript || DEFAULTS.stt.wsl.transcribeScript)
     },
-    http: mergeHttpProvider(parsedStt?.http || parsedLegacyStt?.http, DEFAULTS.stt.http),
-    docker: {
-      enabled: parsedStt?.docker?.enabled !== undefined
-        ? Boolean(parsedStt.docker.enabled)
-        : DEFAULTS.stt.docker.enabled,
-      autoStart: parsedStt?.docker?.autoStart !== undefined
-        ? Boolean(parsedStt.docker.autoStart)
-        : parsed?.docker?.autoStartStt !== undefined
-          ? Boolean(parsed.docker.autoStartStt)
-          : DEFAULTS.stt.docker.autoStart,
-      composeFile: resolvePathLike(rootDir, parsedStt?.docker?.composeFile || parsed?.docker?.composeFile || DEFAULTS.stt.docker.composeFile)
-    }
+    http: mergeHttpProvider(parsedStt?.http || parsedLegacyStt?.http, DEFAULTS.stt.http)
   }
 
   const rewriteProvider = normalizeRewriteProviderId(parsedRewrite?.provider ?? (parsed?.ollama ? 'ollama' : DEFAULTS.rewrite.provider))
@@ -225,10 +214,6 @@ export async function loadConfig(configPathArg) {
         wsl: stt.wsl,
         http: stt.http
       }
-    },
-    docker: {
-      autoStartStt: stt.docker.enabled && stt.docker.autoStart,
-      composeFile: stt.docker.composeFile
     },
     ollama: rewrite.ollama,
     dictation: {

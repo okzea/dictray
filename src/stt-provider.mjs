@@ -1,10 +1,8 @@
-import { DockerSttManager } from './docker-stt.mjs'
 import { legacySttProviderId, normalizeSttProviderId } from './config.mjs'
 import { SpeechTools } from './speech-tools.mjs'
 
 const PROVIDER_LABELS = {
-  'local-http': 'Local HTTP',
-  local: 'Local CLI',
+  local: 'Local',
   wsl: 'WSL'
 }
 
@@ -29,24 +27,18 @@ export class SttProvider {
       }
     }
     this.tools = new SpeechTools(this.config, stateDir)
-    this.localServiceManager = this.supportsLocalServiceControl()
-      ? new DockerSttManager({
-          rootDir: config?.rootDir,
-          composeFile: config?.docker?.composeFile
-        })
-      : null
   }
 
   supportsRuntimePreferences() {
-    return this.id === 'local-http'
+    return false
   }
 
   supportsLocalServiceControl() {
-    return this.id === 'local-http' && Boolean(this.settings?.docker?.enabled && this.settings?.docker?.composeFile)
+    return false
   }
 
   autoStartLocalServiceEnabled() {
-    return this.supportsLocalServiceControl() && Boolean(this.settings?.docker?.autoStart)
+    return false
   }
 
   async checkHealth() {
@@ -83,6 +75,10 @@ export class SttProvider {
     }
   }
 
+  getSttRuntime() {
+    return this.getRuntime()
+  }
+
   async updateRuntime(input = {}) {
     const runtime = await this.tools.updateSttRuntime(input)
     return {
@@ -90,6 +86,10 @@ export class SttProvider {
       provider: this.id,
       providerId: this.id
     }
+  }
+
+  updateSttRuntime(input = {}) {
+    return this.updateRuntime(input)
   }
 
   async waitForHealthy(timeoutMs = 45000, intervalMs = 1500) {
@@ -105,25 +105,19 @@ export class SttProvider {
   }
 
   async startLocalService({ build = false } = {}) {
-    if (!this.localServiceManager) {
-      return {
-        ok: false,
-        skipped: true,
-        reason: 'unsupported_local_service'
-      }
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'unsupported_local_service'
     }
-    return this.localServiceManager.up({ build })
   }
 
   async stopLocalService() {
-    if (!this.localServiceManager) {
-      return {
-        ok: false,
-        skipped: true,
-        reason: 'unsupported_local_service'
-      }
+    return {
+      ok: false,
+      skipped: true,
+      reason: 'unsupported_local_service'
     }
-    return this.localServiceManager.down()
   }
 }
 
@@ -193,6 +187,10 @@ class UnsupportedSttProvider {
     }
   }
 
+  getSttRuntime() {
+    return this.getRuntime()
+  }
+
   async updateRuntime() {
     return {
       ok: false,
@@ -201,6 +199,10 @@ class UnsupportedSttProvider {
       providerId: this.id,
       error: `Unsupported STT provider: ${this.id}`
     }
+  }
+
+  updateSttRuntime(input = {}) {
+    return this.updateRuntime(input)
   }
 
   async waitForHealthy() {
@@ -226,7 +228,7 @@ class UnsupportedSttProvider {
 
 export function createSttProvider(config, stateDir) {
   const providerId = normalizeSttProviderId(config?.provider)
-  if (providerId === 'local-http' || providerId === 'local' || providerId === 'wsl') {
+  if (providerId === 'local' || providerId === 'wsl') {
     return new SttProvider(config, stateDir)
   }
   return new UnsupportedSttProvider(config)

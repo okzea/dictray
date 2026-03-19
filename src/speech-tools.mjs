@@ -337,12 +337,31 @@ export class SpeechTools {
     if (stt.provider === 'local') {
       try {
         await access(expandHome(stt.local.transcribeScript))
-        await execFileAsync(expandHome(stt.local.ffmpegBin), ['-version'], { timeout: 1500 })
-        await execFileAsync(expandHome(stt.local.pythonBin), ['-c', 'import faster_whisper'], { timeout: 4000 })
+        const { stdout, stderr } = await execFileAsync(
+          expandHome(stt.local.pythonBin),
+          [
+            expandHome(stt.local.transcribeScript),
+            '--health',
+            '--model',
+            String(stt.local.model || '').trim() || 'base.en',
+            '--device',
+            String(stt.local.device || '').trim() || 'auto',
+            '--compute-type',
+            String(stt.local.computeType || '').trim() || 'auto'
+          ],
+          {
+            timeout: 4000,
+            maxBuffer: 1024 * 1024
+          }
+        )
+        const payload = JSON.parse(String(stdout || stderr || '{}'))
         return {
-          ok: true,
+          ok: Boolean(payload.ok),
           provider: 'local',
-          pythonBin: stt.local.pythonBin
+          pythonBin: stt.local.pythonBin,
+          model: String(payload.model || stt.local.model || '').trim(),
+          device: String(payload.device || stt.local.device || '').trim(),
+          computeType: String(payload.computeType || stt.local.computeType || '').trim()
         }
       } catch (error) {
         return {
@@ -594,17 +613,20 @@ export class SpeechTools {
 
   async transcribeViaLocal(rawPath, wavPath, started) {
     const stt = this.config.stt.local
-    const normalizeStarted = performance.now()
     try {
-      await execFileAsync(
-        expandHome(stt.ffmpegBin),
-        ['-v', 'error', '-y', '-i', rawPath, '-ac', '1', '-ar', '16000', wavPath],
-        { timeout: 30000 }
-      )
       const transcribeStarted = performance.now()
       const { stdout, stderr } = await execFileAsync(
         expandHome(stt.pythonBin),
-        [expandHome(stt.transcribeScript), wavPath],
+        [
+          expandHome(stt.transcribeScript),
+          rawPath,
+          '--model',
+          String(stt.model || '').trim() || 'base.en',
+          '--device',
+          String(stt.device || '').trim() || 'auto',
+          '--compute-type',
+          String(stt.computeType || '').trim() || 'auto'
+        ],
         {
           timeout: 120000,
           maxBuffer: 1024 * 1024
@@ -615,7 +637,7 @@ export class SpeechTools {
         transcript: String(payload.transcript || '').trim(),
         language: String(payload.language || 'en'),
         timingsMs: {
-          normalize: nowMs(normalizeStarted),
+          normalize: 0,
           transcribe: nowMs(transcribeStarted),
           total: nowMs(started)
         }

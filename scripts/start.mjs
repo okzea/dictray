@@ -16,19 +16,6 @@ function runtimeHelperRoot() {
   return path.join(rootDir, '.runtime-helpers', `${Date.now()}-${process.pid}`)
 }
 
-function providerUsesHttpStt(config) {
-  return String(config?.stt?.provider || '').trim().toLowerCase() === 'local-http'
-}
-
-function dockerAutoStartEnabled(config) {
-  return providerUsesHttpStt(config) && Boolean(config?.stt?.docker?.enabled && config?.stt?.docker?.autoStart)
-}
-
-function isPortAllocatedError(error) {
-  const message = String(error?.message || error || '')
-  return /port is already allocated|bind .* failed/i.test(message)
-}
-
 function run(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -47,62 +34,6 @@ function run(command, args, options = {}) {
       reject(new Error(`${command} ${args.join(' ')} exited with code ${code ?? 1}`))
     })
   })
-}
-
-async function waitForSttHealthy(speech, timeoutMs = 60000) {
-  const startedAt = Date.now()
-  while ((Date.now() - startedAt) < timeoutMs) {
-    const health = await speech.checkSttHealth().catch(() => null)
-    if (health?.ok) {
-      return health
-    }
-    await new Promise((resolve) => setTimeout(resolve, 1500))
-  }
-  return null
-}
-
-async function ensureHttpSttReady(sttProvider, config) {
-  const baseUrl = String(config?.stt?.http?.baseUrl || '').trim()
-
-  log('Checking STT health.')
-  const existingHealth = await sttProvider.checkSttHealth().catch(() => null)
-  if (existingHealth?.ok) {
-    log(`Reusing existing STT service${baseUrl ? ` at ${baseUrl}` : ''}.`)
-    return {
-      started: false
-    }
-  }
-
-  log('Starting managed STT service.')
-
-  try {
-    await sttProvider.startLocalService({ build: false })
-  } catch (error) {
-    if (!isPortAllocatedError(error)) {
-      throw error
-    }
-
-    const conflictedHealth = await sttProvider.checkSttHealth().catch(() => null)
-    if (!conflictedHealth?.ok) {
-      throw error
-    }
-
-    log(`Port is already busy, but STT is healthy${baseUrl ? ` at ${baseUrl}` : ''}. Reusing it.`)
-    return {
-      started: false
-    }
-  }
-
-  log('Waiting for STT health.')
-  const health = await waitForSttHealthy(sttProvider)
-  if (!health?.ok) {
-    throw new Error('Managed STT service did not become healthy in time.')
-  }
-
-  log(`STT is ready${baseUrl ? ` at ${baseUrl}` : ''}.`)
-  return {
-    started: true
-  }
 }
 
 async function warmSttRuntime(sttProvider) {
@@ -198,11 +129,6 @@ async function main() {
   log('Building Windows system volume helper.')
   await buildDotnetHelper('scripts/windows-system-volume/WindowsSystemVolume.csproj', volumeHelperDir, childEnv)
 
-  let dockerStartedByStartScript = false
-  if (dockerAutoStartEnabled(config)) {
-    const dockerStatus = await ensureHttpSttReady(sttProvider, config)
-    dockerStartedByStartScript = Boolean(dockerStatus?.started)
-  }
   await warmSttRuntime(sttProvider)
 
   const electronBin = await ensureElectronRuntime(childEnv)
@@ -212,8 +138,7 @@ async function main() {
       ...childEnv,
       DICTATION_TRAY_HOTKEY_HELPER: hotkeyHelperPath,
       DICTATION_TRAY_UI_AUTOMATION_HELPER: uiAutomationHelperPath,
-      DICTATION_TRAY_VOLUME_HELPER: volumeHelperPath,
-      DICTATION_TRAY_STARTED_DOCKER: dockerStartedByStartScript ? '1' : ''
+      DICTATION_TRAY_VOLUME_HELPER: volumeHelperPath
     }
   })
 }

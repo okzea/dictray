@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -24,11 +25,29 @@ import { SystemVolumeBridge } from '../src/system-volume.mjs'
 import { UiAutomationBridge } from '../src/ui-automation.mjs'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+if (process.platform === 'win32') {
+  app.setAppUserModelId('com.okzea.dictray')
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const APP_NAME = 'DicTray'
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
-const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5]
+const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+const APP_ICON_SVG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.svg')
+const APP_ICON_PNG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.png')
+const APP_ICON_ICO_PATH = path.join(__dirname, '..', 'assets', 'app-icon.ico')
+const TRAY_ICON_PALETTES = {
+  ready: {
+    primary: '#2fcb74',
+    accent: '#84efb1',
+    depth: '#18784e'
+  },
+  hot: {
+    primary: '#ff5d5d',
+    accent: '#ff9b9b',
+    depth: '#b42323'
+  }
+}
 const HOTKEY_PRESETS = [
   { value: 'CommandOrControl+Space', label: 'Ctrl+Space' },
   { value: 'Alt+Space', label: 'Alt+Space' },
@@ -37,7 +56,6 @@ const HOTKEY_PRESETS = [
   { value: 'CommandOrControl+Alt+O', label: 'Ctrl+Alt+O' }
 ]
 const HOTKEY_BRIDGE = String(process.env.DICTATION_TRAY_HOTKEY_HELPER || '').trim() || path.join(__dirname, '..', 'scripts', 'windows-hotkey-hook', 'bin', 'Release', 'net10.0-windows', 'WindowsHotkeyHook.exe')
-const STOP_DOCKER_ON_QUIT = String(process.env.DICTATION_TRAY_STARTED_DOCKER || '').trim() === '1'
 const ALLOWED_PERMISSIONS = new Set(['media', 'microphone'])
 const STT_DEVICE_CPU = 'cpu'
 const STT_DEVICE_GPU = 'gpu'
@@ -45,6 +63,7 @@ const STT_MODEL_TINY = 'tiny'
 const STT_MODEL_MIDDLE = 'middle'
 const STT_MODEL_ADVANCED = 'advanced'
 const DAILY_CHARACTER_STATS_RETENTION_DAYS = 7
+const ONBOARDING_SAMPLE_TEXT = 'hello, my name is Denim.'
 
 let runtimeConfig = null
 let speech = null
@@ -53,18 +72,18 @@ let systemVolume = null
 let uiAutomation = null
 let stateDir = ''
 let traySettingsPath = ''
-let speechPreferencesPath = ''
 let rewritePreferencesPath = ''
 let dailyCharacterStatsPath = ''
+let onboardingStatePath = ''
 let tray = null
 let voiceWindow = null
-let trayIcon = null
+let onboardingWindow = null
+let trayIcons = new Map()
 let windowIcon = null
 let hotkeyBridge = null
 let refreshTimer = null
 let sttKeepWarmTimer = null
 let isQuitting = false
-let isStoppingDockerForQuit = false
 let isRestoringVolumeForQuit = false
 let trayHotkey = DEFAULT_HOTKEY
 let rewriteEnabled = true
@@ -79,13 +98,8 @@ let latestHealth = {
   automation: null
 }
 let sttPreferences = {
-  selectedDevice: '',
-  selectedModel: '',
   currentDevice: '',
   currentModel: '',
-  options: [],
-  modelOptions: [],
-  supported: false,
   provider: '',
   error: ''
 }
@@ -100,7 +114,6 @@ let voiceState = {
 let activeTurnContext = null
 let activeSubmission = null
 let nextSubmissionId = 0
-let sttDockerStartAttempted = false
 let sttWarmupInFlight = null
 let sttReadyForDictation = false
 let sttReadyNotificationAttached = false
@@ -109,6 +122,26 @@ let sttKeepWarmInFlight = false
 let volumeDuckState = null
 let dailyCharacterStats = {
   days: {}
+}
+let onboardingState = {
+  version: 1,
+  seenAt: '',
+  completedAt: '',
+  profile: {
+    name: ''
+  },
+  choices: {
+    localStt: true,
+    externalProviders: false,
+    rewriteCleanup: true
+  },
+  typingBenchmark: {
+    sampleText: ONBOARDING_SAMPLE_TEXT,
+    elapsedMs: 0,
+    charactersPerMinute: 0,
+    wordsPerMinute: 0,
+    measuredAt: ''
+  }
 }
 
 const singleInstance = app.requestSingleInstanceLock()
@@ -198,32 +231,6 @@ function runtimeSttDevicePreference(value) {
   return normalizeSttDevicePreference(value) || STT_DEVICE_CPU
 }
 
-function runtimeSttDeviceOptions(values) {
-  const options = Array.isArray(values)
-    ? values
-      .map((value) => runtimeSttDevicePreference(value))
-      .filter(Boolean)
-    : []
-  return options.length ? [...new Set(options)] : [STT_DEVICE_CPU]
-}
-
-function sttModelPreferenceOptions() {
-  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED]
-}
-
-function sttModelNameForPreference(value) {
-  switch (String(value || '').trim().toLowerCase()) {
-    case STT_MODEL_TINY:
-      return 'tiny.en'
-    case STT_MODEL_MIDDLE:
-      return 'base.en'
-    case STT_MODEL_ADVANCED:
-      return 'small.en'
-    default:
-      return ''
-  }
-}
-
 function normalizeSttModelPreference(value) {
   const lowered = String(value || '').trim().toLowerCase()
   if (!lowered) {
@@ -246,20 +253,6 @@ function runtimeSttModelPreference(value) {
   return normalizeSttModelPreference(value) || ''
 }
 
-function speechPreferenceRuntimePatch(devicePreference) {
-  const normalized = normalizeSttDevicePreference(devicePreference)
-  if (normalized === STT_DEVICE_GPU) {
-    return {
-      device: 'cuda',
-      computeType: 'float16'
-    }
-  }
-  return {
-    device: 'cpu',
-    computeType: 'int8'
-  }
-}
-
 function normalizeRewriteEnabled(value) {
   return value === undefined ? true : Boolean(value)
 }
@@ -272,12 +265,16 @@ function showNotification(title, body) {
   if (!Notification.isSupported()) {
     return
   }
-  new Notification({ title, body }).show()
+  new Notification({
+    title,
+    body,
+    icon: appIcon()
+  }).show()
 }
 
 function sttRuntimeNotificationLabel() {
   const provider = String(runtimeConfig?.speech?.stt?.provider || '').trim()
-  const device = sttPreferences.currentDevice || sttPreferences.selectedDevice || ''
+  const device = sttPreferences.currentDevice || ''
   const model = String(sttPreferences.currentModel || '').trim()
   const modelLabel = model
     ? sttModelMenuLabel(runtimeSttModelPreference(model) || model)
@@ -338,25 +335,6 @@ function throwIfSubmissionCancelled(submission) {
   }
 }
 
-function providerUsesHttpStt() {
-  const providerId = String(speech?.id || runtimeConfig?.stt?.provider || '').trim().toLowerCase()
-  return providerId === 'local-http'
-}
-
-function sttLocalServiceSupported() {
-  if (typeof speech?.supportsLocalServiceControl === 'function') {
-    return Boolean(speech.supportsLocalServiceControl())
-  }
-  return providerUsesHttpStt() && Boolean(runtimeConfig?.stt?.docker?.enabled)
-}
-
-function dockerAutoStartEnabled() {
-  if (typeof speech?.autoStartLocalServiceEnabled === 'function') {
-    return Boolean(speech.autoStartLocalServiceEnabled())
-  }
-  return sttLocalServiceSupported() && Boolean(runtimeConfig?.stt?.docker?.autoStart)
-}
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -392,6 +370,120 @@ function retainedDayKeys(referenceDate = new Date(), retentionDays = DAILY_CHARA
   return keys
 }
 
+function buildTypingBenchmark(input = {}) {
+  const elapsedMs = Math.max(0, Math.floor(Number(input?.elapsedMs || 0) || 0))
+  const characters = Array.from(ONBOARDING_SAMPLE_TEXT).length
+  const words = ONBOARDING_SAMPLE_TEXT.trim().split(/\s+/).filter(Boolean).length
+  return {
+    sampleText: ONBOARDING_SAMPLE_TEXT,
+    elapsedMs,
+    charactersPerMinute: elapsedMs > 0 ? Math.max(0, Math.round((characters / elapsedMs) * 60000)) : 0,
+    wordsPerMinute: elapsedMs > 0 ? Math.max(0, Number(((words / elapsedMs) * 60000).toFixed(1)) || 0) : 0,
+    measuredAt: elapsedMs > 0 ? String(input?.measuredAt || new Date().toISOString()).trim() : ''
+  }
+}
+
+function normalizeProfileName(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().slice(0, 40)
+}
+
+function normalizeOnboardingState(input = {}) {
+  const source = input && typeof input === 'object' ? input : {}
+  const currentProvider = String(runtimeConfig?.stt?.provider || '').trim().toLowerCase()
+  const defaultLocalStt = currentProvider === 'local'
+  return {
+    version: 1,
+    seenAt: String(source?.seenAt || '').trim(),
+    completedAt: String(source?.completedAt || '').trim(),
+    profile: {
+      name: normalizeProfileName(source?.profile?.name)
+    },
+    choices: {
+      localStt: source?.choices?.localStt !== undefined
+        ? Boolean(source.choices.localStt)
+        : source?.choices?.managedDockerStt !== undefined
+          ? !Boolean(source.choices.managedDockerStt)
+          : defaultLocalStt,
+      externalProviders: source?.choices?.externalProviders !== undefined ? Boolean(source.choices.externalProviders) : false,
+      rewriteCleanup: source?.choices?.rewriteCleanup !== undefined ? Boolean(source.choices.rewriteCleanup) : rewriteEnabled
+    },
+    typingBenchmark: buildTypingBenchmark(source?.typingBenchmark || {})
+  }
+}
+
+async function loadOnboardingState() {
+  onboardingState = normalizeOnboardingState(await readJsonFile(onboardingStatePath, {}))
+}
+
+async function saveOnboardingState() {
+  onboardingState = normalizeOnboardingState(onboardingState)
+  await writeJsonFile(onboardingStatePath, onboardingState)
+}
+
+function typingBenchmarkCharactersPerMinute() {
+  return Math.max(0, Math.floor(Number(onboardingState?.typingBenchmark?.charactersPerMinute || 0) || 0))
+}
+
+function typingBenchmarkReady() {
+  return typingBenchmarkCharactersPerMinute() > 0
+}
+
+function onboardingProfileName() {
+  return normalizeProfileName(onboardingState?.profile?.name)
+}
+
+function onboardingCompleted() {
+  return Boolean(String(onboardingState?.completedAt || '').trim())
+}
+
+function estimateTypingMsForCharacters(count) {
+  const characters = Math.max(0, Math.floor(Number(count || 0) || 0))
+  const cpm = typingBenchmarkCharactersPerMinute()
+  if (!characters || !cpm) {
+    return 0
+  }
+  return Math.max(0, Math.round((characters / cpm) * 60000))
+}
+
+function formatDurationCompact(valueMs) {
+  const totalSeconds = Math.max(0, Math.round((Number(valueMs) || 0) / 1000))
+  if (totalSeconds < 60) {
+    return `${totalSeconds}s`
+  }
+  const hours = Math.floor(totalSeconds / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+  const seconds = totalSeconds % 60
+  if (hours > 0) {
+    return `${hours}h ${String(minutes).padStart(2, '0')}m`
+  }
+  return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+}
+
+function greetingLabel() {
+  const name = onboardingProfileName()
+  return name ? `Hi, ${name}` : `Hi from ${APP_NAME}`
+}
+
+function timeSavedTrayLabel() {
+  if (!typingBenchmarkReady()) {
+    return 'Finish Quick Start to estimate your typing time savings.'
+  }
+  return `You saved ${formatDurationCompact(currentDailyTimeSavedMs())} today instead of typing manually.`
+}
+
+function normalizeDailyCharacterEntry(value) {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return {
+      characters: Math.max(0, Math.floor(Number(value?.characters ?? value?.count ?? 0) || 0)),
+      estimatedTypingMs: Math.max(0, Math.floor(Number(value?.estimatedTypingMs || 0) || 0))
+    }
+  }
+  return {
+    characters: Math.max(0, Math.floor(Number(value || 0) || 0)),
+    estimatedTypingMs: 0
+  }
+}
+
 function normalizeDailyCharacterStats(input = {}, referenceDate = new Date()) {
   const allowedKeys = new Set(retainedDayKeys(referenceDate))
   const source = input && typeof input === 'object' ? input : {}
@@ -400,9 +492,9 @@ function normalizeDailyCharacterStats(input = {}, referenceDate = new Date()) {
     if (!allowedKeys.has(String(key))) {
       continue
     }
-    const count = Math.max(0, Math.floor(Number(value) || 0))
-    if (count > 0) {
-      days[String(key)] = count
+    const entry = normalizeDailyCharacterEntry(value)
+    if (entry.characters > 0 || entry.estimatedTypingMs > 0) {
+      days[String(key)] = entry
     }
   }
   return { days }
@@ -418,7 +510,12 @@ async function saveDailyCharacterStats() {
 }
 
 function currentDailyCharacterCount() {
-  return Math.max(0, Math.floor(Number(dailyCharacterStats?.days?.[dayKeyForDate()] || 0)))
+  return normalizeDailyCharacterEntry(dailyCharacterStats?.days?.[dayKeyForDate()]).characters
+}
+
+function currentDailyTimeSavedMs() {
+  const today = normalizeDailyCharacterEntry(dailyCharacterStats?.days?.[dayKeyForDate()])
+  return Math.max(today.estimatedTypingMs, estimateTypingMsForCharacters(today.characters))
 }
 
 async function recordGeneratedCharacters(text) {
@@ -429,27 +526,14 @@ async function recordGeneratedCharacters(text) {
 
   dailyCharacterStats = normalizeDailyCharacterStats(dailyCharacterStats)
   const todayKey = dayKeyForDate()
-  dailyCharacterStats.days[todayKey] = Math.max(0, Math.floor(Number(dailyCharacterStats.days[todayKey] || 0))) + count
+  const today = normalizeDailyCharacterEntry(dailyCharacterStats.days[todayKey])
+  dailyCharacterStats.days[todayKey] = {
+    characters: today.characters + count,
+    estimatedTypingMs: today.estimatedTypingMs + estimateTypingMsForCharacters(count)
+  }
   await saveDailyCharacterStats()
   rebuildMenu()
   return count
-}
-
-async function readSharedSpeechPreferences() {
-  const parsed = await readJsonFile(speechPreferencesPath, {})
-  return {
-    sttDevice: normalizeSttDevicePreference(parsed?.sttDevice),
-    sttModel: normalizeSttModelPreference(parsed?.sttModel)
-  }
-}
-
-async function writeSharedSpeechPreferences(input = {}) {
-  const payload = {
-    sttDevice: normalizeSttDevicePreference(input?.sttDevice),
-    sttModel: normalizeSttModelPreference(input?.sttModel)
-  }
-  await writeJsonFile(speechPreferencesPath, payload)
-  return payload
 }
 
 async function readSharedRewritePreferences() {
@@ -505,7 +589,7 @@ async function saveTraySettings() {
   })
 }
 
-function buildSvgIcon(size = 256) {
+function buildFallbackIcon(size = 256) {
   const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 256 256">
       <defs>
@@ -528,22 +612,69 @@ function buildSvgIcon(size = 256) {
   return nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`)
 }
 
+function loadIconSvgSource() {
+  try {
+    return readFileSync(APP_ICON_SVG_PATH, 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+function buildTrayIconVariant(kind = 'ready', size = 64) {
+  const palette = TRAY_ICON_PALETTES[kind] || TRAY_ICON_PALETTES.ready
+  const sourceSvg = loadIconSvgSource()
+  if (!sourceSvg) {
+    return buildFallbackIcon(size)
+  }
+
+  const recoloredSvg = sourceSvg
+    .replace(/#0dcdfc/gi, palette.accent)
+    .replace(/#20a3f5/gi, palette.primary)
+    .replace(/#3378ed/gi, palette.depth)
+  const image = nativeImage.createFromDataURL(`data:image/svg+xml;base64,${Buffer.from(recoloredSvg).toString('base64')}`)
+  return image.isEmpty()
+    ? buildFallbackIcon(size)
+    : image.resize({ width: size, height: size, quality: 'best' })
+}
+
+function trayIconState() {
+  return voiceState.phase === 'idle' ? 'ready' : 'hot'
+}
+
+function loadIconAsset() {
+  const iconPath = process.platform === 'win32' ? APP_ICON_ICO_PATH : APP_ICON_PNG_PATH
+  const primaryIcon = nativeImage.createFromPath(iconPath)
+  if (!primaryIcon.isEmpty()) {
+    return primaryIcon
+  }
+
+  const fallbackIcon = nativeImage.createFromPath(APP_ICON_PNG_PATH)
+  if (!fallbackIcon.isEmpty()) {
+    return fallbackIcon
+  }
+
+  return null
+}
+
 function appIcon() {
   if (windowIcon && !windowIcon.isEmpty()) {
     return windowIcon
   }
 
-  windowIcon = buildSvgIcon(256)
+  windowIcon = loadIconAsset() || buildFallbackIcon(256)
   return windowIcon
 }
 
 function currentTrayIcon() {
-  if (trayIcon && !trayIcon.isEmpty()) {
-    return trayIcon
+  const state = trayIconState()
+  const cached = trayIcons.get(state)
+  if (cached && !cached.isEmpty()) {
+    return cached
   }
 
-  trayIcon = buildSvgIcon(64)
-  return trayIcon
+  const icon = buildTrayIconVariant(state, 64)
+  trayIcons.set(state, icon)
+  return icon
 }
 
 function configureSessionPermissions(targetSession) {
@@ -597,6 +728,115 @@ async function ensureVoiceWindow() {
   return voiceWindow
 }
 
+async function ensureOnboardingWindow() {
+  if (onboardingWindow && !onboardingWindow.isDestroyed()) {
+    return onboardingWindow
+  }
+
+  onboardingWindow = new BrowserWindow({
+    show: false,
+    width: 520,
+    height: 660,
+    minWidth: 520,
+    minHeight: 660,
+    maxWidth: 520,
+    maxHeight: 660,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    autoHideMenuBar: true,
+    backgroundColor: '#08131a',
+    title: `${APP_NAME} Quick Start`,
+    icon: appIcon(),
+    webPreferences: {
+      preload: path.join(__dirname, 'onboarding-preload.mjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+      sandbox: false
+    }
+  })
+
+  onboardingWindow.on('closed', () => {
+    onboardingWindow = null
+  })
+
+  await onboardingWindow.loadFile(path.join(__dirname, 'onboarding.html'))
+  return onboardingWindow
+}
+
+async function openOnboardingWindow({ markSeen = false } = {}) {
+  const window = await ensureOnboardingWindow()
+  if (markSeen && !onboardingState.seenAt) {
+    onboardingState.seenAt = new Date().toISOString()
+    await saveOnboardingState().catch(() => null)
+    rebuildMenu()
+  }
+  if (window.isMinimized()) {
+    window.restore()
+  }
+  window.show()
+  window.focus()
+  return window
+}
+
+async function maybeShowOnboarding() {
+  if (onboardingState.seenAt) {
+    return
+  }
+  await openOnboardingWindow({ markSeen: true }).catch((error) => {
+    console.error(`[dictray] Failed to open onboarding: ${error?.message || error}`)
+  })
+}
+
+function onboardingStatePayload() {
+  return {
+    sampleText: ONBOARDING_SAMPLE_TEXT,
+    state: onboardingState,
+    runtime: {
+      sttProvider: String(speech?.label || latestHealth.stt?.providerLabel || runtimeConfig?.stt?.provider || '').trim(),
+      rewriteProvider: String(rewriteProvider?.label || latestHealth.rewrite?.providerLabel || runtimeConfig?.rewrite?.provider || '').trim(),
+      rewriteEnabled
+    }
+  }
+}
+
+async function completeOnboarding(input = {}) {
+  const measuredAt = new Date().toISOString()
+  const profileName = normalizeProfileName(input?.profile?.name)
+  const typingBenchmark = buildTypingBenchmark({
+    ...input?.typingBenchmark,
+    measuredAt
+  })
+  if (!typingBenchmark.elapsedMs) {
+    throw new Error('Complete the typing benchmark before finishing Quick Start.')
+  }
+  if (!profileName) {
+    throw new Error('Add your name before finishing Quick Start.')
+  }
+
+  onboardingState = normalizeOnboardingState({
+    ...onboardingState,
+    seenAt: onboardingState.seenAt || measuredAt,
+    completedAt: measuredAt,
+    profile: {
+      ...onboardingState.profile,
+      name: profileName
+    },
+    choices: {
+      ...onboardingState.choices,
+      ...input?.choices
+    },
+    typingBenchmark
+  })
+
+  rewriteEnabled = Boolean(onboardingState.choices.rewriteCleanup)
+  await saveTraySettings()
+  await saveOnboardingState()
+  rebuildMenu()
+  return onboardingStatePayload()
+}
+
 function updateVoiceState(patch = {}) {
   voiceState = {
     ...voiceState,
@@ -634,10 +874,10 @@ function phaseLabel() {
 }
 
 function runtimeLabel() {
-  const provider = String(sttPreferences.provider || runtimeConfig?.speech?.stt?.provider || 'unknown').trim()
+  const provider = String(sttPreferences.provider || runtimeConfig?.stt?.provider || 'unknown').trim()
   const device = String(sttPreferences.currentDevice || '').trim()
   const model = String(sttPreferences.currentModel || '').trim()
-  return `${provider}${device ? `/${device}` : ''}${model ? `/${model}` : ''}`
+  return `${provider}${device ? `/${sttDeviceLabel(device)}` : ''}${model ? `/${model}` : ''}`
 }
 
 function healthValue(ok, up = 'ready', down = 'down') {
@@ -695,7 +935,10 @@ function rebuildMenu() {
     : voiceState.note
       ? `Note: ${compactText(voiceState.note, 110)}`
       : 'Note: none'
+  const greetingMenuLabel = greetingLabel()
   const dailyCharacterLabel = `Keys Saved Today: ${formatCount(currentDailyCharacterCount())}`
+  const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
+  const quickStartMenuLabel = onboardingCompleted() ? 'Open Quick Start' : 'Finish Quick Start'
 
   const modelMenu = rewriteSupportsModelSelection()
     ? rewriteModels.length
@@ -720,33 +963,23 @@ function rebuildMenu() {
         enabled: false
       }]
 
-  const sttDeviceMenu = sttPreferences.supported
-    ? sttPreferences.options.map((value) => ({
-        label: sttDeviceLabel(value),
-        type: 'radio',
-        checked: sttPreferences.selectedDevice === value,
-        click: () => {
-          void updateSttPreferences({ sttDevice: value })
-        }
-      }))
-    : [{
-        label: 'Available only for the managed HTTP STT provider',
-        enabled: false
-      }]
+  const sttDeviceMenu = [{
+    label: sttPreferences.currentDevice ? sttDeviceLabel(sttPreferences.currentDevice) : 'Unknown',
+    enabled: false
+  }, {
+    label: 'Change in config and restart',
+    enabled: false
+  }]
 
-  const sttModelMenu = sttPreferences.supported
-    ? sttPreferences.modelOptions.map((value) => ({
-        label: sttModelMenuLabel(value),
-        type: 'radio',
-        checked: sttPreferences.selectedModel === value,
-        click: () => {
-          void updateSttPreferences({ sttModel: value })
-        }
-      }))
-    : [{
-        label: 'Available only for the managed HTTP STT provider',
-        enabled: false
-      }]
+  const sttModelMenu = [{
+    label: sttPreferences.currentModel
+      ? sttModelMenuLabel(runtimeSttModelPreference(sttPreferences.currentModel) || sttPreferences.currentModel)
+      : 'Unknown',
+    enabled: false
+  }, {
+    label: 'Change in config and restart',
+    enabled: false
+  }]
 
   const duckingLevelMenu = DUCKING_LEVEL_OPTIONS.map((value) => ({
     label: `Duck To ${duckingPercentLabel(value)}`,
@@ -758,6 +991,8 @@ function rebuildMenu() {
   }))
 
   const menu = Menu.buildFromTemplate([
+    { label: greetingMenuLabel, enabled: false },
+    { label: dailyTimeSavedLabel, enabled: false },
     { label: dailyCharacterLabel, enabled: false },
     { label: phaseLabel(), enabled: false },
     { label: `Target: ${compactText(targetLabel, 90)}`, enabled: false },
@@ -813,32 +1048,6 @@ function rebuildMenu() {
       submenu: sttModelMenu
     },
     {
-      label: 'STT Local Service',
-      submenu: sttLocalServiceSupported()
-        ? [
-            {
-              label: dockerAutoStartEnabled() ? 'Auto-start on launch' : 'Manual start',
-              enabled: false
-            },
-            {
-              label: 'Start Managed STT Service',
-              click: () => {
-                void startDockerStt({ notify: true, build: false })
-              }
-            },
-            {
-              label: 'Stop Managed STT Service',
-              click: () => {
-                void stopDockerStt({ notify: true })
-              }
-            }
-          ]
-        : [{
-            label: 'Unavailable for the current STT provider',
-            enabled: false
-          }]
-    },
-    {
       label: 'Shortcut',
       submenu: hotkeyManagedByEnv()
         ? [{
@@ -862,6 +1071,12 @@ function rebuildMenu() {
       }
     },
     {
+      label: quickStartMenuLabel,
+      click: () => {
+        void openOnboardingWindow({ markSeen: true })
+      }
+    },
+    {
       label: 'Open state folder',
       click: () => {
         void shell.openPath(stateDir)
@@ -874,6 +1089,7 @@ function rebuildMenu() {
     }
   ])
 
+  tray.setImage(currentTrayIcon())
   tray.setContextMenu(menu)
   tray.setToolTip(`${APP_NAME} - ${phaseLabel().replace('State: ', '')}`)
 }
@@ -903,8 +1119,7 @@ async function waitForSttHealthy(timeoutMs = 45000) {
 }
 
 function scheduleSttWarmup({
-  waitForHealthy = providerUsesHttpStt(),
-  applyStoredPreferences = providerUsesHttpStt(),
+  waitForHealthy = false,
   notifyReady = false
 } = {}) {
   if (!sttWarmupInFlight) {
@@ -914,14 +1129,11 @@ function scheduleSttWarmup({
         if (!speech) {
           return { ok: false, skipped: true, reason: 'not_ready' }
         }
-        if (providerUsesHttpStt() && waitForHealthy) {
+        if (waitForHealthy) {
           const health = await waitForSttHealthy().catch(() => null)
           if (!health?.ok) {
             return { ok: false, reason: 'stt_unhealthy' }
           }
-        }
-        if (providerUsesHttpStt() && applyStoredPreferences) {
-          await applySharedSpeechPreferencesOnStartup().catch(() => null)
         }
         const result = await speech.warmStt().catch(() => ({ ok: false, reason: 'warmup_failed' }))
         sttReadyForDictation = Boolean(result?.ok)
@@ -1077,113 +1289,13 @@ function startSttKeepWarmTimer() {
   }, intervalMs)
 }
 
-async function startDockerStt({ notify = false, build = false, waitForHealthy = true } = {}) {
-  if (!sttLocalServiceSupported() || !speech) {
-    return { ok: false, skipped: true, reason: 'not_http_provider' }
-  }
-
-  try {
-    sttReadyForDictation = false
-    if (notify) {
-      showNotification(APP_NAME, build ? 'Starting and building the managed STT service.' : 'Starting the managed STT service.')
-    }
-    const result = await speech.startLocalService({ build })
-    let sttHealth = null
-    if (waitForHealthy) {
-      sttHealth = await waitForSttHealthy().catch(() => null)
-    }
-    await refreshRuntimeState(false)
-    if (waitForHealthy && !sttHealth?.ok) {
-      const message = compactText(
-        sttHealth?.error || latestHealth.stt?.error || 'Managed STT service did not become healthy in time.',
-        180
-      )
-      if (notify) {
-        showNotification(APP_NAME, `Managed STT service failed to become healthy: ${message}`)
-      }
-      return {
-        ...result,
-        ok: false,
-        error: message
-      }
-    }
-    void scheduleSttWarmup({ waitForHealthy: true, notifyReady: notify }).catch(() => {})
-    if (notify) {
-      showNotification(APP_NAME, 'Managed STT service is up.')
-    }
-    return {
-      ok: true,
-      ...result
-    }
-  } catch (error) {
-    const message = compactText(error?.message || error, 180)
-    if (notify) {
-      showNotification(APP_NAME, `Failed to start the managed STT service: ${message}`)
-    }
-    return {
-      ok: false,
-      error: message
-    }
-  }
-}
-
-async function stopDockerStt({ notify = false } = {}) {
-  if (!sttLocalServiceSupported() || !speech) {
-    return { ok: false, skipped: true, reason: 'not_http_provider' }
-  }
-
-  try {
-    sttReadyForDictation = false
-    const result = await speech.stopLocalService()
-    await refreshRuntimeState(false)
-    if (notify) {
-      showNotification(APP_NAME, 'Managed STT service stopped.')
-    }
-    return {
-      ok: true,
-      ...result
-    }
-  } catch (error) {
-    const message = compactText(error?.message || error, 180)
-    if (notify) {
-      showNotification(APP_NAME, `Failed to stop the managed STT service: ${message}`)
-    }
-    return {
-      ok: false,
-      error: message
-    }
-  }
-}
-
-async function maybeAutoStartSttDocker() {
-  if (!dockerAutoStartEnabled() || !speech || sttDockerStartAttempted) {
-    return
-  }
-
-  sttDockerStartAttempted = true
-  const health = await speech.checkSttHealth().catch(() => null)
-  if (health?.ok) {
-    return
-  }
-
-  const result = await startDockerStt({
-    notify: false,
-    build: false,
-    waitForHealthy: false
-  })
-  if (!result.ok) {
-    console.error(`[dictray] Failed to auto-start the managed STT service: ${result.error || result.reason || 'unknown error'}`)
-  }
-}
-
 async function refreshRuntimeState(notify = false) {
-  const [sttHealth, rewriteHealth, automationHealth, runtime, modelsPayload, storedSpeech] = await Promise.all([
+  const [sttHealth, rewriteHealth, automationHealth, runtime, modelsPayload] = await Promise.all([
     speech.checkSttHealth(),
     rewriteProvider.checkHealth(),
     uiAutomation.checkHealth(),
-    speech.getSttRuntime(),
-    listRewriteModels(),
-    readSharedSpeechPreferences()
+    speech.getRuntime(),
+    listRewriteModels()
   ])
 
   latestHealth = {
@@ -1197,25 +1309,15 @@ async function refreshRuntimeState(notify = false) {
 
   const currentDevice = runtime.supported
     ? runtimeSttDevicePreference(runtime.device)
-    : ''
-  const currentModel = String(runtime.model || '').trim()
-  const currentModelPreference = runtimeSttModelPreference(currentModel)
-  const options = runtimeSttDeviceOptions(runtime.availableDevices)
-  const modelOptions = sttModelPreferenceOptions()
+    : sttHealth?.ok
+      ? normalizeSttDevicePreference(sttHealth.device)
+      : ''
+  const currentModel = String(runtime.model || '').trim() || (sttHealth?.ok ? String(sttHealth.model || '').trim() : '')
 
   sttPreferences = {
-    provider: runtimeConfig.stt.provider,
-    supported: Boolean(runtime.supported),
-    selectedDevice: options.includes(storedSpeech.sttDevice)
-      ? storedSpeech.sttDevice
-      : currentDevice || options[0] || STT_DEVICE_CPU,
-    selectedModel: modelOptions.includes(storedSpeech.sttModel)
-      ? storedSpeech.sttModel
-      : currentModelPreference || '',
+    provider: String(sttHealth?.providerLabel || speech?.label || runtimeConfig?.stt?.provider || '').trim(),
     currentDevice,
     currentModel,
-    options,
-    modelOptions,
     error: String(runtime.error || sttHealth?.error || '').trim()
   }
 
@@ -1299,107 +1401,6 @@ async function updateTrayHotkey(value) {
   showNotification(APP_NAME, `Shortcut set to ${formatHotkey(trayHotkey)}.`)
 }
 
-async function updateSttPreferences(input = {}) {
-  const requestedDevice = normalizeSttDevicePreference(input?.sttDevice)
-  const requestedModel = normalizeSttModelPreference(input?.sttModel)
-  if (!requestedDevice && !requestedModel) {
-    return
-  }
-
-  if (!providerUsesHttpStt()) {
-    showNotification(APP_NAME, `Live STT switching is only supported for the managed HTTP STT provider, not ${runtimeConfig.stt.provider}.`)
-    return
-  }
-
-  const stored = await readSharedSpeechPreferences()
-  const nextSelectedDevice = requestedDevice || stored.sttDevice || sttPreferences.selectedDevice
-  const nextSelectedModel = requestedModel || stored.sttModel || sttPreferences.selectedModel
-  const requestedParts = [
-    requestedDevice ? `device ${sttDeviceLabel(requestedDevice)}` : '',
-    requestedModel ? `model ${sttModelMenuLabel(requestedModel)}` : ''
-  ].filter(Boolean)
-
-  sttPreferences = {
-    ...sttPreferences,
-    selectedDevice: nextSelectedDevice,
-    selectedModel: nextSelectedModel,
-    error: ''
-  }
-  rebuildMenu()
-
-  if (requestedParts.length) {
-    showNotification(APP_NAME, `Applying STT ${requestedParts.join(' and ')}.`)
-  }
-
-  try {
-    const runtimePatch = requestedDevice
-      ? speechPreferenceRuntimePatch(requestedDevice)
-      : {}
-    if (requestedModel) {
-      runtimePatch.model = sttModelNameForPreference(requestedModel)
-    }
-
-    const result = await speech.updateSttRuntime(runtimePatch)
-    if (!result.ok) {
-      showNotification(APP_NAME, `STT update failed: ${compactText(result.error || 'unknown error', 96)}`)
-      await refreshRuntimeState(false)
-      return
-    }
-
-    await writeSharedSpeechPreferences({
-      sttDevice: nextSelectedDevice,
-      sttModel: nextSelectedModel
-    })
-    sttReadyForDictation = false
-    await waitForPendingSttWarmup().catch(() => null)
-    const warmResult = await scheduleSttWarmup({
-      waitForHealthy: true,
-      applyStoredPreferences: false
-    }).catch(() => ({ ok: false, reason: 'warmup_failed' }))
-    await refreshRuntimeState(false)
-
-    const appliedDevice = runtimeSttDevicePreference(result.device)
-    const appliedModel = runtimeSttModelPreference(result.model)
-    const appliedParts = [
-      appliedDevice ? sttDeviceLabel(appliedDevice) : '',
-      appliedModel ? sttModelMenuLabel(appliedModel) : String(result.model || '').trim()
-    ].filter(Boolean)
-    if (appliedParts.length) {
-      showNotification(APP_NAME, `STT ready: ${appliedParts.join(' / ')}.`)
-    }
-    if (!warmResult?.ok) {
-      showNotification(APP_NAME, 'STT runtime changed, but warmup failed. The next dictation may be slower.')
-    }
-  } catch (error) {
-    showNotification(APP_NAME, `STT update failed: ${compactText(error?.message || error, 96)}`)
-    await refreshRuntimeState(false)
-  }
-}
-
-async function applySharedSpeechPreferencesOnStartup() {
-  const stored = await readSharedSpeechPreferences()
-  if ((!stored.sttDevice && !stored.sttModel) || !providerUsesHttpStt()) {
-    return
-  }
-
-  const runtimePatch = stored.sttDevice
-    ? speechPreferenceRuntimePatch(stored.sttDevice)
-    : {}
-  if (stored.sttModel) {
-    runtimePatch.model = sttModelNameForPreference(stored.sttModel)
-  }
-  const currentRuntime = await speech.getSttRuntime().catch(() => null)
-  if (currentRuntime?.ok) {
-    const sameDevice = runtimePatch.device === undefined || String(currentRuntime.device || '').trim().toLowerCase() === String(runtimePatch.device || '').trim().toLowerCase()
-    const sameComputeType = runtimePatch.computeType === undefined || String(currentRuntime.computeType || '').trim().toLowerCase() === String(runtimePatch.computeType || '').trim().toLowerCase()
-    const sameModel = runtimePatch.model === undefined || String(currentRuntime.model || '').trim() === String(runtimePatch.model || '').trim()
-    if (sameDevice && sameComputeType && sameModel) {
-      return currentRuntime
-    }
-  }
-  await speech.updateSttRuntime(runtimePatch).catch(() => null)
-}
-
 async function switchRewriteModel(modelName) {
   const name = String(modelName || '').trim()
   if (!name || name === currentRewriteModel) {
@@ -1452,19 +1453,8 @@ async function ensureDictationCanStart() {
     return true
   }
 
-  const httpProvider = providerUsesHttpStt()
-  const autoStart = httpProvider && dockerAutoStartEnabled()
-  const healthKnownDown = latestHealth.stt?.ok === false
-
   if (!sttWarmupInFlight) {
-    if (httpProvider && autoStart && healthKnownDown) {
-      void startDockerStt({ notify: false, build: false, waitForHealthy: false }).catch(() => null)
-    } else if (httpProvider && healthKnownDown && !autoStart) {
-      maybeNotifySttBlocked('STT is not ready. Start the managed STT service from the tray and try again.')
-      return false
-    }
     void scheduleSttWarmup({
-      waitForHealthy: httpProvider,
       notifyReady: true
     }).catch(() => {})
   }
@@ -1686,6 +1676,10 @@ async function rewriteTranscript(transcript, windowContext, options = {}) {
           'Treat the transcript as spoken draft text, not as final wording.',
           'Rewrite it into the message the speaker intended to type.',
           'Remove filler words, repetition, false starts, self-corrections, and other speech artifacts.',
+          'Delete hesitation-only phrases completely instead of preserving or paraphrasing them.',
+          'Common hesitation-only phrases include um, uh, er, ah, like, you know, I mean, sort of, kind of, basically, maybe, I guess, I do not know, and let me think when they do not add real meaning.',
+          'Collapse repeated words and restarts such as can can, the the, or we should we should into one clean phrasing.',
+          'If a word like maybe or I do not know expresses real uncertainty that matters to the message, keep the uncertainty but rewrite it naturally.',
           'Restructure sentences when needed so the result reads naturally and makes sense on first read.',
           'Use the app context only to improve wording, structure, tone, and app fit.',
           'Do not invent facts, commands, links, recipients, or code that the transcript did not support.',
@@ -2103,6 +2097,24 @@ ipcMain.on('dictation:error', (_event, payload) => {
   showNotification(APP_NAME, compactText(payload?.message || 'Unknown dictation error', 180))
 })
 
+ipcMain.handle('onboarding:get-state', async () => {
+  return onboardingStatePayload()
+})
+
+ipcMain.handle('onboarding:complete', async (_event, payload) => {
+  const result = await completeOnboarding(payload)
+  if (onboardingWindow && !onboardingWindow.isDestroyed()) {
+    onboardingWindow.close()
+  }
+  return result
+})
+
+ipcMain.on('onboarding:close', () => {
+  if (onboardingWindow && !onboardingWindow.isDestroyed()) {
+    onboardingWindow.close()
+  }
+})
+
 async function createTray() {
   tray = new Tray(currentTrayIcon())
   tray.on('click', () => {
@@ -2115,12 +2127,13 @@ async function bootstrap() {
   runtimeConfig = await loadConfig()
   stateDir = runtimeConfig.memory.stateDir
   traySettingsPath = path.join(stateDir, 'dictation-tray-settings.json')
-  speechPreferencesPath = path.join(stateDir, 'speech-preferences.json')
   rewritePreferencesPath = path.join(stateDir, 'ollama-preferences.json')
   dailyCharacterStatsPath = path.join(stateDir, 'dictation-tray-daily-character-stats.json')
+  onboardingStatePath = path.join(stateDir, 'dictation-tray-onboarding.json')
 
   await loadTraySettings()
   await loadDailyCharacterStats()
+  await loadOnboardingState()
 
   const rewritePreferences = await readSharedRewritePreferences()
   currentRewriteThink = String(rewritePreferences.think || runtimeConfig.rewrite.ollama.think || 'default').trim() || 'default'
@@ -2137,8 +2150,6 @@ async function bootstrap() {
   rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
   systemVolume = new SystemVolumeBridge()
   uiAutomation = new UiAutomationBridge()
-
-  await applySharedSpeechPreferencesOnStartup()
 }
 
 app.on('before-quit', (event) => {
@@ -2161,13 +2172,6 @@ app.on('before-quit', (event) => {
     return
   }
 
-  if (!isStoppingDockerForQuit && STOP_DOCKER_ON_QUIT && sttLocalServiceSupported() && speech) {
-    event.preventDefault()
-    isStoppingDockerForQuit = true
-    void stopDockerStt({ notify: false }).catch(() => null).finally(() => {
-      app.quit()
-    })
-  }
 })
 
 app.whenReady().then(async () => {
@@ -2175,11 +2179,8 @@ app.whenReady().then(async () => {
   await bootstrap()
   await createTray()
   await ensureVoiceWindow()
-  await maybeAutoStartSttDocker()
-  void scheduleSttWarmup({
-    waitForHealthy: providerUsesHttpStt(),
-    notifyReady: true
-  }).catch(() => {})
+  await maybeShowOnboarding()
+  void scheduleSttWarmup({ notifyReady: true }).catch(() => {})
   await refreshRuntimeState(false)
   await registerHotkey()
 
