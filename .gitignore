@@ -1,0 +1,10 @@
+node_modules/
+local/
+.dotnet-cli/
+.electron-cache/
+.runtime-helpers/
+.tmp/
+docker/stt/cache/*
+!docker/stt/cache/.gitkeep
+scripts/**/bin/
+scripts/**/obj/
