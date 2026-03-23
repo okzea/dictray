@@ -629,6 +629,10 @@ internal static class AutomationSearch
 
 internal static class UiAutomationActions
 {
+    private const int FocusSettleDelayMs = 20;
+    private const int ClipboardSettleDelayMs = 10;
+    private const int PasteSettleDelayMs = 40;
+
     public static object? Perform(string action, WindowMatch window, AutomationElement target, ActionRequest request)
     {
         switch (action)
@@ -742,7 +746,7 @@ internal static class UiAutomationActions
 
         var focusTimer = Stopwatch.StartNew();
         WindowCatalog.BringToFront(window);
-        System.Threading.Thread.Sleep(60);
+        System.Threading.Thread.Sleep(FocusSettleDelayMs);
         var focusMs = focusTimer.ElapsedMilliseconds;
 
         System.Windows.Forms.IDataObject? previousClipboard = null;
@@ -765,11 +769,11 @@ internal static class UiAutomationActions
 
             var clipboardSetTimer = Stopwatch.StartNew();
             System.Windows.Forms.Clipboard.SetText(text);
-            System.Threading.Thread.Sleep(40);
+            System.Threading.Thread.Sleep(ClipboardSettleDelayMs);
             clipboardSetMs = clipboardSetTimer.ElapsedMilliseconds;
             var pasteTimer = Stopwatch.StartNew();
             SendPasteShortcut();
-            System.Threading.Thread.Sleep(120);
+            System.Threading.Thread.Sleep(PasteSettleDelayMs);
             pasteShortcutMs = pasteTimer.ElapsedMilliseconds;
         }
         finally
@@ -890,7 +894,7 @@ internal static class UiAutomationActions
         }
 
         SetFocus(window, target);
-        System.Threading.Thread.Sleep(60);
+        System.Threading.Thread.Sleep(FocusSettleDelayMs);
         System.Windows.Forms.SendKeys.SendWait(text);
     }
 
