@@ -229,6 +229,42 @@ function compactText(value, limit = 88) {
   return `${text.slice(0, Math.max(0, limit - 3)).trim()}...`
 }
 
+function supportsAnsiTimingLogs() {
+  return Boolean(process?.stdout?.isTTY) && process.env.NO_COLOR === undefined
+}
+
+function colorTimingText(text, colorName) {
+  if (!supportsAnsiTimingLogs()) {
+    return text
+  }
+
+  const code = colorName === 'green'
+    ? '\u001b[32m'
+    : colorName === 'orange'
+      ? '\u001b[33m'
+      : colorName === 'red'
+        ? '\u001b[31m'
+        : ''
+  return code ? `${code}${text}\u001b[0m` : text
+}
+
+function timingColor(value, warnMs, badMs) {
+  const durationMs = Number(value || 0)
+  if (durationMs >= badMs) {
+    return 'red'
+  }
+  if (durationMs >= warnMs) {
+    return 'orange'
+  }
+  return 'green'
+}
+
+function formatTimingLine(label, value, warnMs, badMs) {
+  const durationMs = Number(value || 0)
+  const text = `- ${label}: ${durationMs}ms`
+  return colorTimingText(text, timingColor(durationMs, warnMs, badMs))
+}
+
 function audioExtensionForMimeType(value) {
   const mimeType = String(value || '').split(';', 1)[0].trim().toLowerCase()
   switch (mimeType) {
@@ -3018,7 +3054,8 @@ async function insertText(text, windowContext, options = {}) {
       timingsMs: {
         waitTarget: waitTargetMs,
         helper: helperMs,
-        clipboard: 0
+        clipboard: 0,
+        helperDetail: result?.timings || null
       }
     }
   } catch (error) {
@@ -3042,30 +3079,46 @@ async function insertText(text, windowContext, options = {}) {
       timingsMs: {
         waitTarget: waitTargetMs,
         helper: 0,
-        clipboard: clipboardMs
+        clipboard: clipboardMs,
+        helperDetail: null
       }
     }
   }
 }
 
 function logDictationTiming(payload) {
-  const parts = [
-    `record=${Number(payload?.recordingMs || 0)}ms`,
-    `stt=${Number(payload?.sttMs || 0)}ms`,
-    `rewrite=${Number(payload?.rewriteMs || 0)}ms`,
-    `insert=${Number(payload?.insertMs || 0)}ms`,
-    `total=${Number(payload?.totalMs || 0)}ms`,
-    `output=${String(payload?.outputMethod || 'none')}`
+  const lines = [
+    `[dictray] Timing (${String(payload?.outputMethod || 'none')})`,
+    formatTimingLine('record', payload?.recordingMs, 5000, 12000),
+    formatTimingLine('stt', payload?.sttMs, 250, 500),
+    formatTimingLine('rewrite', payload?.rewriteMs, 400, 900),
+    formatTimingLine('insert', payload?.insertMs, 250, 450),
+    formatTimingLine('total', payload?.totalMs, 900, 1600)
   ]
+
   if (payload?.insertDetailMs) {
-    parts.push(`insert_wait=${Number(payload.insertDetailMs.waitTarget || 0)}ms`)
-    parts.push(`insert_helper=${Number(payload.insertDetailMs.helper || 0)}ms`)
-    parts.push(`insert_clipboard=${Number(payload.insertDetailMs.clipboard || 0)}ms`)
+    lines.push('  insert breakdown:')
+    lines.push(`  ${formatTimingLine('wait', payload.insertDetailMs.waitTarget, 100, 250).slice(2)}`)
+    lines.push(`  ${formatTimingLine('helper', payload.insertDetailMs.helper, 250, 450).slice(2)}`)
+    lines.push(`  ${formatTimingLine('clipboard', payload.insertDetailMs.clipboard, 40, 100).slice(2)}`)
+    if (payload.insertDetailMs.helperDetail) {
+      const helperDetail = payload.insertDetailMs.helperDetail
+      lines.push('  helper breakdown:')
+      lines.push(`  ${formatTimingLine('total', helperDetail.total, 250, 450).slice(2)}`)
+      lines.push(`  ${formatTimingLine('window', helperDetail.windowResolve, 20, 60).slice(2)}`)
+      lines.push(`  ${formatTimingLine('element', helperDetail.elementResolve, 20, 60).slice(2)}`)
+      lines.push(`  ${formatTimingLine('focus', helperDetail.action?.focus || helperDetail.action?.focusWindow || 0, 40, 90).slice(2)}`)
+      lines.push(`  ${formatTimingLine('clipboard set', helperDetail.action?.clipboardSet || 0, 30, 70).slice(2)}`)
+      lines.push(`  ${formatTimingLine('paste', helperDetail.action?.paste || 0, 80, 140).slice(2)}`)
+      lines.push(`  ${formatTimingLine('clipboard restore', helperDetail.action?.clipboardRestore || 0, 50, 100).slice(2)}`)
+    }
   }
+
   if (payload?.note) {
-    parts.push(`note=${compactText(payload.note, 100)}`)
+    lines.push(`- note: ${compactText(payload.note, 100)}`)
   }
-  console.log(`[dictray] Timing: ${parts.join(' | ')}`)
+
+  console.log(lines.join('\n'))
 }
 
 async function processAudioSubmission(payload = {}) {

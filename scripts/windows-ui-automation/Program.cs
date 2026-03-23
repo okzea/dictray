@@ -117,24 +117,44 @@ internal static class Program
 
     private static int HandleAction(ActionRequest request)
     {
+        var totalTimer = Stopwatch.StartNew();
         var action = NormalizeAction(request.Action);
+        var windowTimer = Stopwatch.StartNew();
         var window = WindowCatalog.ResolveWindow(request.Window);
+        var windowResolveMs = windowTimer.ElapsedMilliseconds;
         if (window is null)
         {
             return Fail("No matching application window was found.");
         }
 
         AutomationElement target;
+        object? actionTimings = null;
+        long elementResolveMs = 0;
         if (action == "focus_window")
         {
             target = window.Element;
+            var actionTimer = Stopwatch.StartNew();
             UiAutomationActions.FocusWindow(window);
+            actionTimings = new
+            {
+                focusWindow = actionTimer.ElapsedMilliseconds
+            };
         }
         else
         {
+            var elementTimer = Stopwatch.StartNew();
             target = AutomationSearch.ResolveElement(window.Element, request.Element, request.SearchLimit)
                 ?? throw new InvalidOperationException("No matching UI element was found in the selected window.");
-            UiAutomationActions.Perform(action, window, target, request);
+            elementResolveMs = elementTimer.ElapsedMilliseconds;
+            var actionTimer = Stopwatch.StartNew();
+            actionTimings = UiAutomationActions.Perform(action, window, target, request);
+            if (actionTimings is null)
+            {
+                actionTimings = new
+                {
+                    action = actionTimer.ElapsedMilliseconds
+                };
+            }
         }
 
         return WriteJson(new
@@ -142,7 +162,14 @@ internal static class Program
             ok = true,
             action,
             window = SnapshotBuilder.BuildWindow(window),
-            target = SnapshotBuilder.BuildLeaf(target)
+            target = SnapshotBuilder.BuildLeaf(target),
+            timings = new
+            {
+                total = totalTimer.ElapsedMilliseconds,
+                windowResolve = windowResolveMs,
+                elementResolve = elementResolveMs,
+                action = actionTimings
+            }
         });
     }
 
@@ -278,24 +305,44 @@ internal static class Program
 
     private static object BuildActionResponse(ActionRequest request)
     {
+        var totalTimer = Stopwatch.StartNew();
         var action = NormalizeAction(request.Action);
+        var windowTimer = Stopwatch.StartNew();
         var window = WindowCatalog.ResolveWindow(request.Window);
+        var windowResolveMs = windowTimer.ElapsedMilliseconds;
         if (window is null)
         {
             return new { ok = false, error = "No matching application window was found." };
         }
 
         AutomationElement target;
+        object? actionTimings = null;
+        long elementResolveMs = 0;
         if (action == "focus_window")
         {
             target = window.Element;
+            var actionTimer = Stopwatch.StartNew();
             UiAutomationActions.FocusWindow(window);
+            actionTimings = new
+            {
+                focusWindow = actionTimer.ElapsedMilliseconds
+            };
         }
         else
         {
+            var elementTimer = Stopwatch.StartNew();
             target = AutomationSearch.ResolveElement(window.Element, request.Element, request.SearchLimit)
                 ?? throw new InvalidOperationException("No matching UI element was found in the selected window.");
-            UiAutomationActions.Perform(action, window, target, request);
+            elementResolveMs = elementTimer.ElapsedMilliseconds;
+            var actionTimer = Stopwatch.StartNew();
+            actionTimings = UiAutomationActions.Perform(action, window, target, request);
+            if (actionTimings is null)
+            {
+                actionTimings = new
+                {
+                    action = actionTimer.ElapsedMilliseconds
+                };
+            }
         }
 
         return new
@@ -303,7 +350,14 @@ internal static class Program
             ok = true,
             action,
             window = SnapshotBuilder.BuildWindow(window),
-            target = SnapshotBuilder.BuildLeaf(target)
+            target = SnapshotBuilder.BuildLeaf(target),
+            timings = new
+            {
+                total = totalTimer.ElapsedMilliseconds,
+                windowResolve = windowResolveMs,
+                elementResolve = elementResolveMs,
+                action = actionTimings
+            }
         };
     }
 }
@@ -575,38 +629,37 @@ internal static class AutomationSearch
 
 internal static class UiAutomationActions
 {
-    public static void Perform(string action, WindowMatch window, AutomationElement target, ActionRequest request)
+    public static object? Perform(string action, WindowMatch window, AutomationElement target, ActionRequest request)
     {
         switch (action)
         {
             case "focus":
             case "focus_element":
                 SetFocus(window, target);
-                return;
+                return null;
             case "invoke":
                 Invoke(window, target);
-                return;
+                return null;
             case "set_value":
                 SetValue(window, target, request.Value);
-                return;
+                return null;
             case "paste_text":
-                PasteText(window, request.Text ?? request.Value);
-                return;
+                return PasteText(window, request.Text ?? request.Value);
             case "send_keys":
                 SendKeys(window, target, request.Text ?? request.Value);
-                return;
+                return null;
             case "expand":
                 ExpandCollapse(window, target, expand: true);
-                return;
+                return null;
             case "collapse":
                 ExpandCollapse(window, target, expand: false);
-                return;
+                return null;
             case "toggle":
                 Toggle(window, target);
-                return;
+                return null;
             case "select":
                 Select(window, target);
-                return;
+                return null;
             default:
                 throw new InvalidOperationException($"Unsupported action \"{action}\".");
         }
@@ -680,18 +733,23 @@ internal static class UiAutomationActions
         pattern.SetValue(value);
     }
 
-    private static void PasteText(WindowMatch window, string? text)
+    private static object PasteText(WindowMatch window, string? text)
     {
         if (string.IsNullOrWhiteSpace(text))
         {
             throw new InvalidOperationException("A non-empty text value is required for paste_text.");
         }
 
+        var focusTimer = Stopwatch.StartNew();
         WindowCatalog.BringToFront(window);
         System.Threading.Thread.Sleep(60);
+        var focusMs = focusTimer.ElapsedMilliseconds;
 
         System.Windows.Forms.IDataObject? previousClipboard = null;
         var hadClipboard = false;
+        long clipboardSetMs = 0;
+        long pasteShortcutMs = 0;
+        long clipboardRestoreMs = 0;
         try
         {
             try
@@ -705,13 +763,18 @@ internal static class UiAutomationActions
                 hadClipboard = false;
             }
 
+            var clipboardSetTimer = Stopwatch.StartNew();
             System.Windows.Forms.Clipboard.SetText(text);
             System.Threading.Thread.Sleep(40);
+            clipboardSetMs = clipboardSetTimer.ElapsedMilliseconds;
+            var pasteTimer = Stopwatch.StartNew();
             SendPasteShortcut();
             System.Threading.Thread.Sleep(120);
+            pasteShortcutMs = pasteTimer.ElapsedMilliseconds;
         }
         finally
         {
+            var clipboardRestoreTimer = Stopwatch.StartNew();
             try
             {
                 if (hadClipboard && previousClipboard is not null)
@@ -726,7 +789,16 @@ internal static class UiAutomationActions
             catch
             {
             }
+            clipboardRestoreMs = clipboardRestoreTimer.ElapsedMilliseconds;
         }
+
+        return new
+        {
+            focus = focusMs,
+            clipboardSet = clipboardSetMs,
+            paste = pasteShortcutMs,
+            clipboardRestore = clipboardRestoreMs
+        };
     }
 
     private static void SendPasteShortcut()
