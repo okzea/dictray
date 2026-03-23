@@ -1757,6 +1757,17 @@ function sttDeviceLabel(value) {
   return value === STT_DEVICE_GPU ? 'GPU (CUDA)' : 'CPU'
 }
 
+function sttDeviceMenuLabel(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === STT_DEVICE_GPU) {
+    return 'GPU (CUDA): faster, needs compatible GPU/driver'
+  }
+  if (normalized === STT_DEVICE_CPU) {
+    return 'CPU: works everywhere, slower on bigger models'
+  }
+  return `${sttDeviceLabel(value)} (${compactText(normalized, 28)})`
+}
+
 function sttModelMenuLabel(value) {
   switch (String(value || '').trim().toLowerCase()) {
     case STT_MODEL_TINY:
@@ -1768,6 +1779,23 @@ function sttModelMenuLabel(value) {
     default:
       return String(value || 'Unknown')
   }
+}
+
+function sttModelMenuOptionLabel(value) {
+  const normalized = normalizeSttModelPreference(value) || String(value || '').trim().toLowerCase()
+  if (normalized === STT_MODEL_TINY) {
+    return 'tiny (tiny.en) - fastest, lower detail'
+  }
+  if (normalized === STT_MODEL_MIDDLE) {
+    return 'middle (base.en) - balanced speed and accuracy'
+  }
+  if (normalized === STT_MODEL_ADVANCED || normalized.includes('small') || normalized.includes('large')) {
+    return `${sttModelMenuLabel(normalized)} - highest quality, slower`
+  }
+  if (normalized.includes('base')) {
+    return `${sttModelMenuLabel(normalized)} - baseline, stable`
+  }
+  return `${sttModelMenuLabel(normalized)} - compatible choice`
 }
 
 function rewriteProviderId() {
@@ -1958,7 +1986,7 @@ function rebuildMenu() {
 
   const sttDeviceMenu = sttPreferences.supported
     ? sttPreferences.options.map((value) => ({
-        label: sttDeviceLabel(value),
+        label: sttDeviceMenuLabel(value),
         type: 'radio',
         checked: sttPreferences.selectedDevice === value,
         click: () => {
@@ -1972,7 +2000,7 @@ function rebuildMenu() {
 
   const sttModelMenu = sttPreferences.supported
     ? sttPreferences.modelOptions.map((value) => ({
-        label: sttModelMenuLabel(value),
+        label: sttModelMenuOptionLabel(value),
         type: 'radio',
         checked: sttPreferences.selectedModel === value,
         click: () => {
