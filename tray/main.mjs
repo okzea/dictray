@@ -1361,6 +1361,21 @@ function loadIconAsset() {
   return null
 }
 
+function loadTrayIconAsset(size = 32) {
+  const candidates = process.platform === 'win32'
+    ? [APP_ICON_ICO_PATH, APP_ICON_PNG_PATH]
+    : [APP_ICON_PNG_PATH]
+
+  for (const iconPath of candidates) {
+    const image = nativeImage.createFromPath(iconPath)
+    if (!image.isEmpty()) {
+      return image.resize({ width: size, height: size, quality: 'best' })
+    }
+  }
+
+  return null
+}
+
 function appIcon() {
   if (windowIcon && !windowIcon.isEmpty()) {
     return windowIcon
@@ -1377,7 +1392,9 @@ function currentTrayIcon() {
     return cached
   }
 
-  const icon = buildTrayIconVariant(state, 64)
+  const icon = process.platform === 'win32'
+    ? (loadTrayIconAsset(32) || buildTrayIconVariant(state, 32))
+    : buildTrayIconVariant(state, 64)
   trayIcons.set(state, icon)
   return icon
 }
@@ -1742,7 +1759,6 @@ function rebuildMenu() {
     return
   }
 
-  const targetLabel = voiceState.targetWindow || 'No active target'
   const noteLabel = voiceState.error
     ? `Error: ${compactText(voiceState.error, 110)}`
     : voiceState.note
@@ -1794,9 +1810,6 @@ function rebuildMenu() {
       }]
 
   const rewriteThinkMenu = [{
-    label: `Current: ${rewriteThinkMenuLabel(currentRewriteThink)}`,
-    enabled: false
-  }, {
     label: 'Off',
     type: 'radio',
     checked: normalizeRewriteThink(currentRewriteThink) === 'off',
@@ -1819,22 +1832,16 @@ function rebuildMenu() {
     }
   }]
 
-  const rewriteTemperatureMenu = [{
-    label: `Current: ${rewriteTemperatureLabel()}`,
-    enabled: false
-  }, ...REWRITE_TEMPERATURE_OPTIONS.map((value) => ({
+  const rewriteTemperatureMenu = REWRITE_TEMPERATURE_OPTIONS.map((value) => ({
     label: rewriteTemperatureLabel(value),
     type: 'radio',
     checked: normalizeRewriteTemperature(currentRewriteTemperature) === value,
     click: () => {
       void updateRewriteTemperature(value)
     }
-  }))]
+  }))
 
   const rewriteProviderMenu = [{
-    label: `Current: ${rewriteProviderMenuLabel()}`,
-    enabled: false
-  }, {
     label: 'Off',
     type: 'radio',
     checked: rewriteProviderId() === 'none',
@@ -1852,10 +1859,6 @@ function rebuildMenu() {
 
   const selectedInputDevice = selectedInputSource()
   const inputSourceMenu = [
-    {
-      label: `Current: ${inputSourceMenuLabel()}`,
-      enabled: false
-    },
     {
       label: 'Open Live Preview',
       click: () => {
@@ -1950,9 +1953,6 @@ function rebuildMenu() {
     { label: greetingMenuLabel, enabled: false },
     { label: dailyTimeSavedLabel, enabled: false },
     { label: dailyCharacterLabel, enabled: false },
-    { label: `Target: ${compactText(targetLabel, 90)}`, enabled: false },
-    { label: `${SPEECH_TO_TEXT_LABEL}: ${healthValue(latestHealth.stt?.ok, runtimeLabel(), compactText(latestHealth.stt?.error || runtimeLabel(), 70))}`, enabled: false },
-    { label: `${TEXT_IMPROVEMENT_LABEL}: ${healthValue(latestHealth.rewrite?.ok, rewriteStatusLabel(), compactText(latestHealth.rewrite?.error || rewriteStatusLabel(), 70))}`, enabled: false },
     {
       label: 'History',
       submenu: historyMenu
@@ -2045,12 +2045,6 @@ function rebuildMenu() {
       label: quickStartMenuLabel,
       click: () => {
         void openOnboardingWindow({ markSeen: true })
-      }
-    },
-    {
-      label: 'Open state folder',
-      click: () => {
-        void shell.openPath(stateDir)
       }
     },
     { type: 'separator' },
