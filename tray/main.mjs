@@ -326,6 +326,55 @@ function duckingPercentLabel(value = duckingLevel) {
   return `${Math.round(clampUnitInterval(value) * 100)}%`
 }
 
+function rewriteThinkMenuOptionLabel(value) {
+  switch (normalizeRewriteThink(value)) {
+    case 'off':
+      return 'Off (fast, no extra creativity)'
+    case 'default':
+      return 'Default (balanced)'
+    case 'on':
+      return 'On (more effort, sometimes better phrasing)'
+    default:
+      return rewriteThinkMenuLabel(value)
+  }
+}
+
+function rewriteTemperatureMenuOptionLabel(value) {
+  const numeric = normalizeRewriteTemperature(value)
+  switch (numeric) {
+    case 0:
+      return '0.0 (Strict and deterministic, almost no guesswork)'
+    case 0.1:
+      return '0.1 (Very focused and predictable)'
+    case 0.2:
+      return '0.2 (Straightforward, slight flexibility)'
+    case 0.3:
+      return '0.3 (Balanced cleanup and fluency)'
+    case 0.5:
+      return '0.5 (Freer wording, still close to source)'
+    case 0.7:
+      return '0.7 (Creative phrasing, keep meaning)'
+    case 1:
+      return '1.0 (Most freeform, biggest variation)'
+    default:
+      return `${numeric.toFixed(1)} (Moderate variation)`
+  }
+}
+
+function duckingLevelMenuLabel(value) {
+  const percent = duckingPercentLabel(value)
+  if (value <= 0.2) {
+    return `Duck To ${percent} (low)`
+  }
+  if (value <= 0.5) {
+    return `Duck To ${percent} (medium)`
+  }
+  if (value <= 0.8) {
+    return `Duck To ${percent} (high)`
+  }
+  return `Duck To ${percent} (very high)`
+}
+
 function hotkeyManagedByEnv() {
   return Boolean(String(process.env.DICTATION_TRAY_HOTKEY || '').trim())
 }
@@ -1805,21 +1854,21 @@ function rebuildMenu() {
       }]
 
   const rewriteThinkMenu = [{
-    label: 'Off',
+    label: rewriteThinkMenuOptionLabel('off'),
     type: 'radio',
     checked: normalizeRewriteThink(currentRewriteThink) === 'off',
     click: () => {
       void updateRewriteThink('off')
     }
   }, {
-    label: 'Default',
+    label: rewriteThinkMenuOptionLabel('default'),
     type: 'radio',
     checked: normalizeRewriteThink(currentRewriteThink) === 'default',
     click: () => {
       void updateRewriteThink('default')
     }
   }, {
-    label: 'On',
+    label: rewriteThinkMenuOptionLabel('on'),
     type: 'radio',
     checked: normalizeRewriteThink(currentRewriteThink) === 'on',
     click: () => {
@@ -1828,7 +1877,7 @@ function rebuildMenu() {
   }]
 
   const rewriteTemperatureMenu = REWRITE_TEMPERATURE_OPTIONS.map((value) => ({
-    label: rewriteTemperatureLabel(value),
+    label: rewriteTemperatureMenuOptionLabel(value),
     type: 'radio',
     checked: normalizeRewriteTemperature(currentRewriteTemperature) === value,
     click: () => {
@@ -1837,14 +1886,14 @@ function rebuildMenu() {
   }))
 
   const rewriteProviderMenu = [{
-    label: 'Off',
+    label: 'Off (skip text improvement)',
     type: 'radio',
     checked: rewriteProviderId() === 'none',
     click: () => {
       void updateRewriteProvider('none')
     }
   }, {
-    label: 'Ollama',
+    label: 'Ollama (local rewrite provider)',
     type: 'radio',
     checked: rewriteProviderId() === 'ollama',
     click: () => {
@@ -1936,7 +1985,7 @@ function rebuildMenu() {
       }]
 
   const duckingLevelMenu = DUCKING_LEVEL_OPTIONS.map((value) => ({
-    label: `Duck To ${duckingPercentLabel(value)}`,
+    label: duckingLevelMenuLabel(value),
     type: 'radio',
     checked: duckingLevel === value,
     click: () => {
