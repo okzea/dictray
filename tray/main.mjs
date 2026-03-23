@@ -1759,11 +1759,6 @@ function rebuildMenu() {
     return
   }
 
-  const noteLabel = voiceState.error
-    ? `Error: ${compactText(voiceState.error, 110)}`
-    : voiceState.note
-      ? `Note: ${compactText(voiceState.note, 110)}`
-      : 'Note: none'
   const greetingMenuLabel = greetingLabel()
   const dailyCharacterLabel = `Keys Saved Today: ${formatCount(currentDailyCharacterCount())}`
   const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
@@ -1957,7 +1952,6 @@ function rebuildMenu() {
       label: 'History',
       submenu: historyMenu
     },
-    { label: noteLabel, enabled: false },
     { type: 'separator' },
     {
       label: voiceState.phase === 'listening'
