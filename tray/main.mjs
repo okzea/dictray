@@ -34,6 +34,7 @@ if (process.platform === 'win32') {
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const APP_NAME = 'DicTray'
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
+const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 const REWRITE_TEMPERATURE_OPTIONS = [0, 0.1, 0.2, 0.3, 0.5, 0.7, 1]
 const APP_ICON_SVG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.svg')
@@ -57,6 +58,13 @@ const HOTKEY_PRESETS = [
   { value: 'CommandOrControl+Alt+F12', label: 'Ctrl+Alt+F12' },
   { value: 'CommandOrControl+Alt+F13', label: 'Ctrl+Alt+F13' },
   { value: 'CommandOrControl+Alt+O', label: 'Ctrl+Alt+O' }
+]
+const PROMPT_HOTKEY_PRESETS = [
+  { value: 'Alt+Shift+Space', label: 'Alt+Shift+Space' },
+  { value: 'CommandOrControl+Shift+Space', label: 'Ctrl+Shift+Space' },
+  { value: 'CommandOrControl+Alt+Shift+F12', label: 'Ctrl+Alt+Shift+F12' },
+  { value: 'CommandOrControl+Alt+Shift+F13', label: 'Ctrl+Alt+Shift+F13' },
+  { value: 'CommandOrControl+Alt+Shift+O', label: 'Ctrl+Alt+Shift+O' }
 ]
 const HOTKEY_BRIDGE = String(process.env.DICTATION_TRAY_HOTKEY_HELPER || '').trim()
   || resolveBundledHelperExecutable('windows-hotkey-hook', 'WindowsHotkeyHook.exe')
@@ -121,10 +129,12 @@ let voiceOverlayFocusedBoundsRefresh = null
 let isQuitting = false
 let isRestoringVolumeForQuit = false
 let trayHotkey = DEFAULT_HOTKEY
+let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
 let duckingEnabled = true
 let duckingLevel = 0.3
 let pressEnterAfterInsert = false
+let activePressEnterAfterInsert = false
 let currentRewriteModel = ''
 let currentRewriteThink = 'off'
 let currentRewriteTemperature = 0.1
@@ -386,6 +396,14 @@ function normalizeTrayHotkey(value) {
     return normalized
   }
   return DEFAULT_HOTKEY
+}
+
+function normalizePromptHotkey(value) {
+  const normalized = String(value || '').trim()
+  if (PROMPT_HOTKEY_PRESETS.some((preset) => preset.value === normalized)) {
+    return normalized
+  }
+  return DEFAULT_PROMPT_HOTKEY
 }
 
 function formatHotkey(value) {
@@ -1334,6 +1352,12 @@ async function loadTraySettings() {
   if (parsed?.pressEnterAfterInsert !== undefined) {
     pressEnterAfterInsert = Boolean(parsed?.pressEnterAfterInsert)
   }
+  if (parsed?.promptHotkey !== undefined) {
+    promptTrayHotkey = normalizePromptHotkey(parsed?.promptHotkey)
+    if (promptTrayHotkey === trayHotkey) {
+      promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
+    }
+  }
   preferredInputDeviceId = normalizeInputDeviceId(parsed?.inputDeviceId)
 }
 
@@ -1344,6 +1368,7 @@ async function saveTraySettings() {
     duckingEnabled,
     duckingLevel,
     pressEnterAfterInsert,
+    promptHotkey: promptTrayHotkey,
     inputDeviceId: preferredInputDeviceId || undefined
   })
 }
@@ -2109,7 +2134,7 @@ function rebuildMenu() {
       submenu: sttModelMenu
     },
     {
-      label: 'Shortcut',
+      label: 'Dictation Shortcut',
       submenu: hotkeyManagedByEnv()
         ? [{
             label: `Managed by DICTATION_TRAY_HOTKEY: ${formatHotkey(trayHotkey)}`,
@@ -2123,6 +2148,17 @@ function rebuildMenu() {
               void updateTrayHotkey(preset.value)
             }
           }))
+    },
+    {
+      label: 'Submit Shortcut (with Enter)',
+      submenu: PROMPT_HOTKEY_PRESETS.map((preset) => ({
+        label: preset.label,
+        type: 'radio',
+        checked: promptTrayHotkey === preset.value,
+        click: () => {
+          void updatePromptTrayHotkey(preset.value)
+        }
+      }))
     },
     { type: 'separator' },
     {
@@ -2539,10 +2575,26 @@ async function updatePressEnterAfterInsert(value) {
 
 async function updateTrayHotkey(value) {
   trayHotkey = normalizeTrayHotkey(value)
+  if (trayHotkey === promptTrayHotkey) {
+    promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
+    showNotification(APP_NAME, `Submit shortcut reset to ${formatHotkey(promptTrayHotkey)} to avoid conflict.`)
+  }
   await saveTraySettings()
   await registerHotkey()
   rebuildMenu()
   showNotification(APP_NAME, `Shortcut set to ${formatHotkey(trayHotkey)}.`)
+}
+
+async function updatePromptTrayHotkey(value) {
+  promptTrayHotkey = normalizePromptHotkey(value)
+  if (promptTrayHotkey === trayHotkey) {
+    showNotification(APP_NAME, 'Submit shortcut cannot match the main shortcut. Please pick a different key.')
+    return
+  }
+  await saveTraySettings()
+  await registerHotkey()
+  rebuildMenu()
+  showNotification(APP_NAME, `Submit Shortcut set to ${formatHotkey(promptTrayHotkey)}.`)
 }
 
 async function updateRewriteThink(value) {
@@ -3118,6 +3170,7 @@ async function insertText(text, windowContext, options = {}) {
   let enterMs = 0
   let enterError
   let helperNote
+  const shouldPressEnter = Boolean(options?.pressEnterAfterInsert ?? pressEnterAfterInsert)
 
   try {
     const helperStartedAt = performance.now()
@@ -3136,7 +3189,7 @@ async function insertText(text, windowContext, options = {}) {
       helperNote = `Clipboard restore may not have completed: ${String(clipboardRestoreError || 'Clipboard busy/unavailable').trim()}`
     }
 
-    if (pressEnterAfterInsert) {
+    if (shouldPressEnter) {
       try {
         const enterStartedAt = performance.now()
         await uiAutomation.action({
@@ -3248,6 +3301,7 @@ async function processAudioSubmission(payload = {}) {
     controller: new AbortController(),
     contextHandle: activeTurnContext
   }
+  const pressEnterAfterInsertForSubmission = activePressEnterAfterInsert
   activeSubmission = submission
   const signal = submission.controller.signal
   const startedAt = performance.now()
@@ -3407,7 +3461,10 @@ async function processAudioSubmission(payload = {}) {
     })
 
     const insertStartedAt = performance.now()
-    const insertResult = await insertText(finalText, windowContext, { signal })
+    const insertResult = await insertText(finalText, windowContext, {
+      signal,
+      pressEnterAfterInsert: pressEnterAfterInsertForSubmission
+    })
     throwIfSubmissionCancelled(submission)
     const insertMs = nowMs(insertStartedAt)
     if (insertResult.note) {
@@ -3481,6 +3538,7 @@ async function processAudioSubmission(payload = {}) {
     }
     throw error
   } finally {
+    activePressEnterAfterInsert = false
     if (activeSubmission === submission) {
       activeSubmission = null
     }
@@ -3508,7 +3566,7 @@ function beginTurnContextCapture() {
   activeTurnContext = contextHandle
 }
 
-async function toggleDictationCapture() {
+async function toggleDictationCapture({ pressEnterAfterInsert: overridePressEnter } = {}) {
   if (voiceState.phase === 'listening') {
     await stopDictationCapture()
     return
@@ -3518,15 +3576,21 @@ async function toggleDictationCapture() {
     clearVoiceState()
     return
   }
-  await startDictationCapture()
+  await startDictationCapture({
+    pressEnterAfterInsert: overridePressEnter
+  })
 }
 
-async function startDictationCapture() {
+async function startDictationCapture({
+  pressEnterAfterInsert: forcePressEnterAfterInsert
+} = {}) {
   if (voiceState.phase !== 'idle' || activeSubmission) {
     return
   }
+  activePressEnterAfterInsert = Boolean(forcePressEnterAfterInsert ?? pressEnterAfterInsert)
   const ready = await ensureDictationCanStart()
   if (!ready) {
+    activePressEnterAfterInsert = false
     return
   }
 
@@ -3585,6 +3649,29 @@ function registerPressOnlyHotkey() {
   if (!ok) {
     showNotification(APP_NAME, `Failed to register hotkey ${formatHotkey(trayHotkey)}.`)
   }
+
+  const promptOk = registerPromptShortcut()
+  if (!promptOk && trayHotkey !== promptTrayHotkey) {
+    return
+  }
+}
+
+function registerPromptShortcut() {
+  if (promptTrayHotkey === trayHotkey) {
+    return true
+  }
+
+  const ok = globalShortcut.register(promptTrayHotkey, () => {
+    void toggleDictationCapture({
+      pressEnterAfterInsert: true
+    })
+  })
+  if (!ok) {
+    showNotification(APP_NAME, `Failed to register submit shortcut ${formatHotkey(promptTrayHotkey)}.`)
+    return false
+  }
+
+  return true
 }
 
 function scheduleHotkeyBridgeRestart() {
@@ -3670,6 +3757,8 @@ function startHotkeyBridge() {
     registerPressOnlyHotkey()
     showNotification(APP_NAME, 'Hold-to-talk bridge stopped. Falling back to press-to-toggle.')
   })
+
+  registerPromptShortcut()
 }
 
 async function registerHotkey() {
