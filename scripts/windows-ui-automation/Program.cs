@@ -829,13 +829,13 @@ internal static class UiAutomationActions
             }
         }
 
-        return string.IsNullOrWhiteSpace(Read(DataFormats.UnicodeText))
-            ? string.IsNullOrWhiteSpace(Read(DataFormats.Text))
-                ? string.IsNullOrWhiteSpace(Read(DataFormats.StringFormat))
+        return string.IsNullOrWhiteSpace(Read(System.Windows.Forms.DataFormats.UnicodeText))
+            ? string.IsNullOrWhiteSpace(Read(System.Windows.Forms.DataFormats.Text))
+                ? string.IsNullOrWhiteSpace(Read(System.Windows.Forms.DataFormats.StringFormat))
                     ? null
-                    : Read(DataFormats.StringFormat)
-                : Read(DataFormats.Text)
-            : Read(DataFormats.UnicodeText);
+                    : Read(System.Windows.Forms.DataFormats.StringFormat)
+                : Read(System.Windows.Forms.DataFormats.Text)
+            : Read(System.Windows.Forms.DataFormats.UnicodeText);
     }
 
     private static ClipboardRestoreResult RestoreClipboard(System.Windows.Forms.IDataObject? previousClipboard, string? previousText, bool hadClipboard)
