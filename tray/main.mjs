@@ -124,6 +124,7 @@ let trayHotkey = DEFAULT_HOTKEY
 let rewriteEnabled = false
 let duckingEnabled = true
 let duckingLevel = 0.3
+let pressEnterAfterInsert = false
 let currentRewriteModel = ''
 let currentRewriteThink = 'off'
 let currentRewriteTemperature = 0.1
@@ -1330,6 +1331,9 @@ async function loadTraySettings() {
   if (parsed?.duckingLevel !== undefined) {
     duckingLevel = normalizeDuckingLevel(parsed?.duckingLevel)
   }
+  if (parsed?.pressEnterAfterInsert !== undefined) {
+    pressEnterAfterInsert = Boolean(parsed?.pressEnterAfterInsert)
+  }
   preferredInputDeviceId = normalizeInputDeviceId(parsed?.inputDeviceId)
 }
 
@@ -1339,6 +1343,7 @@ async function saveTraySettings() {
     rewriteEnabled,
     duckingEnabled,
     duckingLevel,
+    pressEnterAfterInsert,
     inputDeviceId: preferredInputDeviceId || undefined
   })
 }
@@ -2049,6 +2054,14 @@ function rebuildMenu() {
       }
     },
     {
+      label: 'Send Enter After Insert',
+      type: 'checkbox',
+      checked: pressEnterAfterInsert,
+      click: (item) => {
+        void updatePressEnterAfterInsert(Boolean(item.checked))
+      }
+    },
+    {
       label: 'Text Improvement Provider',
       submenu: rewriteProviderMenu
     },
@@ -2515,6 +2528,13 @@ async function updateDuckingLevel(value) {
   if (voiceState.phase === 'listening') {
     await duckSystemVolumeForPushToTalk(Boolean(volumeDuckState)).catch(() => null)
   }
+}
+
+async function updatePressEnterAfterInsert(value) {
+  pressEnterAfterInsert = Boolean(value)
+  await saveTraySettings()
+  rebuildMenu()
+  showNotification(APP_NAME, `Send Enter after insert is ${pressEnterAfterInsert ? 'enabled' : 'disabled'}.`)
 }
 
 async function updateTrayHotkey(value) {
@@ -3088,12 +3108,15 @@ async function insertText(text, windowContext, options = {}) {
       timingsMs: {
         waitTarget: 0,
         helper: 0,
-        clipboard: 0
+        clipboard: 0,
+        enter: 0
       }
     }
   }
 
   const waitTargetMs = 0
+  let enterMs = 0
+  let enterError
 
   try {
     const helperStartedAt = performance.now()
@@ -3105,6 +3128,26 @@ async function insertText(text, windowContext, options = {}) {
       signal: options?.signal || null
     })
     const helperMs = Math.round(performance.now() - helperStartedAt)
+
+    if (pressEnterAfterInsert) {
+      try {
+        const enterStartedAt = performance.now()
+        await uiAutomation.action({
+          action: 'send_keys',
+          window: windowContext?.selector || {},
+          text: '{ENTER}'
+        }, {
+          signal: options?.signal || null
+        })
+        enterMs = Math.round(performance.now() - enterStartedAt)
+      } catch (error) {
+        if (isAbortError(error)) {
+          throw error
+        }
+        enterError = String(error?.message || error).trim()
+      }
+    }
+
     return {
       ok: true,
       method: 'paste_text',
@@ -3113,8 +3156,10 @@ async function insertText(text, windowContext, options = {}) {
         waitTarget: waitTargetMs,
         helper: helperMs,
         clipboard: 0,
+        enter: enterMs,
         helperDetail: result?.timings || null
-      }
+      },
+      enterError
     }
   } catch (error) {
     if (isAbortError(error)) {
@@ -3138,6 +3183,7 @@ async function insertText(text, windowContext, options = {}) {
         waitTarget: waitTargetMs,
         helper: 0,
         clipboard: clipboardMs,
+        enter: 0,
         helperDetail: null
       }
     }
@@ -3159,6 +3205,7 @@ function logDictationTiming(payload) {
     lines.push(`  ${formatTimingLine('wait', payload.insertDetailMs.waitTarget, 100, 250).slice(2)}`)
     lines.push(`  ${formatTimingLine('helper', payload.insertDetailMs.helper, 250, 450).slice(2)}`)
     lines.push(`  ${formatTimingLine('clipboard', payload.insertDetailMs.clipboard, 40, 100).slice(2)}`)
+    lines.push(`  ${formatTimingLine('enter', payload.insertDetailMs.enter, 30, 80).slice(2)}`)
     if (payload.insertDetailMs.helperDetail) {
       const helperDetail = payload.insertDetailMs.helperDetail
       lines.push('  helper breakdown:')
@@ -3357,6 +3404,9 @@ async function processAudioSubmission(payload = {}) {
     const insertMs = nowMs(insertStartedAt)
     if (!insertResult.ok && insertResult.copied) {
       note = `Paste failed. Copied the final text to the clipboard instead. ${insertResult.error ? `Reason: ${compactText(insertResult.error, 80)}` : ''}`.trim()
+      showNotification(APP_NAME, compactText(note, 180))
+    } else if (insertResult?.enterError) {
+      note = `Insert succeeded, but Enter failed. ${compactText(insertResult.enterError, 80)}`
       showNotification(APP_NAME, compactText(note, 180))
     }
 
