@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { projectRoot, resolveBundledSttConfig } from './runtime-paths.mjs'
 
 const DEFAULTS = {
   memory: {
@@ -14,25 +15,22 @@ const DEFAULTS = {
       pythonBin: 'python',
       ffmpegBin: 'ffmpeg',
       transcribeScript: './scripts/faster_whisper_cli.py',
+      workerScript: './scripts/faster_whisper_worker.py',
+      daemonScript: './scripts/faster_whisper_daemon.py',
       model: 'base.en',
+      modelDir: '',
       device: 'auto',
       computeType: 'auto'
     },
-    wsl: {
-      wslBin: 'wsl.exe',
-      pythonBin: 'python',
-      ffmpegBin: 'ffmpeg',
-      transcribeScript: '$HOME/.openclaw/tools/faster_whisper_cli.py'
-    },
     http: {
-      baseUrl: 'http://127.0.0.1:4591',
+      baseUrl: 'http://127.0.0.1:4593',
       path: '/transcribe',
       healthPath: '/health',
       timeoutMs: 120000
     }
   },
   rewrite: {
-    provider: 'ollama',
+    provider: 'none',
     ollama: {
       baseUrl: 'http://127.0.0.1:11434',
       model: 'qwen3-coder:30b',
@@ -42,7 +40,7 @@ const DEFAULTS = {
     }
   },
   dictation: {
-    rewriteEnabled: true,
+    rewriteEnabled: false,
     duckingEnabled: true,
     duckingLevel: 0.3
   }
@@ -90,6 +88,23 @@ function resolvePathLike(rootDir, value) {
   return text
 }
 
+function preferBundledPython(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  return !normalized || normalized === 'python' || normalized === 'python3'
+}
+
+function preferBundledTranscribeScript(value, fallback) {
+  const normalized = String(value || '').trim()
+  if (!normalized) {
+    return true
+  }
+  return normalized === String(fallback || '').trim()
+}
+
+function preferBundledModelDir(value) {
+  return !String(value || '').trim()
+}
+
 function mergeHttpProvider(parsed = {}, fallback) {
   return {
     baseUrl: normalizeUrl(parsed?.baseUrl, fallback.baseUrl),
@@ -106,13 +121,11 @@ export function normalizeSttProviderId(value) {
   }
   switch (normalized) {
     case 'http':
+      return 'http'
     case 'local-http':
     case 'local_http':
-      return 'local'
     case 'local':
       return 'local'
-    case 'wsl':
-      return 'wsl'
     default:
       return normalized
   }
@@ -150,7 +163,8 @@ function normalizeOllamaConfig(input = {}, fallback = DEFAULTS.rewrite.ollama) {
 }
 
 export async function loadConfig(configPathArg) {
-  const configPath = path.resolve(configPathArg || process.env.DICTATION_TRAY_CONFIG || './dictation-tray.config.json')
+  const defaultConfigPath = path.join(projectRoot(), 'dictation-tray.config.json')
+  const configPath = path.resolve(configPathArg || process.env.DICTATION_TRAY_CONFIG || defaultConfigPath)
   const rootDir = path.dirname(configPath)
   const raw = await readFile(configPath, 'utf8')
   const parsed = JSON.parse(raw)
@@ -158,8 +172,15 @@ export async function loadConfig(configPathArg) {
   const parsedLegacyStt = parsedSpeech?.stt || {}
   const parsedStt = parsed?.stt || {}
   const parsedRewrite = parsed?.rewrite || {}
+  const bundledStt = resolveBundledSttConfig()
+  const envSttProvider = String(process.env.DICTATION_TRAY_STT_PROVIDER || '').trim()
 
-  const sttProvider = normalizeSttProviderId(parsedStt?.provider ?? parsedLegacyStt?.provider ?? DEFAULTS.stt.provider)
+  const sttProvider = normalizeSttProviderId(envSttProvider || parsedStt?.provider || parsedLegacyStt?.provider || DEFAULTS.stt.provider)
+  const parsedLocalPythonBin = parsedStt?.local?.pythonBin ?? parsedLegacyStt?.local?.pythonBin
+  const parsedLocalTranscribeScript = parsedStt?.local?.transcribeScript ?? parsedLegacyStt?.local?.transcribeScript
+  const parsedLocalWorkerScript = parsedStt?.local?.workerScript ?? parsedLegacyStt?.local?.workerScript
+  const parsedLocalDaemonScript = parsedStt?.local?.daemonScript ?? parsedLegacyStt?.local?.daemonScript
+  const parsedLocalModelDir = parsedStt?.local?.modelDir ?? parsedLegacyStt?.local?.modelDir
   const stt = {
     enabled: parsedStt?.enabled !== undefined
       ? Boolean(parsedStt.enabled)
@@ -173,18 +194,25 @@ export async function loadConfig(configPathArg) {
       DEFAULTS.stt.keepWarmIntervalMs
     ),
     local: {
-      pythonBin: String(parsedStt?.local?.pythonBin || parsedLegacyStt?.local?.pythonBin || DEFAULTS.stt.local.pythonBin),
+      pythonBin: bundledStt?.pythonBin && preferBundledPython(parsedLocalPythonBin)
+        ? bundledStt.pythonBin
+        : String(parsedLocalPythonBin || DEFAULTS.stt.local.pythonBin),
       ffmpegBin: String(parsedStt?.local?.ffmpegBin || parsedLegacyStt?.local?.ffmpegBin || DEFAULTS.stt.local.ffmpegBin),
-      transcribeScript: resolvePathLike(rootDir, parsedStt?.local?.transcribeScript || parsedLegacyStt?.local?.transcribeScript || DEFAULTS.stt.local.transcribeScript),
-      model: String(parsedStt?.local?.model || parsedLegacyStt?.local?.model || DEFAULTS.stt.local.model).trim() || DEFAULTS.stt.local.model,
+      transcribeScript: bundledStt?.transcribeScript && preferBundledTranscribeScript(parsedLocalTranscribeScript, DEFAULTS.stt.local.transcribeScript)
+        ? bundledStt.transcribeScript
+        : resolvePathLike(rootDir, parsedLocalTranscribeScript || DEFAULTS.stt.local.transcribeScript),
+      workerScript: bundledStt?.workerScript && preferBundledTranscribeScript(parsedLocalWorkerScript, DEFAULTS.stt.local.workerScript)
+        ? bundledStt.workerScript
+        : resolvePathLike(rootDir, parsedLocalWorkerScript || DEFAULTS.stt.local.workerScript),
+      daemonScript: bundledStt?.daemonScript && preferBundledTranscribeScript(parsedLocalDaemonScript, DEFAULTS.stt.local.daemonScript)
+        ? bundledStt.daemonScript
+        : resolvePathLike(rootDir, parsedLocalDaemonScript || DEFAULTS.stt.local.daemonScript),
+      model: String(parsedStt?.local?.model || parsedLegacyStt?.local?.model || bundledStt?.model || DEFAULTS.stt.local.model).trim() || DEFAULTS.stt.local.model,
+      modelDir: bundledStt?.modelDir && preferBundledModelDir(parsedLocalModelDir)
+        ? bundledStt.modelDir
+        : resolvePathLike(rootDir, parsedLocalModelDir || DEFAULTS.stt.local.modelDir),
       device: String(parsedStt?.local?.device || parsedLegacyStt?.local?.device || DEFAULTS.stt.local.device).trim() || DEFAULTS.stt.local.device,
       computeType: String(parsedStt?.local?.computeType || parsedLegacyStt?.local?.computeType || DEFAULTS.stt.local.computeType).trim() || DEFAULTS.stt.local.computeType
-    },
-    wsl: {
-      wslBin: String(parsedStt?.wsl?.wslBin || parsedLegacyStt?.wsl?.wslBin || DEFAULTS.stt.wsl.wslBin),
-      pythonBin: String(parsedStt?.wsl?.pythonBin || parsedLegacyStt?.wsl?.pythonBin || DEFAULTS.stt.wsl.pythonBin),
-      ffmpegBin: String(parsedStt?.wsl?.ffmpegBin || parsedLegacyStt?.wsl?.ffmpegBin || DEFAULTS.stt.wsl.ffmpegBin),
-      transcribeScript: String(parsedStt?.wsl?.transcribeScript || parsedLegacyStt?.wsl?.transcribeScript || DEFAULTS.stt.wsl.transcribeScript)
     },
     http: mergeHttpProvider(parsedStt?.http || parsedLegacyStt?.http, DEFAULTS.stt.http)
   }
@@ -199,7 +227,7 @@ export async function loadConfig(configPathArg) {
     configPath,
     rootDir,
     memory: {
-      stateDir: path.resolve(rootDir, parsed?.memory?.stateDir || DEFAULTS.memory.stateDir)
+      stateDir: path.resolve(process.env.DICTATION_TRAY_STATE_DIR || parsed?.memory?.stateDir || DEFAULTS.memory.stateDir)
     },
     stt,
     rewrite,
@@ -211,7 +239,6 @@ export async function loadConfig(configPathArg) {
         timeoutMs: stt.timeoutMs,
         keepWarmIntervalMs: stt.keepWarmIntervalMs,
         local: stt.local,
-        wsl: stt.wsl,
         http: stt.http
       }
     },
@@ -227,7 +254,8 @@ export async function loadConfig(configPathArg) {
     },
     resolved: {
       hotkeyEnv: String(process.env.DICTATION_TRAY_HOTKEY || '').trim(),
-      helperRoot: resolvePathLike(rootDir, './scripts')
+      helperRoot: resolvePathLike(rootDir, './scripts'),
+      bundledStt
     }
   }
 }

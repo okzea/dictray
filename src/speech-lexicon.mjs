@@ -22,9 +22,7 @@ const DEFAULT_TRANSCRIPT_LEXICON = [
   ['oxy', 'okzea'],
   ['o x y', 'okzea'],
   ['oxe', 'okzea'],
-  ['o x e', 'okzea'],
-  ['w s l', 'wsl'],
-  ['double u s l', 'wsl']
+  ['o x e', 'okzea']
 ]
 
 const TRANSCRIPT_LEXICON = DEFAULT_TRANSCRIPT_LEXICON

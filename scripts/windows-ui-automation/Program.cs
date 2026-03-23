@@ -16,6 +16,13 @@ internal static class Program
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         WriteIndented = true
     };
+    private static readonly JsonSerializerOptions CompactJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        WriteIndented = false
+    };
 
     [STAThread]
     private static int Main(string[] args)
@@ -40,6 +47,7 @@ internal static class Program
                 "list-windows" => HandleListWindows(ReadRequest<ListWindowsRequest>() ?? new ListWindowsRequest()),
                 "snapshot" => HandleSnapshot(ReadRequest<SnapshotRequest>() ?? new SnapshotRequest()),
                 "action" => HandleAction(ReadRequest<ActionRequest>() ?? new ActionRequest()),
+                "serve" => RunServer(),
                 _ => Fail($"Unknown command \"{command}\".")
             };
         }
@@ -162,6 +170,157 @@ internal static class Program
         Console.Out.WriteLine(JsonSerializer.Serialize(payload, JsonOptions));
         return exitCode;
     }
+
+    private static int RunServer()
+    {
+        string? line;
+        while ((line = Console.ReadLine()) is not null)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            object response;
+            try
+            {
+                var request = JsonSerializer.Deserialize<ServeRequest>(line, CompactJsonOptions)
+                    ?? throw new InvalidOperationException("Invalid server request.");
+                response = HandleServeRequest(request);
+            }
+            catch (Exception error)
+            {
+                response = new ServeResponse
+                {
+                    Ok = false,
+                    Error = error.Message
+                };
+            }
+
+            Console.Out.WriteLine(JsonSerializer.Serialize(response, CompactJsonOptions));
+        }
+
+        return 0;
+    }
+
+    private static object HandleServeRequest(ServeRequest request)
+    {
+        var command = (request.Command ?? string.Empty).Trim().ToLowerInvariant();
+        object payload = command switch
+        {
+            "health" => new
+            {
+                ok = true,
+                platform = "windows",
+                backend = "uia",
+                supports = new[] { "list-windows", "snapshot", "action", "serve" }
+            },
+            "list-windows" => BuildListWindowsResponse(ReadPayload<ListWindowsRequest>(request.Payload) ?? new ListWindowsRequest()),
+            "snapshot" => BuildSnapshotResponse(ReadPayload<SnapshotRequest>(request.Payload) ?? new SnapshotRequest()),
+            "action" => BuildActionResponse(ReadPayload<ActionRequest>(request.Payload) ?? new ActionRequest()),
+            _ => new { ok = false, error = $"Unknown command \"{command}\"." }
+        };
+
+        return new ServeResponse
+        {
+            Id = request.Id,
+            Payload = payload,
+            Ok = true
+        };
+    }
+
+    private static T? ReadPayload<T>(JsonElement? payload)
+    {
+        if (payload is null || payload.Value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+        {
+            return default;
+        }
+
+        return payload.Value.Deserialize<T>(CompactJsonOptions);
+    }
+
+    private static object BuildListWindowsResponse(ListWindowsRequest request)
+    {
+        var windows = WindowCatalog.ListWindows(request.Selector, request.Limit);
+        return new
+        {
+            ok = true,
+            count = windows.Count,
+            windows
+        };
+    }
+
+    private static object BuildSnapshotResponse(SnapshotRequest request)
+    {
+        var window = WindowCatalog.ResolveWindow(request.Window);
+        if (window is null)
+        {
+            return new { ok = false, error = "No matching application window was found." };
+        }
+
+        var target = AutomationSearch.ResolveElement(window.Element, request.Element, request.SearchLimit);
+        if (target is null)
+        {
+            return new { ok = false, error = "No matching UI element was found in the selected window." };
+        }
+
+        var budget = new SnapshotBudget(request.MaxNodes ?? 120);
+        var tree = SnapshotBuilder.Build(target, 0, Math.Max(0, request.MaxDepth ?? 4), budget);
+        return new
+        {
+            ok = true,
+            window = SnapshotBuilder.BuildWindow(window),
+            target = tree,
+            truncated = budget.Truncated,
+            nodeCount = budget.Visited
+        };
+    }
+
+    private static object BuildActionResponse(ActionRequest request)
+    {
+        var action = NormalizeAction(request.Action);
+        var window = WindowCatalog.ResolveWindow(request.Window);
+        if (window is null)
+        {
+            return new { ok = false, error = "No matching application window was found." };
+        }
+
+        AutomationElement target;
+        if (action == "focus_window")
+        {
+            target = window.Element;
+            UiAutomationActions.FocusWindow(window);
+        }
+        else
+        {
+            target = AutomationSearch.ResolveElement(window.Element, request.Element, request.SearchLimit)
+                ?? throw new InvalidOperationException("No matching UI element was found in the selected window.");
+            UiAutomationActions.Perform(action, window, target, request);
+        }
+
+        return new
+        {
+            ok = true,
+            action,
+            window = SnapshotBuilder.BuildWindow(window),
+            target = SnapshotBuilder.BuildLeaf(target)
+        };
+    }
+}
+
+internal sealed class ServeRequest
+{
+    public string? Id { get; init; }
+    public string? Command { get; init; }
+    public JsonElement? Payload { get; init; }
+}
+
+internal sealed class ServeResponse
+{
+    public string? Id { get; init; }
+    public bool Ok { get; init; }
+    public string? Error { get; init; }
+    public object? Payload { get; init; }
 }
 
 internal sealed class ListWindowsRequest
@@ -205,6 +364,7 @@ internal sealed record WindowMatch(IntPtr Handle, AutomationElement Element, str
 
 internal static class WindowCatalog
 {
+    private const int SwShow = 5;
     private const int SwRestore = 9;
 
     public static List<object> ListWindows(UiSelector? selector, int? limit)
@@ -240,7 +400,13 @@ internal static class WindowCatalog
 
     public static void BringToFront(WindowMatch window)
     {
-        ShowWindow(window.Handle, SwRestore);
+        if (window.Handle == GetForegroundWindow())
+        {
+            return;
+        }
+
+        var command = IsIconic(window.Handle) ? SwRestore : SwShow;
+        ShowWindow(window.Handle, command);
         SetForegroundWindow(window.Handle);
     }
 
@@ -336,6 +502,9 @@ internal static class WindowCatalog
 
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr hWnd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
@@ -538,7 +707,7 @@ internal static class UiAutomationActions
 
             System.Windows.Forms.Clipboard.SetText(text);
             System.Threading.Thread.Sleep(40);
-            System.Windows.Forms.SendKeys.SendWait("^v");
+            SendPasteShortcut();
             System.Threading.Thread.Sleep(120);
         }
         finally
@@ -559,6 +728,87 @@ internal static class UiAutomationActions
             }
         }
     }
+
+    private static void SendPasteShortcut()
+    {
+        var inputs = new[]
+        {
+            CreateKeyboardInput(VkControl, keyUp: false),
+            CreateKeyboardInput(VkV, keyUp: false),
+            CreateKeyboardInput(VkV, keyUp: true),
+            CreateKeyboardInput(VkControl, keyUp: true)
+        };
+
+        var sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf<NativeInput>());
+        if (sent == inputs.Length)
+        {
+            return;
+        }
+
+        SendPasteShortcutWithKeybdEvent();
+    }
+
+    private static void SendPasteShortcutWithKeybdEvent()
+    {
+        keybd_event(VkControl, 0, 0, UIntPtr.Zero);
+        keybd_event(VkV, 0, 0, UIntPtr.Zero);
+        keybd_event(VkV, 0, KeyeventfKeyup, UIntPtr.Zero);
+        keybd_event(VkControl, 0, KeyeventfKeyup, UIntPtr.Zero);
+    }
+
+    private static NativeInput CreateKeyboardInput(ushort vk, bool keyUp)
+    {
+        return new NativeInput
+        {
+            Type = InputKeyboard,
+            Data = new InputUnion
+            {
+                Keyboard = new KeyboardInput
+                {
+                    Vk = vk,
+                    Scan = 0,
+                    Flags = keyUp ? KeyeventfKeyup : 0,
+                    Time = 0,
+                    ExtraInfo = IntPtr.Zero
+                }
+            }
+        };
+    }
+
+    private const int InputKeyboard = 1;
+    private const uint KeyeventfKeyup = 0x0002;
+    private const ushort VkControl = 0x11;
+    private const ushort VkV = 0x56;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeInput
+    {
+        public int Type;
+        public InputUnion Data;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion
+    {
+        [FieldOffset(0)]
+        public KeyboardInput Keyboard;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KeyboardInput
+    {
+        public ushort Vk;
+        public ushort Scan;
+        public uint Flags;
+        public uint Time;
+        public IntPtr ExtraInfo;
+    }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern uint SendInput(uint nInputs, NativeInput[] pInputs, int cbSize);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern void keybd_event(ushort bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     private static void SendKeys(WindowMatch window, AutomationElement target, string? text)
     {

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
-import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
@@ -13,12 +13,14 @@ import {
   Menu,
   nativeImage,
   Notification,
+  screen,
   session,
   shell,
   Tray
 } from 'electron'
-import { loadConfig } from '../src/config.mjs'
+import { loadConfig, normalizeRewriteProviderId } from '../src/config.mjs'
 import { createRewriteProvider } from '../src/rewrite-provider.mjs'
+import { resolveBundledHelperExecutable } from '../src/runtime-paths.mjs'
 import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
 import { createSttProvider } from '../src/stt-provider.mjs'
 import { SystemVolumeBridge } from '../src/system-volume.mjs'
@@ -33,6 +35,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const APP_NAME = 'DicTray'
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+const REWRITE_TEMPERATURE_OPTIONS = [0, 0.1, 0.2, 0.3, 0.5, 0.7, 1]
 const APP_ICON_SVG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.svg')
 const APP_ICON_PNG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.png')
 const APP_ICON_ICO_PATH = path.join(__dirname, '..', 'assets', 'app-icon.ico')
@@ -55,15 +58,37 @@ const HOTKEY_PRESETS = [
   { value: 'CommandOrControl+Alt+F13', label: 'Ctrl+Alt+F13' },
   { value: 'CommandOrControl+Alt+O', label: 'Ctrl+Alt+O' }
 ]
-const HOTKEY_BRIDGE = String(process.env.DICTATION_TRAY_HOTKEY_HELPER || '').trim() || path.join(__dirname, '..', 'scripts', 'windows-hotkey-hook', 'bin', 'Release', 'net10.0-windows', 'WindowsHotkeyHook.exe')
+const HOTKEY_BRIDGE = String(process.env.DICTATION_TRAY_HOTKEY_HELPER || '').trim()
+  || resolveBundledHelperExecutable('windows-hotkey-hook', 'WindowsHotkeyHook.exe')
+  || path.join(__dirname, '..', 'scripts', 'windows-hotkey-hook', 'bin', 'Release', 'net10.0-windows', 'WindowsHotkeyHook.exe')
 const ALLOWED_PERMISSIONS = new Set(['media', 'microphone'])
+const FORCE_ONBOARDING = /^(1|true|yes)$/i.test(String(process.env.DICTATION_TRAY_FORCE_ONBOARDING || '').trim())
 const STT_DEVICE_CPU = 'cpu'
 const STT_DEVICE_GPU = 'gpu'
 const STT_MODEL_TINY = 'tiny'
 const STT_MODEL_MIDDLE = 'middle'
 const STT_MODEL_ADVANCED = 'advanced'
+const SPEECH_EFFORT_LOW = 'low'
+const SPEECH_EFFORT_MID = 'mid'
+const SPEECH_EFFORT_HIGH = 'high'
+const SPEECH_TO_TEXT_LABEL = 'Speech to Text'
+const TEXT_IMPROVEMENT_LABEL = 'Text Improvement'
 const DAILY_CHARACTER_STATS_RETENTION_DAYS = 7
-const ONBOARDING_SAMPLE_TEXT = 'hello, my name is Denim.'
+const OUTPUT_HISTORY_LIMIT = 5
+const ONBOARDING_SAMPLE_TEXT = "I'm ready to give up on typing with my keyboard for ever"
+const HOTKEY_BRIDGE_RESTART_DELAY_MS = 150
+const HOTKEY_BRIDGE_RESTART_WINDOW_MS = 60000
+const HOTKEY_BRIDGE_MAX_RESTARTS = 20
+const VOICE_OVERLAY_WIDTH = 308
+const VOICE_OVERLAY_HEIGHT = 104
+const VOICE_OVERLAY_MARGIN = 18
+const VOICE_OVERLAY_GAP = 14
+const VOICE_OVERLAY_IDLE_HIDE_DELAY_MS = 1800
+const INPUT_SOURCE_WINDOW_WIDTH = 420
+const INPUT_SOURCE_WINDOW_HEIGHT = 520
+const TARGET_WINDOW_POLL_INTERVAL_MS = 280
+const EXIT_EXISTING_INSTANCE_ARG = '--dictray-exit-existing'
+const REQUEST_EXIT_EXISTING_INSTANCE = process.argv.includes(EXIT_EXISTING_INSTANCE_ARG)
 
 let runtimeConfig = null
 let speech = null
@@ -72,25 +97,36 @@ let systemVolume = null
 let uiAutomation = null
 let stateDir = ''
 let traySettingsPath = ''
+let speechPreferencesPath = ''
 let rewritePreferencesPath = ''
+let legacyRewritePreferencesPath = ''
 let dailyCharacterStatsPath = ''
 let onboardingStatePath = ''
+let outputHistoryPath = ''
+let diagnosticsLogPath = ''
 let tray = null
 let voiceWindow = null
+let inputSourceWindow = null
 let onboardingWindow = null
 let trayIcons = new Map()
 let windowIcon = null
 let hotkeyBridge = null
+let hotkeyBridgeRestartTimer = null
+let hotkeyBridgeRestartAtMs = []
 let refreshTimer = null
 let sttKeepWarmTimer = null
+let voiceOverlayHideTimer = null
+let voiceOverlayFocusedBounds = null
+let voiceOverlayFocusedBoundsRefresh = null
 let isQuitting = false
 let isRestoringVolumeForQuit = false
 let trayHotkey = DEFAULT_HOTKEY
-let rewriteEnabled = true
+let rewriteEnabled = false
 let duckingEnabled = true
 let duckingLevel = 0.3
 let currentRewriteModel = ''
-let currentRewriteThink = 'default'
+let currentRewriteThink = 'off'
+let currentRewriteTemperature = 0.1
 let rewriteModels = []
 let latestHealth = {
   stt: null,
@@ -98,9 +134,22 @@ let latestHealth = {
   automation: null
 }
 let sttPreferences = {
+  supported: false,
+  options: [],
+  modelOptions: [],
+  selectedDevice: '',
+  selectedModel: '',
   currentDevice: '',
   currentModel: '',
   provider: '',
+  error: ''
+}
+let preferredInputDeviceId = ''
+let inputDeviceState = {
+  available: [],
+  permission: 'unknown',
+  activeDeviceId: '',
+  activeLabel: '',
   error: ''
 }
 let voiceState = {
@@ -108,6 +157,8 @@ let voiceState = {
   transcript: '',
   finalText: '',
   targetWindow: '',
+  targetBounds: null,
+  targetElementBounds: null,
   note: '',
   error: ''
 }
@@ -119,21 +170,27 @@ let sttReadyForDictation = false
 let sttReadyNotificationAttached = false
 let lastSttBlockedNotificationAt = 0
 let sttKeepWarmInFlight = false
+let runtimeReloadInFlight = null
+let lastSttDiagnosticSignature = ''
+let lastSttHealthLogSignature = ''
 let volumeDuckState = null
 let dailyCharacterStats = {
   days: {}
 }
+let outputHistory = {
+  entries: []
+}
 let onboardingState = {
-  version: 1,
+  version: 2,
   seenAt: '',
   completedAt: '',
   profile: {
     name: ''
   },
   choices: {
-    localStt: true,
-    externalProviders: false,
-    rewriteCleanup: true
+    rewriteCleanup: false,
+    speechEffort: SPEECH_EFFORT_MID,
+    pushToTalkHotkey: DEFAULT_HOTKEY
   },
   typingBenchmark: {
     sampleText: ONBOARDING_SAMPLE_TEXT,
@@ -145,12 +202,23 @@ let onboardingState = {
 }
 
 const singleInstance = app.requestSingleInstanceLock()
-if (!singleInstance) {
+if (!singleInstance || REQUEST_EXIT_EXISTING_INSTANCE) {
   app.quit()
 }
 
-app.on('second-instance', () => {
-  rebuildMenu()
+app.on('second-instance', (_event, commandLine = []) => {
+  if (Array.isArray(commandLine) && commandLine.includes(EXIT_EXISTING_INSTANCE_ARG)) {
+    isQuitting = true
+    app.quit()
+    return
+  }
+  void reloadRuntimeConfig().then(async () => {
+    await scheduleSttWarmup({ notifyReady: true }).catch(() => null)
+    await refreshRuntimeState(false)
+    rebuildMenu()
+  }).catch((error) => {
+    console.error(`[dictray] Failed to reload runtime after relaunch: ${error?.message || error}`)
+  })
 })
 
 function compactText(value, limit = 88) {
@@ -159,6 +227,26 @@ function compactText(value, limit = 88) {
     return text
   }
   return `${text.slice(0, Math.max(0, limit - 3)).trim()}...`
+}
+
+function audioExtensionForMimeType(value) {
+  const mimeType = String(value || '').split(';', 1)[0].trim().toLowerCase()
+  switch (mimeType) {
+    case 'audio/webm':
+      return '.webm'
+    case 'audio/ogg':
+      return '.ogg'
+    case 'audio/wav':
+    case 'audio/x-wav':
+      return '.wav'
+    case 'audio/mp4':
+    case 'audio/m4a':
+      return '.m4a'
+    case 'audio/mpeg':
+      return '.mp3'
+    default:
+      return '.bin'
+  }
 }
 
 function formatCount(value) {
@@ -170,6 +258,10 @@ function clampUnitInterval(value) {
     return 0
   }
   return Math.max(0, Math.min(1, Number(value)))
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, value))
 }
 
 function normalizeDuckingEnabled(value) {
@@ -215,6 +307,103 @@ function formatHotkey(value) {
     .replace(/CommandOrControl/g, process.platform === 'darwin' ? 'CmdOrCtrl' : 'Ctrl')
 }
 
+function normalizeRewriteThink(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (['on', 'true', 'enabled', 'enable', '1'].includes(normalized)) {
+    return 'on'
+  }
+  if (['off', 'false', 'disabled', 'disable', '0', 'none'].includes(normalized)) {
+    return 'off'
+  }
+  return 'default'
+}
+
+function rewriteThinkMenuLabel(value) {
+  switch (normalizeRewriteThink(value)) {
+    case 'on':
+      return 'On'
+    case 'off':
+      return 'Off'
+    default:
+      return 'Default'
+  }
+}
+
+function normalizeRewriteTemperature(value) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) {
+    return 0.1
+  }
+
+  let best = REWRITE_TEMPERATURE_OPTIONS[0]
+  let bestDistance = Math.abs(best - numeric)
+  for (const option of REWRITE_TEMPERATURE_OPTIONS.slice(1)) {
+    const distance = Math.abs(option - numeric)
+    if (distance < bestDistance) {
+      best = option
+      bestDistance = distance
+    }
+  }
+  return best
+}
+
+function rewriteTemperatureLabel(value = currentRewriteTemperature) {
+  return normalizeRewriteTemperature(value).toFixed(1)
+}
+
+function normalizeInputDeviceId(value) {
+  return String(value || '').trim()
+}
+
+function normalizeInputPermission(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === 'granted' || normalized === 'denied' || normalized === 'prompt') {
+    return normalized
+  }
+  return 'unknown'
+}
+
+function normalizeAvailableInputDevices(values) {
+  const devices = []
+  const seen = new Set()
+  let unnamedIndex = 0
+
+  for (const value of Array.isArray(values) ? values : []) {
+    const deviceId = normalizeInputDeviceId(value?.deviceId)
+    const groupId = String(value?.groupId || '').trim()
+    const label = compactText(String(value?.label || '').trim() || `Microphone ${unnamedIndex + 1}`, 64)
+    const key = deviceId || `${groupId}:${label}`
+    if (!key || seen.has(key)) {
+      continue
+    }
+    seen.add(key)
+    devices.push({
+      deviceId,
+      groupId,
+      label
+    })
+    unnamedIndex += 1
+  }
+
+  return devices
+}
+
+function selectedInputSource() {
+  return inputDeviceState.available.find((device) => device.deviceId === preferredInputDeviceId) || null
+}
+
+function inputSourceMenuLabel() {
+  if (preferredInputDeviceId) {
+    if (!inputDeviceState.available.length) {
+      return 'Selected microphone'
+    }
+    return selectedInputSource()?.label || 'Selected microphone unavailable'
+  }
+
+  const activeLabel = compactText(inputDeviceState.activeLabel || '', 40)
+  return activeLabel ? `System Default (${activeLabel})` : 'System Default'
+}
+
 function normalizeSttDevicePreference(value) {
   switch (String(value || '').trim().toLowerCase()) {
     case 'gpu':
@@ -229,6 +418,15 @@ function normalizeSttDevicePreference(value) {
 
 function runtimeSttDevicePreference(value) {
   return normalizeSttDevicePreference(value) || STT_DEVICE_CPU
+}
+
+function runtimeSttDeviceOptions(values) {
+  const options = Array.isArray(values)
+    ? values
+      .map((value) => runtimeSttDevicePreference(value))
+      .filter(Boolean)
+    : []
+  return options.length ? [...new Set(options)] : [STT_DEVICE_CPU]
 }
 
 function normalizeSttModelPreference(value) {
@@ -249,8 +447,94 @@ function normalizeSttModelPreference(value) {
   return ''
 }
 
+function sttModelPreferenceOptions() {
+  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED]
+}
+
+function sttModelNameForPreference(value) {
+  switch (String(value || '').trim().toLowerCase()) {
+    case STT_MODEL_TINY:
+      return 'tiny.en'
+    case STT_MODEL_MIDDLE:
+      return 'base.en'
+    case STT_MODEL_ADVANCED:
+      return 'small.en'
+    default:
+      return ''
+  }
+}
+
+function normalizeSpeechEffort(value) {
+  switch (String(value || '').trim().toLowerCase()) {
+    case SPEECH_EFFORT_LOW:
+    case 'fast':
+    case 'faster':
+      return SPEECH_EFFORT_LOW
+    case SPEECH_EFFORT_HIGH:
+    case 'quality':
+      return SPEECH_EFFORT_HIGH
+    case SPEECH_EFFORT_MID:
+    case 'medium':
+    case 'middle':
+    case 'balanced':
+      return SPEECH_EFFORT_MID
+    default:
+      return ''
+  }
+}
+
+function speechEffortForModel(value) {
+  switch (normalizeSttModelPreference(value)) {
+    case STT_MODEL_TINY:
+      return SPEECH_EFFORT_LOW
+    case STT_MODEL_ADVANCED:
+      return SPEECH_EFFORT_HIGH
+    case STT_MODEL_MIDDLE:
+    default:
+      return SPEECH_EFFORT_MID
+  }
+}
+
+function sttModelForSpeechEffort(value) {
+  switch (normalizeSpeechEffort(value)) {
+    case SPEECH_EFFORT_LOW:
+      return 'tiny.en'
+    case SPEECH_EFFORT_HIGH:
+      return 'small.en'
+    case SPEECH_EFFORT_MID:
+    default:
+      return 'base.en'
+  }
+}
+
+function speechEffortLabel(value) {
+  switch (normalizeSpeechEffort(value)) {
+    case SPEECH_EFFORT_LOW:
+      return 'Low (Faster)'
+    case SPEECH_EFFORT_HIGH:
+      return 'High (Quality)'
+    case SPEECH_EFFORT_MID:
+    default:
+      return 'Mid (Balanced)'
+  }
+}
+
 function runtimeSttModelPreference(value) {
   return normalizeSttModelPreference(value) || ''
+}
+
+function speechPreferenceRuntimePatch(devicePreference) {
+  const normalized = normalizeSttDevicePreference(devicePreference)
+  if (normalized === STT_DEVICE_GPU) {
+    return {
+      device: 'cuda',
+      computeType: 'float16'
+    }
+  }
+  return {
+    device: 'cpu',
+    computeType: 'int8'
+  }
 }
 
 function normalizeRewriteEnabled(value) {
@@ -262,6 +546,10 @@ function nowMs(startedAt) {
 }
 
 function showNotification(title, body) {
+  void appendDiagnosticsLog('notification', {
+    title: String(title || '').trim(),
+    body: String(body || '').trim()
+  })
   if (!Notification.isSupported()) {
     return
   }
@@ -272,23 +560,8 @@ function showNotification(title, body) {
   }).show()
 }
 
-function sttRuntimeNotificationLabel() {
-  const provider = String(runtimeConfig?.speech?.stt?.provider || '').trim()
-  const device = sttPreferences.currentDevice || ''
-  const model = String(sttPreferences.currentModel || '').trim()
-  const modelLabel = model
-    ? sttModelMenuLabel(runtimeSttModelPreference(model) || model)
-    : ''
-  return [
-    provider ? provider.toUpperCase() : '',
-    device ? sttDeviceLabel(device) : '',
-    modelLabel
-  ].filter(Boolean).join(' / ')
-}
-
 function notifySttReady() {
-  const label = sttRuntimeNotificationLabel()
-  showNotification(APP_NAME, label ? `STT is ready: ${label}.` : 'STT is ready for dictation.')
+  showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} is ready.`)
 }
 
 function maybeNotifySttBlocked(message, minIntervalMs = 4000) {
@@ -298,6 +571,103 @@ function maybeNotifySttBlocked(message, minIntervalMs = 4000) {
   }
   lastSttBlockedNotificationAt = now
   showNotification(APP_NAME, message)
+}
+
+function providerUsesHttpStt() {
+  const providerId = String(speech?.id || runtimeConfig?.stt?.provider || '').trim().toLowerCase()
+  return providerId === 'http'
+}
+
+function sttDiagnosticSnapshot(health = latestHealth.stt) {
+  if (!health) {
+    return null
+  }
+
+  return {
+    provider: String(health?.providerId || health?.provider || runtimeConfig?.stt?.provider || '').trim(),
+    message: String(health?.error || '').trim(),
+    detail: String(health?.detail || '').trim(),
+    pythonBin: String(health?.pythonBin || runtimeConfig?.stt?.local?.pythonBin || '').trim(),
+    daemonScript: String(health?.daemonScript || runtimeConfig?.stt?.local?.daemonScript || '').trim(),
+    transcribeScript: String(health?.transcribeScript || runtimeConfig?.stt?.local?.transcribeScript || '').trim(),
+    model: String(health?.model || runtimeConfig?.stt?.local?.model || '').trim(),
+    modelDir: String(health?.modelDir || runtimeConfig?.stt?.local?.modelDir || '').trim(),
+    device: String(health?.device || runtimeConfig?.stt?.local?.device || '').trim(),
+    computeType: String(health?.computeType || runtimeConfig?.stt?.local?.computeType || '').trim(),
+    bundledRuntimeDir: String(process.env.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || '').trim(),
+    stateDir: String(stateDir || '').trim()
+  }
+}
+
+function logSttDiagnostic(context, health = latestHealth.stt, force = false) {
+  if (!health || health.ok) {
+    return
+  }
+
+  const snapshot = {
+    context,
+    ...sttDiagnosticSnapshot(health)
+  }
+  const signature = JSON.stringify(snapshot)
+  if (!force && signature === lastSttDiagnosticSignature) {
+    return
+  }
+  lastSttDiagnosticSignature = signature
+
+  console.error('[dictray] Speech to Text diagnostic:', snapshot)
+  if (snapshot.detail) {
+    console.error(`[dictray] Speech to Text raw detail:\n${snapshot.detail}`)
+  }
+  void appendDiagnosticsLog('stt-diagnostic', snapshot)
+}
+
+async function appendDiagnosticsLog(kind, payload = {}) {
+  if (!diagnosticsLogPath) {
+    return
+  }
+
+  const entry = {
+    at: new Date().toISOString(),
+    kind,
+    payload
+  }
+
+  try {
+    await mkdir(path.dirname(diagnosticsLogPath), { recursive: true })
+    await appendFile(diagnosticsLogPath, `${JSON.stringify(entry)}\n`, 'utf8')
+  } catch {
+    // ignore diagnostics logging failures
+  }
+}
+
+async function saveFailedSubmissionSample(kind, audioBytes, mimeType, metadata = {}) {
+  if (!(audioBytes instanceof Uint8Array) || !audioBytes.length || !stateDir) {
+    return null
+  }
+
+  const debugDir = path.join(stateDir, 'stt-debug')
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const baseName = `${stamp}-${kind}`
+  const audioPath = path.join(debugDir, `${baseName}${audioExtensionForMimeType(mimeType)}`)
+  const metadataPath = path.join(debugDir, `${baseName}.json`)
+
+  try {
+    await mkdir(debugDir, { recursive: true })
+    await writeFile(audioPath, Buffer.from(audioBytes))
+    await writeFile(metadataPath, `${JSON.stringify({
+      at: new Date().toISOString(),
+      kind,
+      mimeType: String(mimeType || 'application/octet-stream').trim(),
+      audioBytes: audioBytes.length,
+      ...metadata
+    }, null, 2)}\n`, 'utf8')
+    return {
+      audioPath,
+      metadataPath
+    }
+  } catch {
+    return null
+  }
 }
 
 function createAbortError(message = 'Dictation was cancelled.') {
@@ -337,6 +707,214 @@ function throwIfSubmissionCancelled(submission) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function clearVoiceOverlayHideTimer() {
+  if (voiceOverlayHideTimer) {
+    clearTimeout(voiceOverlayHideTimer)
+    voiceOverlayHideTimer = null
+  }
+}
+
+function normalizeOverlayBounds(bounds, { allowPoint = false } = {}) {
+  if (!bounds || typeof bounds !== 'object') {
+    return null
+  }
+
+  const left = Number(bounds.left)
+  const top = Number(bounds.top)
+  const width = Number(bounds.width)
+  const height = Number(bounds.height)
+  if (![left, top, width, height].every(Number.isFinite)) {
+    return null
+  }
+
+  if (width <= 0 || height <= 0) {
+    if (!allowPoint) {
+      return null
+    }
+    return {
+      left,
+      top,
+      width: 1,
+      height: 1
+    }
+  }
+
+  return {
+    left,
+    top,
+    width,
+    height
+  }
+}
+
+function sameOverlayBounds(a, b) {
+  if (!a && !b) {
+    return true
+  }
+  if (!a || !b) {
+    return false
+  }
+  return a.left === b.left
+    && a.top === b.top
+    && a.width === b.width
+    && a.height === b.height
+}
+
+function resolveVoiceOverlayWindowBounds(state = voiceState) {
+  const focusedWindowBounds = normalizeOverlayBounds(voiceOverlayFocusedBounds)
+  if (focusedWindowBounds) {
+    return focusedWindowBounds
+  }
+  const windowBounds = normalizeOverlayBounds(state?.targetBounds)
+  if (windowBounds) {
+    return windowBounds
+  }
+
+  return null
+}
+
+function clampOverlayAxis(value, origin, availableSize, overlaySize) {
+  const maxOffset = Math.max(0, availableSize - overlaySize)
+  const min = origin + Math.min(VOICE_OVERLAY_MARGIN, maxOffset)
+  const max = origin + Math.max(0, maxOffset - VOICE_OVERLAY_MARGIN)
+  return Math.round(clampNumber(value, Math.min(min, max), Math.max(min, max)))
+}
+
+function computeVoiceOverlayBounds(state = voiceState) {
+  const windowBounds = resolveVoiceOverlayWindowBounds(state)
+  if (!windowBounds && voiceWindow && !voiceWindow.isDestroyed() && voiceWindow.isVisible()) {
+    return voiceWindow.getBounds()
+  }
+  const matchingRect = windowBounds
+    ? {
+        x: Math.round(windowBounds.left),
+        y: Math.round(windowBounds.top),
+        width: Math.max(1, Math.round(windowBounds.width)),
+        height: Math.max(1, Math.round(windowBounds.height))
+      }
+    : {
+        x: 0,
+        y: 0,
+        width: VOICE_OVERLAY_WIDTH,
+        height: VOICE_OVERLAY_HEIGHT
+      }
+  const display = windowBounds ? screen.getDisplayMatching(matchingRect) : screen.getPrimaryDisplay()
+  const workArea = display?.workArea || {
+    x: 0,
+    y: 0,
+    width: VOICE_OVERLAY_WIDTH + (VOICE_OVERLAY_MARGIN * 2),
+    height: VOICE_OVERLAY_HEIGHT + (VOICE_OVERLAY_MARGIN * 2)
+  }
+
+  let x = workArea.x + Math.round((workArea.width - VOICE_OVERLAY_WIDTH) / 2)
+  let y = workArea.y + workArea.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
+  if (windowBounds) {
+    x = windowBounds.left + Math.round((windowBounds.width - VOICE_OVERLAY_WIDTH) / 2)
+    y = windowBounds.top + windowBounds.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
+  }
+
+  return {
+    x: clampOverlayAxis(x, workArea.x, workArea.width, VOICE_OVERLAY_WIDTH),
+    y: clampOverlayAxis(y, workArea.y, workArea.height, VOICE_OVERLAY_HEIGHT),
+    width: VOICE_OVERLAY_WIDTH,
+    height: VOICE_OVERLAY_HEIGHT
+  }
+}
+
+function voiceOverlayVisible(state = voiceState) {
+  return state.phase !== 'idle' || Boolean(state.error || state.note)
+}
+
+function buildVoiceOverlayPayload(state = voiceState) {
+  return {
+    visible: voiceOverlayVisible(state),
+    phase: String(state?.phase || 'idle').trim() || 'idle',
+    targetWindow: compactText(state?.targetWindow || '', 70),
+    note: compactText(state?.note || '', 120),
+    error: compactText(state?.error || '', 120)
+  }
+}
+
+function syncAudioInputConfig(window, { refresh = false } = {}) {
+  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) {
+    return
+  }
+
+  window.webContents.send('dictation:audio-input-config', {
+    preferredInputDeviceId,
+    refresh: Boolean(refresh)
+  })
+}
+
+function syncAllAudioInputConfig({ refresh = false } = {}) {
+  syncAudioInputConfig(voiceWindow, { refresh })
+  syncAudioInputConfig(inputSourceWindow, { refresh })
+}
+
+function scheduleVoiceOverlayHide(delayMs = VOICE_OVERLAY_IDLE_HIDE_DELAY_MS) {
+  clearVoiceOverlayHideTimer()
+  voiceOverlayHideTimer = setTimeout(() => {
+    voiceOverlayHideTimer = null
+    if (!voiceWindow || voiceWindow.isDestroyed()) {
+      return
+    }
+    if (voiceState.phase === 'idle') {
+      voiceWindow.hide()
+    }
+  }, Math.max(0, Number(delayMs) || 0))
+}
+
+async function refreshVoiceOverlayFocusedBounds() {
+  if (voiceOverlayFocusedBoundsRefresh || !uiAutomation || !voiceOverlayVisible()) {
+    return voiceOverlayFocusedBoundsRefresh
+  }
+
+  voiceOverlayFocusedBoundsRefresh = (async () => {
+    try {
+      const focusedWindow = await getFocusedWindowSnapshot().catch(() => null)
+      const nextBounds = normalizeOverlayBounds(focusedWindow?.bounds)
+      if (!sameOverlayBounds(voiceOverlayFocusedBounds, nextBounds)) {
+        voiceOverlayFocusedBounds = nextBounds
+        if (voiceWindow && !voiceWindow.isDestroyed() && voiceOverlayVisible()) {
+          voiceWindow.setBounds(computeVoiceOverlayBounds(), false)
+        }
+      }
+    } finally {
+      voiceOverlayFocusedBoundsRefresh = null
+    }
+  })()
+
+  return voiceOverlayFocusedBoundsRefresh
+}
+
+function syncVoiceOverlay() {
+  if (!voiceWindow || voiceWindow.isDestroyed()) {
+    return
+  }
+
+  clearVoiceOverlayHideTimer()
+  const payload = buildVoiceOverlayPayload()
+  if (!payload.visible) {
+    voiceOverlayFocusedBounds = null
+    if (voiceWindow.isVisible()) {
+      voiceWindow.hide()
+    }
+    return
+  }
+
+  void refreshVoiceOverlayFocusedBounds()
+  voiceWindow.setBounds(computeVoiceOverlayBounds(), false)
+  if (!voiceWindow.webContents.isDestroyed()) {
+    voiceWindow.webContents.send('dictation:voice-state', payload)
+  }
+  if (!voiceWindow.isVisible()) {
+    voiceWindow.showInactive()
+  }
+  if (voiceState.phase === 'idle') {
+    scheduleVoiceOverlayHide()
+  }
 }
 
 async function readJsonFile(filePath, fallback = {}) {
@@ -389,23 +967,22 @@ function normalizeProfileName(value) {
 
 function normalizeOnboardingState(input = {}) {
   const source = input && typeof input === 'object' ? input : {}
-  const currentProvider = String(runtimeConfig?.stt?.provider || '').trim().toLowerCase()
-  const defaultLocalStt = currentProvider === 'local'
+  const defaultRewriteCleanup = rewriteProviderId() !== 'none' && rewriteEnabled
+  const defaultSpeechEffort = speechEffortForModel(runtimeConfig?.stt?.local?.model || sttPreferences.currentModel || 'base.en')
+  const defaultPushToTalkHotkey = hotkeyManagedByEnv()
+    ? String(process.env.DICTATION_TRAY_HOTKEY || DEFAULT_HOTKEY).trim() || DEFAULT_HOTKEY
+    : normalizeTrayHotkey(trayHotkey || DEFAULT_HOTKEY)
   return {
-    version: 1,
+    version: 2,
     seenAt: String(source?.seenAt || '').trim(),
     completedAt: String(source?.completedAt || '').trim(),
     profile: {
       name: normalizeProfileName(source?.profile?.name)
     },
     choices: {
-      localStt: source?.choices?.localStt !== undefined
-        ? Boolean(source.choices.localStt)
-        : source?.choices?.managedDockerStt !== undefined
-          ? !Boolean(source.choices.managedDockerStt)
-          : defaultLocalStt,
-      externalProviders: source?.choices?.externalProviders !== undefined ? Boolean(source.choices.externalProviders) : false,
-      rewriteCleanup: source?.choices?.rewriteCleanup !== undefined ? Boolean(source.choices.rewriteCleanup) : rewriteEnabled
+      rewriteCleanup: source?.choices?.rewriteCleanup !== undefined ? Boolean(source.choices.rewriteCleanup) : defaultRewriteCleanup,
+      speechEffort: normalizeSpeechEffort(source?.choices?.speechEffort) || defaultSpeechEffort,
+      pushToTalkHotkey: normalizeTrayHotkey(source?.choices?.pushToTalkHotkey || defaultPushToTalkHotkey)
     },
     typingBenchmark: buildTypingBenchmark(source?.typingBenchmark || {})
   }
@@ -500,6 +1077,30 @@ function normalizeDailyCharacterStats(input = {}, referenceDate = new Date()) {
   return { days }
 }
 
+function normalizeOutputHistoryEntry(input = {}) {
+  const source = input && typeof input === 'object' ? input : {}
+  const text = String(source?.text || '').replace(/\s+/g, ' ').trim()
+  const mode = String(source?.mode || '').trim().toLowerCase() === 'improved'
+    ? 'improved'
+    : 'speech'
+  const createdAt = String(source?.createdAt || '').trim()
+  return {
+    text: text.slice(0, 4000),
+    mode,
+    createdAt
+  }
+}
+
+function normalizeOutputHistory(input = {}) {
+  const source = input && typeof input === 'object' ? input : {}
+  const rawEntries = Array.isArray(source.entries) ? source.entries : []
+  const entries = rawEntries
+    .map((entry) => normalizeOutputHistoryEntry(entry))
+    .filter((entry) => entry.text)
+    .slice(0, OUTPUT_HISTORY_LIMIT)
+  return { entries }
+}
+
 async function loadDailyCharacterStats() {
   dailyCharacterStats = normalizeDailyCharacterStats(await readJsonFile(dailyCharacterStatsPath, {}))
 }
@@ -507,6 +1108,41 @@ async function loadDailyCharacterStats() {
 async function saveDailyCharacterStats() {
   dailyCharacterStats = normalizeDailyCharacterStats(dailyCharacterStats)
   await writeJsonFile(dailyCharacterStatsPath, dailyCharacterStats)
+}
+
+async function loadOutputHistory() {
+  outputHistory = normalizeOutputHistory(await readJsonFile(outputHistoryPath, {}))
+}
+
+async function saveOutputHistory() {
+  outputHistory = normalizeOutputHistory(outputHistory)
+  await writeJsonFile(outputHistoryPath, outputHistory)
+}
+
+async function recordOutputHistory(text, { improved = false } = {}) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim()
+  if (!normalized) {
+    return null
+  }
+
+  outputHistory = normalizeOutputHistory(outputHistory)
+  outputHistory.entries = [
+    {
+      text: normalized,
+      mode: improved ? 'improved' : 'speech',
+      createdAt: new Date().toISOString()
+    },
+    ...outputHistory.entries
+  ].slice(0, OUTPUT_HISTORY_LIMIT)
+
+  await saveOutputHistory()
+  rebuildMenu()
+  return outputHistory.entries[0]
+}
+
+function outputHistoryMenuLabel(entry) {
+  const mode = String(entry?.mode || '').trim() === 'improved' ? 'Improved' : 'Speech'
+  return `[${mode}] ${compactText(entry?.text || '', 96)}`
 }
 
 function currentDailyCharacterCount() {
@@ -536,20 +1172,48 @@ async function recordGeneratedCharacters(text) {
   return count
 }
 
+async function readSharedSpeechPreferences() {
+  const parsed = await readJsonFile(speechPreferencesPath, {})
+  return {
+    sttDevice: normalizeSttDevicePreference(parsed?.sttDevice),
+    sttModel: normalizeSttModelPreference(parsed?.sttModel)
+  }
+}
+
+async function writeSharedSpeechPreferences(input = {}) {
+  const payload = {
+    sttDevice: normalizeSttDevicePreference(input?.sttDevice),
+    sttModel: normalizeSttModelPreference(input?.sttModel)
+  }
+  await writeJsonFile(speechPreferencesPath, payload)
+  return payload
+}
+
 async function readSharedRewritePreferences() {
-  const parsed = await readJsonFile(rewritePreferencesPath, {})
+  const primary = await readJsonFile(rewritePreferencesPath, {})
+  const hasPrimaryPreferences = primary && typeof primary === 'object'
+    && ['provider', 'think', 'model', 'temperature'].some((key) => primary[key] !== undefined)
+  const parsed = hasPrimaryPreferences
+    ? primary
+    : await readJsonFile(legacyRewritePreferencesPath, {})
+  const rawThink = String(parsed?.think || '').trim()
+  const migratedThink = !rawThink || rawThink.toLowerCase() === 'default'
+    ? 'off'
+    : rawThink
   return {
     provider: String(parsed?.provider || '').trim(),
-    think: String(parsed?.think || '').trim(),
-    model: String(parsed?.model || '').trim()
+    think: normalizeRewriteThink(migratedThink),
+    model: String(parsed?.model || '').trim(),
+    temperature: normalizeRewriteTemperature(parsed?.temperature ?? 0.1)
   }
 }
 
 async function writeSharedRewritePreferences(input = {}) {
   const payload = {
     provider: String(input?.provider || runtimeConfig?.rewrite?.provider || '').trim(),
-    think: String(input?.think || currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'default').trim() || 'default',
-    model: String(input?.model || currentRewriteModel || runtimeConfig?.rewrite?.ollama?.model || '').trim()
+    think: normalizeRewriteThink(input?.think || currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'off'),
+    model: String(input?.model || currentRewriteModel || runtimeConfig?.rewrite?.ollama?.model || '').trim(),
+    temperature: normalizeRewriteTemperature(input?.temperature ?? currentRewriteTemperature ?? runtimeConfig?.rewrite?.ollama?.temperature ?? 0.1)
   }
   await writeJsonFile(rewritePreferencesPath, payload)
   return payload
@@ -572,12 +1236,16 @@ async function loadTraySettings() {
   if (parsed?.rewriteEnabled !== undefined) {
     rewriteEnabled = normalizeRewriteEnabled(parsed?.rewriteEnabled)
   }
+  if (String(runtimeConfig?.rewrite?.provider || '').trim().toLowerCase() === 'none') {
+    rewriteEnabled = false
+  }
   if (parsed?.duckingEnabled !== undefined) {
     duckingEnabled = normalizeDuckingEnabled(parsed?.duckingEnabled)
   }
   if (parsed?.duckingLevel !== undefined) {
     duckingLevel = normalizeDuckingLevel(parsed?.duckingLevel)
   }
+  preferredInputDeviceId = normalizeInputDeviceId(parsed?.inputDeviceId)
 }
 
 async function saveTraySettings() {
@@ -585,7 +1253,8 @@ async function saveTraySettings() {
     hotkey: hotkeyManagedByEnv() ? undefined : trayHotkey,
     rewriteEnabled,
     duckingEnabled,
-    duckingLevel
+    duckingLevel,
+    inputDeviceId: preferredInputDeviceId || undefined
   })
 }
 
@@ -702,12 +1371,18 @@ async function ensureVoiceWindow() {
 
   voiceWindow = new BrowserWindow({
     show: false,
-    width: 320,
-    height: 180,
+    width: VOICE_OVERLAY_WIDTH,
+    height: VOICE_OVERLAY_HEIGHT,
     icon: appIcon(),
     skipTaskbar: true,
     frame: false,
     transparent: true,
+    resizable: false,
+    movable: false,
+    minimizable: false,
+    maximizable: false,
+    hasShadow: false,
+    backgroundColor: '#00000000',
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       contextIsolation: true,
@@ -725,7 +1400,55 @@ async function ensureVoiceWindow() {
   })
 
   await voiceWindow.loadFile(path.join(__dirname, 'voice.html'))
+  voiceWindow.setAlwaysOnTop(true, 'screen-saver')
+  voiceWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+  voiceWindow.setIgnoreMouseEvents(true, { forward: true })
+  syncVoiceOverlay()
+  syncAudioInputConfig(voiceWindow, { refresh: true })
   return voiceWindow
+}
+
+async function ensureInputSourceWindow() {
+  if (inputSourceWindow && !inputSourceWindow.isDestroyed()) {
+    return inputSourceWindow
+  }
+
+  inputSourceWindow = new BrowserWindow({
+    show: false,
+    width: INPUT_SOURCE_WINDOW_WIDTH,
+    height: INPUT_SOURCE_WINDOW_HEIGHT,
+    minWidth: INPUT_SOURCE_WINDOW_WIDTH,
+    minHeight: INPUT_SOURCE_WINDOW_HEIGHT,
+    autoHideMenuBar: true,
+    backgroundColor: '#08131a',
+    title: `${APP_NAME} Input Source`,
+    icon: appIcon(),
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.mjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      backgroundThrottling: false,
+      sandbox: false
+    }
+  })
+
+  inputSourceWindow.on('closed', () => {
+    inputSourceWindow = null
+  })
+
+  await inputSourceWindow.loadFile(path.join(__dirname, 'input-source.html'))
+  syncAudioInputConfig(inputSourceWindow, { refresh: true })
+  return inputSourceWindow
+}
+
+async function openInputSourceWindow() {
+  const window = await ensureInputSourceWindow()
+  if (window.isMinimized()) {
+    window.restore()
+  }
+  window.show()
+  window.focus()
+  return window
 }
 
 async function ensureOnboardingWindow() {
@@ -781,22 +1504,28 @@ async function openOnboardingWindow({ markSeen = false } = {}) {
 }
 
 async function maybeShowOnboarding() {
-  if (onboardingState.seenAt) {
+  if (!FORCE_ONBOARDING && onboardingState.seenAt) {
     return
   }
-  await openOnboardingWindow({ markSeen: true }).catch((error) => {
+  await openOnboardingWindow({ markSeen: !onboardingState.seenAt }).catch((error) => {
     console.error(`[dictray] Failed to open onboarding: ${error?.message || error}`)
   })
 }
 
 function onboardingStatePayload() {
+  const currentSpeechEffort = normalizeSpeechEffort(onboardingState?.choices?.speechEffort)
+    || speechEffortForModel(runtimeConfig?.stt?.local?.model || sttPreferences.currentModel || 'base.en')
   return {
     sampleText: ONBOARDING_SAMPLE_TEXT,
     state: onboardingState,
     runtime: {
       sttProvider: String(speech?.label || latestHealth.stt?.providerLabel || runtimeConfig?.stt?.provider || '').trim(),
       rewriteProvider: String(rewriteProvider?.label || latestHealth.rewrite?.providerLabel || runtimeConfig?.rewrite?.provider || '').trim(),
-      rewriteEnabled
+      rewriteEnabled,
+      speechEffort: currentSpeechEffort,
+      hotkey: trayHotkey,
+      hotkeyManagedByEnv: hotkeyManagedByEnv(),
+      hotkeyPresets: HOTKEY_PRESETS
     }
   }
 }
@@ -804,6 +1533,10 @@ function onboardingStatePayload() {
 async function completeOnboarding(input = {}) {
   const measuredAt = new Date().toISOString()
   const profileName = normalizeProfileName(input?.profile?.name)
+  const rewriteCleanup = Boolean(input?.choices?.rewriteCleanup)
+  const speechEffort = normalizeSpeechEffort(input?.choices?.speechEffort)
+    || speechEffortForModel(runtimeConfig?.stt?.local?.model || sttPreferences.currentModel || 'base.en')
+  const pushToTalkHotkey = normalizeTrayHotkey(input?.choices?.pushToTalkHotkey || trayHotkey || DEFAULT_HOTKEY)
   const typingBenchmark = buildTypingBenchmark({
     ...input?.typingBenchmark,
     measuredAt
@@ -825,14 +1558,41 @@ async function completeOnboarding(input = {}) {
     },
     choices: {
       ...onboardingState.choices,
-      ...input?.choices
+      rewriteCleanup,
+      speechEffort,
+      pushToTalkHotkey
     },
     typingBenchmark
   })
 
-  rewriteEnabled = Boolean(onboardingState.choices.rewriteCleanup)
+  runtimeConfig.stt.local.model = sttModelForSpeechEffort(onboardingState.choices.speechEffort)
+  speech = createSttProvider({
+    ...runtimeConfig.stt,
+    rootDir: runtimeConfig.rootDir
+  }, stateDir)
+  sttReadyForDictation = false
+
+  if (!hotkeyManagedByEnv()) {
+    trayHotkey = onboardingState.choices.pushToTalkHotkey
+    await registerHotkey()
+  }
+
+  if (rewriteCleanup && rewriteProviderId() === 'none') {
+    runtimeConfig.rewrite.provider = 'ollama'
+    rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
+  }
+
+  rewriteEnabled = rewriteCleanup && rewriteProviderId() !== 'none'
+  await writeSharedRewritePreferences({
+    provider: runtimeConfig.rewrite.provider,
+    think: currentRewriteThink,
+    model: currentRewriteModel,
+    temperature: currentRewriteTemperature
+  })
   await saveTraySettings()
   await saveOnboardingState()
+  await scheduleSttWarmup({ notifyReady: false }).catch(() => null)
+  await refreshRuntimeState(false)
   rebuildMenu()
   return onboardingStatePayload()
 }
@@ -843,6 +1603,7 @@ function updateVoiceState(patch = {}) {
     ...patch
   }
   rebuildMenu()
+  syncVoiceOverlay()
 }
 
 function clearVoiceState(error = '') {
@@ -851,6 +1612,8 @@ function clearVoiceState(error = '') {
     transcript: '',
     finalText: '',
     targetWindow: '',
+    targetBounds: null,
+    targetElementBounds: null,
     note: '',
     error: String(error || '')
   })
@@ -866,6 +1629,8 @@ function phaseLabel() {
       return 'State: rewriting'
     case 'inserting':
       return 'State: inserting'
+    case 'pending_insert':
+      return 'State: waiting to insert'
     case 'processing':
       return 'State: processing'
     default:
@@ -874,10 +1639,12 @@ function phaseLabel() {
 }
 
 function runtimeLabel() {
-  const provider = String(sttPreferences.provider || runtimeConfig?.stt?.provider || 'unknown').trim()
   const device = String(sttPreferences.currentDevice || '').trim()
   const model = String(sttPreferences.currentModel || '').trim()
-  return `${provider}${device ? `/${sttDeviceLabel(device)}` : ''}${model ? `/${model}` : ''}`
+  const modelLabel = model
+    ? sttModelMenuLabel(runtimeSttModelPreference(model) || model)
+    : ''
+  return [device ? sttDeviceLabel(device) : '', modelLabel].filter(Boolean).join(' / ') || 'Ready'
 }
 
 function healthValue(ok, up = 'ready', down = 'down') {
@@ -906,7 +1673,17 @@ function rewriteProviderId() {
 }
 
 function rewriteProviderLabel() {
-  return String(rewriteProvider?.label || latestHealth.rewrite?.providerLabel || rewriteProviderId()).trim() || 'Rewrite'
+  return String(rewriteProvider?.label || latestHealth.rewrite?.providerLabel || rewriteProviderId()).trim() || TEXT_IMPROVEMENT_LABEL
+}
+
+function rewriteProviderMenuLabel(value = rewriteProviderId()) {
+  switch (normalizeRewriteProviderId(value)) {
+    case 'ollama':
+      return 'Ollama'
+    case 'none':
+    default:
+      return 'Off'
+  }
 }
 
 function rewriteSupportsModelSelection() {
@@ -921,7 +1698,7 @@ function rewriteStatusLabel() {
 }
 
 function rewriteThinkSetting() {
-  return String(currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'default').trim() || 'default'
+  return normalizeRewriteThink(currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'off')
 }
 
 function rebuildMenu() {
@@ -939,6 +1716,23 @@ function rebuildMenu() {
   const dailyCharacterLabel = `Keys Saved Today: ${formatCount(currentDailyCharacterCount())}`
   const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
   const quickStartMenuLabel = onboardingCompleted() ? 'Open Quick Start' : 'Finish Quick Start'
+  const historyMenu = outputHistory.entries.length > 0
+    ? [{
+        label: 'Click any entry to copy it',
+        enabled: false
+      }, {
+        type: 'separator'
+      }, ...outputHistory.entries.map((entry) => ({
+        label: outputHistoryMenuLabel(entry),
+        click: () => {
+          clipboard.writeText(String(entry?.text || ''))
+          showNotification(APP_NAME, 'Saved text copied to clipboard.')
+        }
+      }))]
+    : [{
+        label: 'No saved text yet',
+        enabled: false
+      }]
 
   const modelMenu = rewriteSupportsModelSelection()
     ? rewriteModels.length
@@ -958,28 +1752,154 @@ function rebuildMenu() {
         }]
     : [{
         label: rewriteProviderId() === 'none'
-          ? 'Rewrite provider disabled'
+          ? 'Choose Text Improvement Provider first'
           : `Model selection unavailable for ${rewriteProviderLabel()}`,
         enabled: false
       }]
 
-  const sttDeviceMenu = [{
-    label: sttPreferences.currentDevice ? sttDeviceLabel(sttPreferences.currentDevice) : 'Unknown',
+  const rewriteThinkMenu = [{
+    label: `Current: ${rewriteThinkMenuLabel(currentRewriteThink)}`,
     enabled: false
   }, {
-    label: 'Change in config and restart',
-    enabled: false
+    label: 'Off',
+    type: 'radio',
+    checked: normalizeRewriteThink(currentRewriteThink) === 'off',
+    click: () => {
+      void updateRewriteThink('off')
+    }
+  }, {
+    label: 'Default',
+    type: 'radio',
+    checked: normalizeRewriteThink(currentRewriteThink) === 'default',
+    click: () => {
+      void updateRewriteThink('default')
+    }
+  }, {
+    label: 'On',
+    type: 'radio',
+    checked: normalizeRewriteThink(currentRewriteThink) === 'on',
+    click: () => {
+      void updateRewriteThink('on')
+    }
   }]
 
-  const sttModelMenu = [{
-    label: sttPreferences.currentModel
-      ? sttModelMenuLabel(runtimeSttModelPreference(sttPreferences.currentModel) || sttPreferences.currentModel)
-      : 'Unknown',
+  const rewriteTemperatureMenu = [{
+    label: `Current: ${rewriteTemperatureLabel()}`,
+    enabled: false
+  }, ...REWRITE_TEMPERATURE_OPTIONS.map((value) => ({
+    label: rewriteTemperatureLabel(value),
+    type: 'radio',
+    checked: normalizeRewriteTemperature(currentRewriteTemperature) === value,
+    click: () => {
+      void updateRewriteTemperature(value)
+    }
+  }))]
+
+  const rewriteProviderMenu = [{
+    label: `Current: ${rewriteProviderMenuLabel()}`,
     enabled: false
   }, {
-    label: 'Change in config and restart',
-    enabled: false
+    label: 'Off',
+    type: 'radio',
+    checked: rewriteProviderId() === 'none',
+    click: () => {
+      void updateRewriteProvider('none')
+    }
+  }, {
+    label: 'Ollama',
+    type: 'radio',
+    checked: rewriteProviderId() === 'ollama',
+    click: () => {
+      void updateRewriteProvider('ollama')
+    }
   }]
+
+  const selectedInputDevice = selectedInputSource()
+  const inputSourceMenu = [
+    {
+      label: `Current: ${inputSourceMenuLabel()}`,
+      enabled: false
+    },
+    {
+      label: 'Open Live Preview',
+      click: () => {
+        void openInputSourceWindow()
+      }
+    },
+    { type: 'separator' },
+    ...(preferredInputDeviceId && inputDeviceState.available.length && !selectedInputDevice
+      ? [{
+          label: 'Selected microphone is unavailable. Falling back to the system default when needed.',
+          enabled: false
+        }]
+      : []),
+    ...(inputDeviceState.error
+      ? [{
+          label: `Status: ${compactText(inputDeviceState.error, 72)}`,
+          enabled: false
+        }]
+      : []),
+    {
+      label: 'System Default',
+      type: 'radio',
+      checked: !preferredInputDeviceId,
+      click: () => {
+        void updateInputSourcePreference('')
+      }
+    },
+    ...(inputDeviceState.available.length
+      ? inputDeviceState.available.map((device) => ({
+          label: compactText(device.label, 56),
+          type: 'radio',
+          checked: preferredInputDeviceId === device.deviceId,
+          click: () => {
+            void updateInputSourcePreference(device.deviceId)
+          }
+        }))
+      : [{
+          label: inputDeviceState.permission === 'denied'
+            ? 'Microphone access denied'
+            : inputDeviceState.permission === 'granted'
+              ? 'No microphones detected'
+              : 'Start dictation once to grant microphone access',
+          enabled: false
+        }]),
+    { type: 'separator' },
+    {
+      label: 'Refresh Inputs',
+      click: () => {
+        void refreshInputSources()
+      }
+    }
+  ]
+
+  const sttDeviceMenu = sttPreferences.supported
+    ? sttPreferences.options.map((value) => ({
+        label: sttDeviceLabel(value),
+        type: 'radio',
+        checked: sttPreferences.selectedDevice === value,
+        click: () => {
+          void updateSttPreferences({ sttDevice: value })
+        }
+      }))
+    : [{
+        label: 'Available only for the HTTP STT provider',
+        enabled: false
+      }]
+
+  const sttModelMenu = sttPreferences.supported
+    ? sttPreferences.modelOptions.map((value) => ({
+        label: sttModelMenuLabel(value),
+        type: 'radio',
+        checked: sttPreferences.selectedModel === value,
+        click: () => {
+          void updateSttPreferences({ sttModel: value })
+        }
+      }))
+    : [{
+        label: 'Available only for the HTTP STT provider',
+        enabled: false
+      }]
 
   const duckingLevelMenu = DUCKING_LEVEL_OPTIONS.map((value) => ({
     label: `Duck To ${duckingPercentLabel(value)}`,
@@ -996,25 +1916,35 @@ function rebuildMenu() {
     { label: dailyCharacterLabel, enabled: false },
     { label: phaseLabel(), enabled: false },
     { label: `Target: ${compactText(targetLabel, 90)}`, enabled: false },
-    { label: `STT: ${healthValue(latestHealth.stt?.ok, runtimeLabel(), compactText(latestHealth.stt?.error || runtimeLabel(), 70))}`, enabled: false },
-    { label: `Rewrite: ${healthValue(latestHealth.rewrite?.ok, rewriteStatusLabel(), compactText(latestHealth.rewrite?.error || rewriteStatusLabel(), 70))}`, enabled: false },
-    { label: voiceState.transcript ? `Last transcript: ${compactText(voiceState.transcript, 110)}` : 'Last transcript: none', enabled: false },
-    { label: voiceState.finalText ? `Last text: ${compactText(voiceState.finalText, 110)}` : 'Last text: none', enabled: false },
+    { label: `${SPEECH_TO_TEXT_LABEL}: ${healthValue(latestHealth.stt?.ok, runtimeLabel(), compactText(latestHealth.stt?.error || runtimeLabel(), 70))}`, enabled: false },
+    { label: `${TEXT_IMPROVEMENT_LABEL}: ${healthValue(latestHealth.rewrite?.ok, rewriteStatusLabel(), compactText(latestHealth.rewrite?.error || rewriteStatusLabel(), 70))}`, enabled: false },
+    {
+      label: 'History',
+      submenu: historyMenu
+    },
     { label: noteLabel, enabled: false },
     { type: 'separator' },
     {
-      label: voiceState.phase === 'listening' ? 'Stop Dictation' : 'Start Dictation',
+      label: voiceState.phase === 'listening'
+        ? 'Stop Dictation'
+        : voiceState.phase === 'pending_insert'
+          ? 'Cancel Pending Insert'
+          : 'Start Dictation',
       click: () => {
         void toggleDictationCapture()
       }
     },
     {
-      label: 'Rewrite Transcript',
+      label: 'Improve Text',
       type: 'checkbox',
       checked: rewriteEnabled,
       click: (item) => {
         void updateRewriteEnabled(Boolean(item.checked))
       }
+    },
+    {
+      label: 'Text Improvement Provider',
+      submenu: rewriteProviderMenu
     },
     {
       label: 'Output Ducking',
@@ -1036,15 +1966,27 @@ function rebuildMenu() {
       ]
     },
     {
-      label: 'Rewrite Model',
+      label: 'Text Improvement Model',
       submenu: modelMenu
     },
     {
-      label: 'STT Device',
+      label: 'Text Improvement Thinking',
+      submenu: rewriteThinkMenu
+    },
+    {
+      label: 'Text Improvement Temperature',
+      submenu: rewriteTemperatureMenu
+    },
+    {
+      label: 'Input Source',
+      submenu: inputSourceMenu
+    },
+    {
+      label: 'Speech to Text Device',
       submenu: sttDeviceMenu
     },
     {
-      label: 'STT Model',
+      label: 'Speech to Text Model',
       submenu: sttModelMenu
     },
     {
@@ -1137,6 +2079,9 @@ function scheduleSttWarmup({
         }
         const result = await speech.warmStt().catch(() => ({ ok: false, reason: 'warmup_failed' }))
         sttReadyForDictation = Boolean(result?.ok)
+        if (!result?.ok) {
+          logSttDiagnostic('warmup', latestHealth.stt)
+        }
         return result
       } finally {
         if (sttWarmupInFlight === pending) {
@@ -1289,6 +2234,18 @@ function startSttKeepWarmTimer() {
   }, intervalMs)
 }
 
+function shouldSkipBackgroundRuntimeRefresh() {
+  if (!speech || speech.id !== 'local') {
+    return false
+  }
+  return Boolean(
+    activeSubmission
+    || sttWarmupInFlight
+    || sttKeepWarmInFlight
+    || voiceState.phase !== 'idle'
+  )
+}
+
 async function refreshRuntimeState(notify = false) {
   const [sttHealth, rewriteHealth, automationHealth, runtime, modelsPayload] = await Promise.all([
     speech.checkSttHealth(),
@@ -1314,19 +2271,51 @@ async function refreshRuntimeState(notify = false) {
       : ''
   const currentModel = String(runtime.model || '').trim() || (sttHealth?.ok ? String(sttHealth.model || '').trim() : '')
 
+  const supported = Boolean(runtime.supported && typeof speech?.supportsRuntimePreferences === 'function' && speech.supportsRuntimePreferences())
+  const availableDevices = runtimeSttDeviceOptions(runtime.availableDevices)
+  const storedPreferences = supported
+    ? await readSharedSpeechPreferences().catch(() => ({ sttDevice: '', sttModel: '' }))
+    : { sttDevice: '', sttModel: '' }
+
   sttPreferences = {
+    supported,
+    options: availableDevices,
+    modelOptions: sttModelPreferenceOptions(),
+    selectedDevice: storedPreferences.sttDevice || currentDevice || availableDevices[0] || '',
+    selectedModel: storedPreferences.sttModel || runtimeSttModelPreference(currentModel) || STT_MODEL_MIDDLE,
     provider: String(sttHealth?.providerLabel || speech?.label || runtimeConfig?.stt?.provider || '').trim(),
     currentDevice,
     currentModel,
     error: String(runtime.error || sttHealth?.error || '').trim()
   }
 
+  const sttHealthSnapshot = {
+    ok: Boolean(sttHealth?.ok),
+    error: String(sttHealth?.error || '').trim(),
+    detail: String(sttHealth?.detail || '').trim(),
+    pythonBin: String(sttHealth?.pythonBin || runtimeConfig?.stt?.local?.pythonBin || '').trim(),
+    transcribeScript: String(sttHealth?.transcribeScript || runtimeConfig?.stt?.local?.transcribeScript || '').trim(),
+    model: String(sttHealth?.model || runtimeConfig?.stt?.local?.model || '').trim(),
+    modelDir: String(sttHealth?.modelDir || runtimeConfig?.stt?.local?.modelDir || '').trim(),
+    device: String(sttHealth?.device || runtimeConfig?.stt?.local?.device || '').trim(),
+    computeType: String(sttHealth?.computeType || runtimeConfig?.stt?.local?.computeType || '').trim()
+  }
+  const sttHealthSignature = JSON.stringify(sttHealthSnapshot)
+  if (sttHealthSignature !== lastSttHealthLogSignature) {
+    lastSttHealthLogSignature = sttHealthSignature
+    void appendDiagnosticsLog('stt-health', sttHealthSnapshot)
+  }
+
+  if (!sttHealth?.ok) {
+    logSttDiagnostic('health-check', sttHealth)
+  }
+
   if (notify) {
     if (sttHealth.ok && (rewriteProviderId() === 'none' || rewriteHealth.ok)) {
-      showNotification(APP_NAME, rewriteProviderId() === 'none' ? 'STT is responding. Rewrite is disabled.' : `STT and ${rewriteProviderLabel()} are responding.`)
+      showNotification(APP_NAME, rewriteProviderId() === 'none' ? `${SPEECH_TO_TEXT_LABEL} is responding. ${TEXT_IMPROVEMENT_LABEL} is off.` : `${SPEECH_TO_TEXT_LABEL} and ${TEXT_IMPROVEMENT_LABEL.toLowerCase()} are responding.`)
     } else {
       const problems = [
-        !sttHealth.ok ? `STT: ${compactText(sttHealth.error || 'down', 60)}` : '',
+        !sttHealth.ok ? `${SPEECH_TO_TEXT_LABEL}: ${compactText(sttHealth.error || 'down', 60)}` : '',
         rewriteProviderId() !== 'none' && !rewriteHealth.ok ? `${rewriteProviderLabel()}: ${compactText(rewriteHealth.error || 'down', 60)}` : ''
       ].filter(Boolean)
       showNotification(APP_NAME, problems.join(' | ') || 'Runtime health check failed.')
@@ -1337,29 +2326,70 @@ async function refreshRuntimeState(notify = false) {
 }
 
 async function updateRewriteEnabled(value) {
+  if (Boolean(value) && rewriteProviderId() === 'none') {
+    rewriteEnabled = false
+    await saveTraySettings()
+    rebuildMenu()
+    showNotification(APP_NAME, 'Choose Text Improvement Provider > Ollama before turning on Improve Text.')
+    await refreshRuntimeState(false)
+    return
+  }
+
   rewriteEnabled = Boolean(value)
   await saveTraySettings()
   rebuildMenu()
   if (!rewriteEnabled) {
-    showNotification(APP_NAME, 'Rewrite disabled. Raw transcript will be inserted.')
+    showNotification(APP_NAME, `${TEXT_IMPROVEMENT_LABEL} is off. Raw speech text will be inserted.`)
     await refreshRuntimeState(false)
     return
   }
 
   const modelName = String(currentRewriteModel || runtimeConfig?.rewrite?.ollama?.model || '').trim()
-  showNotification(APP_NAME, modelName ? `Rewrite enabled. Warming ${modelName}.` : 'Rewrite enabled.')
+  showNotification(APP_NAME, modelName ? `${TEXT_IMPROVEMENT_LABEL} is on. Warming ${modelName}.` : `${TEXT_IMPROVEMENT_LABEL} is on.`)
   try {
     const warmResult = await warmSelectedModel()
     if (warmResult?.ok === false || warmResult?.skipped) {
-      showNotification(APP_NAME, rewriteProviderId() === 'none' ? 'Rewrite enabled, but no rewrite provider is configured.' : 'Rewrite enabled, but model warmup was skipped.')
+      showNotification(APP_NAME, rewriteProviderId() === 'none' ? `${TEXT_IMPROVEMENT_LABEL} is on, but no provider is configured.` : `${TEXT_IMPROVEMENT_LABEL} is on, but model warmup was skipped.`)
     } else {
-      showNotification(APP_NAME, modelName ? `${modelName} is ready for dictation cleanup.` : 'Rewrite is ready.')
+      showNotification(APP_NAME, modelName ? `${modelName} is ready for text improvement.` : `${TEXT_IMPROVEMENT_LABEL} is ready.`)
     }
   } catch (error) {
-    showNotification(APP_NAME, `Rewrite enabled, but model warmup failed: ${compactText(error?.message || error, 96)}`)
+    showNotification(APP_NAME, `${TEXT_IMPROVEMENT_LABEL} is on, but model warmup failed: ${compactText(error?.message || error, 96)}`)
   } finally {
     await refreshRuntimeState(false)
   }
+}
+
+async function updateRewriteProvider(value) {
+  const providerId = normalizeRewriteProviderId(value)
+  if (providerId === rewriteProviderId()) {
+    return
+  }
+
+  runtimeConfig.rewrite.provider = providerId
+  rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
+
+  if (providerId === 'none') {
+    rewriteEnabled = false
+    rewriteModels = []
+  }
+
+  await writeSharedRewritePreferences({
+    provider: providerId,
+    think: currentRewriteThink,
+    model: currentRewriteModel,
+    temperature: currentRewriteTemperature
+  })
+  await saveTraySettings()
+  rebuildMenu()
+  await refreshRuntimeState(false)
+
+  if (providerId === 'none') {
+    showNotification(APP_NAME, `${TEXT_IMPROVEMENT_LABEL} is off.`)
+    return
+  }
+
+  showNotification(APP_NAME, `${TEXT_IMPROVEMENT_LABEL} provider set to ${rewriteProviderMenuLabel(providerId)}. Turn on Improve Text when ready.`)
 }
 
 async function updateDuckingEnabled(value) {
@@ -1401,6 +2431,165 @@ async function updateTrayHotkey(value) {
   showNotification(APP_NAME, `Shortcut set to ${formatHotkey(trayHotkey)}.`)
 }
 
+async function updateRewriteThink(value) {
+  const nextValue = normalizeRewriteThink(value)
+  if (nextValue === normalizeRewriteThink(currentRewriteThink)) {
+    return
+  }
+
+  currentRewriteThink = nextValue
+  runtimeConfig.rewrite.ollama.think = nextValue
+  runtimeConfig.ollama.think = nextValue
+  await writeSharedRewritePreferences({
+    provider: runtimeConfig.rewrite.provider,
+    think: nextValue,
+    model: currentRewriteModel,
+    temperature: currentRewriteTemperature
+  })
+  rebuildMenu()
+  showNotification(APP_NAME, `Text improvement thinking set to ${rewriteThinkMenuLabel(nextValue)}.`)
+}
+
+async function updateRewriteTemperature(value) {
+  const nextValue = normalizeRewriteTemperature(value)
+  if (nextValue === normalizeRewriteTemperature(currentRewriteTemperature)) {
+    return
+  }
+
+  currentRewriteTemperature = nextValue
+  runtimeConfig.rewrite.ollama.temperature = nextValue
+  runtimeConfig.ollama.temperature = nextValue
+  await writeSharedRewritePreferences({
+    provider: runtimeConfig.rewrite.provider,
+    think: currentRewriteThink,
+    model: currentRewriteModel,
+    temperature: nextValue
+  })
+  rebuildMenu()
+  showNotification(APP_NAME, `Text improvement temperature set to ${rewriteTemperatureLabel(nextValue)}.`)
+}
+
+async function updateInputSourcePreference(value) {
+  const nextDeviceId = normalizeInputDeviceId(value)
+  if (nextDeviceId === preferredInputDeviceId) {
+    syncAllAudioInputConfig({ refresh: true })
+    rebuildMenu()
+    return
+  }
+
+  preferredInputDeviceId = nextDeviceId
+  await saveTraySettings()
+  rebuildMenu()
+  syncAllAudioInputConfig({ refresh: true })
+  showNotification(APP_NAME, `Input source set to ${inputSourceMenuLabel()}.`)
+}
+
+async function refreshInputSources() {
+  rebuildMenu()
+  syncAllAudioInputConfig({ refresh: true })
+}
+
+async function updateSttPreferences(input = {}) {
+  const requestedDevice = normalizeSttDevicePreference(input?.sttDevice)
+  const requestedModel = normalizeSttModelPreference(input?.sttModel)
+  if (!requestedDevice && !requestedModel) {
+    return
+  }
+
+  if (!providerUsesHttpStt()) {
+    showNotification(APP_NAME, `Live ${SPEECH_TO_TEXT_LABEL.toLowerCase()} switching is only supported for the HTTP STT provider, not ${runtimeConfig.stt.provider}.`)
+    return
+  }
+
+  const stored = await readSharedSpeechPreferences()
+  const nextSelectedDevice = requestedDevice || stored.sttDevice || sttPreferences.selectedDevice
+  const nextSelectedModel = requestedModel || stored.sttModel || sttPreferences.selectedModel
+  const requestedParts = [
+    requestedDevice ? `device ${sttDeviceLabel(requestedDevice)}` : '',
+    requestedModel ? `model ${sttModelMenuLabel(requestedModel)}` : ''
+  ].filter(Boolean)
+
+  sttPreferences = {
+    ...sttPreferences,
+    selectedDevice: nextSelectedDevice,
+    selectedModel: nextSelectedModel,
+    error: ''
+  }
+  rebuildMenu()
+
+  if (requestedParts.length) {
+    showNotification(APP_NAME, `Applying ${SPEECH_TO_TEXT_LABEL.toLowerCase()} ${requestedParts.join(' and ')}.`)
+  }
+
+  try {
+    const runtimePatch = requestedDevice
+      ? speechPreferenceRuntimePatch(requestedDevice)
+      : {}
+    if (requestedModel) {
+      runtimePatch.model = sttModelNameForPreference(requestedModel)
+    }
+
+    const result = await speech.updateSttRuntime(runtimePatch)
+    if (!result.ok) {
+      showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} update failed: ${compactText(result.error || 'unknown error', 96)}`)
+      await refreshRuntimeState(false)
+      return
+    }
+
+    await writeSharedSpeechPreferences({
+      sttDevice: nextSelectedDevice,
+      sttModel: nextSelectedModel
+    })
+    sttReadyForDictation = false
+    await waitForPendingSttWarmup().catch(() => null)
+    const warmResult = await scheduleSttWarmup({
+      waitForHealthy: true,
+      notifyReady: false
+    }).catch(() => ({ ok: false, reason: 'warmup_failed' }))
+    await refreshRuntimeState(false)
+
+    const appliedDevice = runtimeSttDevicePreference(result.device)
+    const appliedModel = runtimeSttModelPreference(result.model)
+    const appliedParts = [
+      appliedDevice ? sttDeviceLabel(appliedDevice) : '',
+      appliedModel ? sttModelMenuLabel(appliedModel) : String(result.model || '').trim()
+    ].filter(Boolean)
+    if (appliedParts.length) {
+      showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} ready: ${appliedParts.join(' / ')}.`)
+    }
+    if (!warmResult?.ok) {
+      showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} runtime changed, but warmup failed. The next dictation may be slower.`)
+    }
+  } catch (error) {
+    showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} update failed: ${compactText(error?.message || error, 96)}`)
+    await refreshRuntimeState(false)
+  }
+}
+
+async function applySharedSpeechPreferencesOnStartup() {
+  const stored = await readSharedSpeechPreferences()
+  if ((!stored.sttDevice && !stored.sttModel) || !providerUsesHttpStt()) {
+    return
+  }
+
+  const runtimePatch = stored.sttDevice
+    ? speechPreferenceRuntimePatch(stored.sttDevice)
+    : {}
+  if (stored.sttModel) {
+    runtimePatch.model = sttModelNameForPreference(stored.sttModel)
+  }
+  const currentRuntime = await speech.getSttRuntime().catch(() => null)
+  if (currentRuntime?.ok) {
+    const sameDevice = runtimePatch.device === undefined || String(currentRuntime.device || '').trim().toLowerCase() === String(runtimePatch.device || '').trim().toLowerCase()
+    const sameComputeType = runtimePatch.computeType === undefined || String(currentRuntime.computeType || '').trim().toLowerCase() === String(runtimePatch.computeType || '').trim().toLowerCase()
+    const sameModel = runtimePatch.model === undefined || String(currentRuntime.model || '').trim() === String(runtimePatch.model || '').trim()
+    if (sameDevice && sameComputeType && sameModel) {
+      return currentRuntime
+    }
+  }
+  await speech.updateSttRuntime(runtimePatch).catch(() => null)
+}
+
 async function switchRewriteModel(modelName) {
   const name = String(modelName || '').trim()
   if (!name || name === currentRewriteModel) {
@@ -1414,19 +2603,20 @@ async function switchRewriteModel(modelName) {
   await writeSharedRewritePreferences({
     provider: runtimeConfig.rewrite.provider,
     think: currentRewriteThink,
-    model: name
+    model: name,
+    temperature: currentRewriteTemperature
   })
   rebuildMenu()
 
   if (!rewriteEnabled) {
-    showNotification(APP_NAME, `Rewrite model set to ${name}. Rewrite is currently disabled.`)
+    showNotification(APP_NAME, `Text improvement model set to ${name}. ${TEXT_IMPROVEMENT_LABEL} is currently off.`)
     return
   }
 
   showNotification(APP_NAME, `Switching to ${name} and warming it.`)
   try {
     await warmSelectedModel()
-    showNotification(APP_NAME, `${name} is ready for dictation cleanup.`)
+    showNotification(APP_NAME, `${name} is ready for text improvement.`)
   } catch (error) {
     showNotification(APP_NAME, `Model switch saved, but warmup failed: ${compactText(error?.message || error, 96)}`)
   } finally {
@@ -1459,7 +2649,13 @@ async function ensureDictationCanStart() {
     }).catch(() => {})
   }
 
-  maybeNotifySttBlocked('Dictation is still starting. STT is not ready yet. You will get a notification when it is ready.')
+  if (latestHealth.stt?.ok === false && latestHealth.stt?.error) {
+    logSttDiagnostic('dictation-blocked', latestHealth.stt)
+    maybeNotifySttBlocked(`${SPEECH_TO_TEXT_LABEL} is not ready: ${compactText(latestHealth.stt.error, 160)}`)
+    return false
+  }
+
+  maybeNotifySttBlocked(`Dictation is still starting. ${SPEECH_TO_TEXT_LABEL} is not ready yet. You will get a notification when it is ready.`)
   return false
 }
 
@@ -1621,12 +2817,14 @@ async function captureFocusedWindowContext() {
     title: compactText(focusedWindow?.title || '', 180),
     processName: String(focusedWindow?.processName || '').trim(),
     className: String(focusedWindow?.className || '').trim(),
+    windowBounds: normalizeOverlayBounds(focusedWindow?.bounds),
     focusedElement: focusedElement
       ? {
           name: compactText(focusedElement.name || '', 100),
           controlType: String(focusedElement.controlType || '').trim(),
           value: compactText(focusedElement.value || '', 120),
-          text: compactText(focusedElement.text || '', 120)
+          text: compactText(focusedElement.text || '', 120),
+          bounds: normalizeOverlayBounds(focusedElement.bounds)
         }
       : null,
     snippets: collectSnapshotSnippets(target, 8)
@@ -1634,6 +2832,82 @@ async function captureFocusedWindowContext() {
 
   context.modeHint = inferModeHint(context)
   return context
+}
+
+async function getFocusedWindowSnapshot() {
+  const windowsResult = await uiAutomation.listWindows({ limit: 32 })
+  return Array.isArray(windowsResult?.windows)
+    ? windowsResult.windows.find((window) => window?.focused) || windowsResult.windows[0] || null
+    : null
+}
+
+function normalizeWindowToken(value) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function matchesCapturedWindow(windowContext, candidateWindow) {
+  if (!windowContext || !candidateWindow) {
+    return false
+  }
+
+  const targetHwnd = normalizeWindowToken(windowContext?.hwnd || windowContext?.selector?.hwnd)
+  const currentHwnd = normalizeWindowToken(candidateWindow?.hwnd)
+  if (targetHwnd && currentHwnd) {
+    return targetHwnd === currentHwnd
+  }
+
+  const targetProcess = normalizeWindowToken(windowContext?.processName)
+  const currentProcess = normalizeWindowToken(candidateWindow?.processName)
+  if (targetProcess && currentProcess && targetProcess !== currentProcess) {
+    return false
+  }
+
+  const targetClass = normalizeWindowToken(windowContext?.className)
+  const currentClass = normalizeWindowToken(candidateWindow?.className)
+  if (targetClass && currentClass && targetClass !== currentClass) {
+    return false
+  }
+
+  const targetTitle = normalizeWindowToken(windowContext?.title)
+  const currentTitle = normalizeWindowToken(candidateWindow?.title)
+  if (targetTitle && currentTitle) {
+    return currentTitle.includes(targetTitle) || targetTitle.includes(currentTitle)
+  }
+
+  return Boolean(targetProcess || targetClass)
+}
+
+async function waitForTargetWindowFocus(windowContext, submission) {
+  if (!windowContext?.selector) {
+    return null
+  }
+
+  let waitingShown = false
+  while (true) {
+    throwIfSubmissionCancelled(submission)
+
+    let focusedWindow = null
+    try {
+      focusedWindow = await getFocusedWindowSnapshot()
+    } catch {
+      return null
+    }
+
+    if (!focusedWindow || matchesCapturedWindow(windowContext, focusedWindow)) {
+      return focusedWindow
+    }
+
+    if (!waitingShown) {
+      waitingShown = true
+      updateVoiceState({
+        phase: 'pending_insert',
+        note: `Return to ${formatTargetWindow(windowContext) || 'the original window'} to insert.`,
+        error: ''
+      })
+    }
+
+    await sleep(TARGET_WINDOW_POLL_INTERVAL_MS)
+  }
 }
 
 function unwrapModelText(value) {
@@ -1700,7 +2974,7 @@ async function rewriteTranscript(transcript, windowContext, options = {}) {
       }
     ],
     options: {
-      temperature: 0.1,
+      temperature: currentRewriteTemperature,
       num_predict: 220
     }
   }, {
@@ -1716,11 +2990,19 @@ async function insertText(text, windowContext, options = {}) {
     return {
       ok: false,
       method: 'none',
-      error: 'Final text was empty.'
+      error: 'Final text was empty.',
+      timingsMs: {
+        waitTarget: 0,
+        helper: 0,
+        clipboard: 0
+      }
     }
   }
 
+  const waitTargetMs = 0
+
   try {
+    const helperStartedAt = performance.now()
     const result = await uiAutomation.action({
       action: 'paste_text',
       window: windowContext?.selector || {},
@@ -1728,21 +3010,40 @@ async function insertText(text, windowContext, options = {}) {
     }, {
       signal: options?.signal || null
     })
+    const helperMs = Math.round(performance.now() - helperStartedAt)
     return {
       ok: true,
       method: 'paste_text',
-      targetWindow: result?.window || null
+      targetWindow: result?.window || null,
+      timingsMs: {
+        waitTarget: waitTargetMs,
+        helper: helperMs,
+        clipboard: 0
+      }
     }
   } catch (error) {
     if (isAbortError(error)) {
       throw error
     }
+    const clipboardStartedAt = performance.now()
+    await appendDiagnosticsLog('insert-fallback', {
+      error: String(error?.message || error).trim(),
+      targetWindow: formatTargetWindow(windowContext),
+      selector: windowContext?.selector || null,
+      textLength: normalized.length
+    })
     clipboard.writeText(normalized)
+    const clipboardMs = Math.round(performance.now() - clipboardStartedAt)
     return {
       ok: false,
       method: 'clipboard',
       error: String(error?.message || error),
-      copied: true
+      copied: true,
+      timingsMs: {
+        waitTarget: waitTargetMs,
+        helper: 0,
+        clipboard: clipboardMs
+      }
     }
   }
 }
@@ -1756,6 +3057,11 @@ function logDictationTiming(payload) {
     `total=${Number(payload?.totalMs || 0)}ms`,
     `output=${String(payload?.outputMethod || 'none')}`
   ]
+  if (payload?.insertDetailMs) {
+    parts.push(`insert_wait=${Number(payload.insertDetailMs.waitTarget || 0)}ms`)
+    parts.push(`insert_helper=${Number(payload.insertDetailMs.helper || 0)}ms`)
+    parts.push(`insert_clipboard=${Number(payload.insertDetailMs.clipboard || 0)}ms`)
+  }
   if (payload?.note) {
     parts.push(`note=${compactText(payload.note, 100)}`)
   }
@@ -1763,9 +3069,12 @@ function logDictationTiming(payload) {
 }
 
 async function processAudioSubmission(payload = {}) {
-  const previousSubmission = activeSubmission
-  if (previousSubmission && !previousSubmission.controller.signal.aborted) {
-    previousSubmission.controller.abort(createAbortError('Dictation was superseded by a new push-to-talk turn.'))
+  if (activeSubmission && !activeSubmission.controller.signal.aborted) {
+    return {
+      ok: false,
+      cancelled: true,
+      reason: 'submission_in_flight'
+    }
   }
 
   const submission = {
@@ -1785,6 +3094,13 @@ async function processAudioSubmission(payload = {}) {
     throw new Error('Recording was empty.')
   }
 
+  await appendDiagnosticsLog('submission-start', {
+    mimeType: String(payload?.mimeType || 'application/octet-stream').trim(),
+    audioBytes: audioBytes.length,
+    recordingMs,
+    captureDevice: payload?.captureDevice || null
+  })
+
   const contextPromise = submission.contextHandle?.promise || Promise.resolve(null)
 
   try {
@@ -1800,22 +3116,79 @@ async function processAudioSubmission(payload = {}) {
     const sttStartedAt = performance.now()
     await waitForPendingSttWarmup(signal)
     throwIfSubmissionCancelled(submission)
-    const transcribePayload = await speech.transcribeAudioBuffer(
-      Buffer.from(audioBytes),
-      payload?.mimeType || 'application/octet-stream',
-      { signal }
-    )
+    let transcribePayload
+    try {
+      transcribePayload = await speech.transcribeAudioBuffer(
+        Buffer.from(audioBytes),
+        payload?.mimeType || 'application/octet-stream'
+      )
+    } catch (error) {
+      const currentHealth = await speech.checkSttHealth().catch(() => null)
+      if (currentHealth) {
+        latestHealth = {
+          ...latestHealth,
+          stt: currentHealth
+        }
+      }
+      await appendDiagnosticsLog('stt-transcribe-error', {
+        message: String(error?.message || error).trim(),
+        detail: String(error?.detail || '').trim(),
+        mimeType: String(payload?.mimeType || 'application/octet-stream').trim(),
+        pythonBin: String(error?.pythonBin || runtimeConfig?.stt?.local?.pythonBin || '').trim(),
+        transcribeScript: String(error?.transcribeScript || runtimeConfig?.stt?.local?.transcribeScript || '').trim(),
+        model: String(error?.model || runtimeConfig?.stt?.local?.model || '').trim(),
+        modelDir: String(error?.modelDir || runtimeConfig?.stt?.local?.modelDir || '').trim(),
+        device: String(error?.device || runtimeConfig?.stt?.local?.device || '').trim(),
+        computeType: String(error?.computeType || runtimeConfig?.stt?.local?.computeType || '').trim(),
+        health: currentHealth || null
+      })
+      if (currentHealth && !currentHealth.ok) {
+        logSttDiagnostic('transcribe', currentHealth, true)
+      }
+      throw error
+    }
     throwIfSubmissionCancelled(submission)
 
     const sttMs = nowMs(sttStartedAt)
     const rawTranscript = String(transcribePayload?.transcript || '').trim()
     const transcript = normalizeSpeechTranscript(rawTranscript)
     if (!transcript) {
-      clearVoiceState()
+      const audioStats = transcribePayload?.audioStats || null
+      const peakDb = Number(audioStats?.inputPeakDb)
+      const rmsDb = Number(audioStats?.inputRmsDb)
+      const lowSignal = (Number.isFinite(peakDb) && peakDb < -45) || (Number.isFinite(rmsDb) && rmsDb < -55)
+      const message = lowSignal
+        ? 'Speech to Text captured an extremely quiet signal. Check your microphone selection and Windows input volume.'
+        : 'Speech to Text returned empty text. Hold the shortcut a bit longer and start speaking after the listening cue.'
+      const debugSample = await saveFailedSubmissionSample('empty-transcript', audioBytes, payload?.mimeType, {
+        recordingMs,
+        rawTranscriptLength: rawTranscript.length,
+        normalizedTranscriptLength: transcript.length,
+        timingsMs: transcribePayload?.timingsMs || null,
+        usedVadFallback: Boolean(transcribePayload?.usedVadFallback),
+        provider: String(runtimeConfig?.stt?.provider || '').trim(),
+        audioStats,
+        captureDevice: payload?.captureDevice || null
+      })
+      await appendDiagnosticsLog('empty-transcript', {
+        mimeType: String(payload?.mimeType || 'application/octet-stream').trim(),
+        audioBytes: audioBytes.length,
+        recordingMs,
+        rawTranscriptLength: rawTranscript.length,
+        normalizedTranscriptLength: transcript.length,
+        timingsMs: transcribePayload?.timingsMs || null,
+        usedVadFallback: Boolean(transcribePayload?.usedVadFallback),
+        audioStats,
+        captureDevice: payload?.captureDevice || null,
+        debugSample: debugSample || null
+      })
+      clearVoiceState(message)
+      showNotification(APP_NAME, message)
       return {
         ok: false,
         cancelled: true,
         reason: 'empty_transcript',
+        error: message,
         earcon: 'cancel'
       }
     }
@@ -1854,11 +3227,15 @@ async function processAudioSubmission(payload = {}) {
     }
 
     throwIfSubmissionCancelled(submission)
+    const focusedWindowForInsert = await waitForTargetWindowFocus(windowContext, submission)
+    throwIfSubmissionCancelled(submission)
     updateVoiceState({
       phase: 'inserting',
       transcript,
       finalText,
       targetWindow: formatTargetWindow(windowContext),
+      targetBounds: normalizeOverlayBounds(focusedWindowForInsert?.bounds) || windowContext?.windowBounds || null,
+      targetElementBounds: windowContext?.focusedElement?.bounds || null,
       note,
       error: ''
     })
@@ -1881,6 +3258,11 @@ async function processAudioSubmission(payload = {}) {
       note,
       error: ''
     })
+    await recordOutputHistory(finalText, {
+      improved: rewriteEnabled && finalText !== transcript
+    }).catch((error) => {
+      console.error(`[dictray] Failed to record output history: ${error?.message || error}`)
+    })
     await recordGeneratedCharacters(finalText).catch((error) => {
       console.error(`[dictray] Failed to record generated characters: ${error?.message || error}`)
     })
@@ -1892,6 +3274,7 @@ async function processAudioSubmission(payload = {}) {
       insertMs,
       totalMs,
       outputMethod: insertResult.method,
+      insertDetailMs: insertResult.timingsMs || null,
       note
     })
 
@@ -1907,11 +3290,15 @@ async function processAudioSubmission(payload = {}) {
         stt: Number(transcribePayload?.timingsMs?.total || sttMs),
         rewrite: rewriteMs,
         insert: insertMs,
+        insertDetail: insertResult.timingsMs || null,
         total: totalMs
       }
     }
   } catch (error) {
     if (isAbortError(error)) {
+      if (activeSubmission === submission) {
+        clearVoiceState()
+      }
       return {
         ok: false,
         cancelled: true,
@@ -1935,7 +3322,9 @@ function beginTurnContextCapture() {
       .then((context) => {
         if (activeTurnContext === contextHandle) {
           updateVoiceState({
-            targetWindow: formatTargetWindow(context)
+            targetWindow: formatTargetWindow(context),
+            targetBounds: context?.windowBounds || null,
+            targetElementBounds: context?.focusedElement?.bounds || null
           })
         }
         return context
@@ -1950,24 +3339,41 @@ async function toggleDictationCapture() {
     await stopDictationCapture()
     return
   }
+  if (voiceState.phase === 'pending_insert') {
+    cancelActiveSubmission('Pending insertion was cancelled.')
+    clearVoiceState()
+    return
+  }
   await startDictationCapture()
 }
 
 async function startDictationCapture() {
+  if (voiceState.phase !== 'idle' || activeSubmission) {
+    return
+  }
   const ready = await ensureDictationCanStart()
   if (!ready) {
     return
   }
+
   cancelActiveSubmission()
   beginTurnContextCapture()
+
+  const focusedWindow = await getFocusedWindowSnapshot().catch(() => null)
+  const initialBounds = normalizeOverlayBounds(focusedWindow?.bounds)
+  voiceOverlayFocusedBounds = initialBounds
+
   updateVoiceState({
     phase: 'processing',
     transcript: '',
     finalText: '',
+    targetBounds: initialBounds,
+    targetElementBounds: null,
     note: '',
     error: '',
     targetWindow: ''
   })
+
   const window = await ensureVoiceWindow()
   await duckSystemVolumeForPushToTalk()
   window.webContents.send('dictation:start-recording')
@@ -1983,13 +3389,18 @@ async function stopDictationCapture() {
 }
 
 function stopHotkeyBridge() {
-  if (!hotkeyBridge || hotkeyBridge.killed) {
-    hotkeyBridge = null
+  if (hotkeyBridgeRestartTimer) {
+    clearTimeout(hotkeyBridgeRestartTimer)
+    hotkeyBridgeRestartTimer = null
+  }
+
+  const bridge = hotkeyBridge
+  hotkeyBridge = null
+  if (!bridge || bridge.killed) {
     return
   }
 
-  hotkeyBridge.kill()
-  hotkeyBridge = null
+  bridge.kill()
 }
 
 function registerPressOnlyHotkey() {
@@ -2002,15 +3413,42 @@ function registerPressOnlyHotkey() {
   }
 }
 
+function scheduleHotkeyBridgeRestart() {
+  const now = Date.now()
+  hotkeyBridgeRestartAtMs = hotkeyBridgeRestartAtMs.filter((value) => (now - value) < HOTKEY_BRIDGE_RESTART_WINDOW_MS)
+  hotkeyBridgeRestartAtMs.push(now)
+
+  if (hotkeyBridgeRestartAtMs.length > HOTKEY_BRIDGE_MAX_RESTARTS) {
+    return false
+  }
+
+  if (hotkeyBridgeRestartTimer) {
+    clearTimeout(hotkeyBridgeRestartTimer)
+  }
+  hotkeyBridgeRestartTimer = setTimeout(() => {
+    hotkeyBridgeRestartTimer = null
+    if (isQuitting) {
+      return
+    }
+    console.warn('[dictray] Restarting hold-to-talk bridge.')
+    startHotkeyBridge()
+  }, HOTKEY_BRIDGE_RESTART_DELAY_MS)
+  return true
+}
+
 function startHotkeyBridge() {
   stopHotkeyBridge()
-  hotkeyBridge = spawn(HOTKEY_BRIDGE, [trayHotkey], {
+  const bridge = spawn(HOTKEY_BRIDGE, [trayHotkey], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   })
+  hotkeyBridge = bridge
 
-  const stdout = readline.createInterface({ input: hotkeyBridge.stdout })
+  const stdout = readline.createInterface({ input: bridge.stdout })
   stdout.on('line', (line) => {
+    if (hotkeyBridge !== bridge) {
+      return
+    }
     const event = String(line || '').trim().toLowerCase()
     if (event === 'down') {
       void startDictationCapture()
@@ -2021,27 +3459,40 @@ function startHotkeyBridge() {
     }
   })
 
-  const stderr = readline.createInterface({ input: hotkeyBridge.stderr })
+  const stderr = readline.createInterface({ input: bridge.stderr })
   stderr.on('line', (line) => {
+    if (hotkeyBridge !== bridge) {
+      return
+    }
     const message = String(line || '').trim()
     if (message) {
       console.error(`[dictray] hotkey bridge: ${message}`)
     }
   })
 
-  hotkeyBridge.on('error', (error) => {
+  bridge.on('error', (error) => {
+    if (hotkeyBridge !== bridge) {
+      return
+    }
     console.error('[dictray] Failed to start hotkey bridge:', error)
     stopHotkeyBridge()
     registerPressOnlyHotkey()
     showNotification(APP_NAME, 'Hold-to-talk bridge failed. Falling back to press-to-toggle.')
   })
 
-  hotkeyBridge.on('exit', (code) => {
-    hotkeyBridge = null
+  bridge.on('exit', (code) => {
+    if (hotkeyBridge === bridge) {
+      hotkeyBridge = null
+    } else {
+      return
+    }
     if (isQuitting) {
       return
     }
     console.error(`[dictray] Hotkey bridge exited with code ${code ?? 0}.`)
+    if (scheduleHotkeyBridgeRestart()) {
+      return
+    }
     registerPressOnlyHotkey()
     showNotification(APP_NAME, 'Hold-to-talk bridge stopped. Falling back to press-to-toggle.')
   })
@@ -2091,6 +3542,32 @@ ipcMain.on('dictation:state', (_event, payload) => {
   })
 })
 
+ipcMain.on('dictation:input-devices', (_event, payload) => {
+  const available = normalizeAvailableInputDevices(payload?.devices)
+  const activeDeviceId = normalizeInputDeviceId(payload?.activeDeviceId)
+  const activeLabel = compactText(
+    String(payload?.activeLabel || available.find((device) => device.deviceId === activeDeviceId)?.label || '').trim(),
+    64
+  )
+
+  inputDeviceState = {
+    available,
+    permission: normalizeInputPermission(payload?.permission),
+    activeDeviceId,
+    activeLabel,
+    error: compactText(String(payload?.error || '').trim(), 120)
+  }
+  rebuildMenu()
+})
+
+ipcMain.handle('dictation:set-input-device', async (_event, payload) => {
+  await updateInputSourcePreference(payload?.deviceId)
+  return {
+    ok: true,
+    deviceId: preferredInputDeviceId
+  }
+})
+
 ipcMain.on('dictation:error', (_event, payload) => {
   clearVoiceState(String(payload?.message || 'Unknown dictation error'))
   void restoreSystemVolumeAfterPushToTalk().catch(() => {})
@@ -2123,31 +3600,89 @@ async function createTray() {
   rebuildMenu()
 }
 
-async function bootstrap() {
-  runtimeConfig = await loadConfig()
-  stateDir = runtimeConfig.memory.stateDir
+function applyStatePaths(config) {
+  stateDir = config.memory.stateDir
   traySettingsPath = path.join(stateDir, 'dictation-tray-settings.json')
-  rewritePreferencesPath = path.join(stateDir, 'ollama-preferences.json')
+  speechPreferencesPath = path.join(stateDir, 'speech-preferences.json')
+  rewritePreferencesPath = path.join(stateDir, 'rewrite-preferences.json')
+  legacyRewritePreferencesPath = path.join(stateDir, 'ollama-preferences.json')
   dailyCharacterStatsPath = path.join(stateDir, 'dictation-tray-daily-character-stats.json')
   onboardingStatePath = path.join(stateDir, 'dictation-tray-onboarding.json')
+  outputHistoryPath = path.join(stateDir, 'dictation-tray-output-history.json')
+  diagnosticsLogPath = path.join(stateDir, 'dictation-tray-debug.log')
+}
 
-  await loadTraySettings()
-  await loadDailyCharacterStats()
-  await loadOnboardingState()
+async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = {}) {
+  runtimeConfig = nextConfig
+  applyStatePaths(runtimeConfig)
+
+  if (loadPersistentState) {
+    await loadDailyCharacterStats()
+    await loadOutputHistory()
+  }
 
   const rewritePreferences = await readSharedRewritePreferences()
-  currentRewriteThink = String(rewritePreferences.think || runtimeConfig.rewrite.ollama.think || 'default').trim() || 'default'
+  runtimeConfig.rewrite.provider = normalizeRewriteProviderId(rewritePreferences.provider || runtimeConfig.rewrite.provider)
+  currentRewriteThink = normalizeRewriteThink(rewritePreferences.think || runtimeConfig.rewrite.ollama.think || 'off')
+  currentRewriteTemperature = normalizeRewriteTemperature(rewritePreferences.temperature ?? runtimeConfig.rewrite.ollama.temperature ?? 0.1)
   currentRewriteModel = String(rewritePreferences.model || runtimeConfig.rewrite.ollama.model || '').trim()
   runtimeConfig.rewrite.ollama.model = currentRewriteModel
   runtimeConfig.rewrite.ollama.think = currentRewriteThink
+  runtimeConfig.rewrite.ollama.temperature = currentRewriteTemperature
   runtimeConfig.ollama.model = currentRewriteModel
   runtimeConfig.ollama.think = currentRewriteThink
+  runtimeConfig.ollama.temperature = currentRewriteTemperature
+  await loadOnboardingState()
+  runtimeConfig.stt.local.model = sttModelForSpeechEffort(onboardingState?.choices?.speechEffort)
+  if (!hotkeyManagedByEnv()) {
+    trayHotkey = normalizeTrayHotkey(onboardingState?.choices?.pushToTalkHotkey || trayHotkey)
+  }
+  if (loadPersistentState) {
+    await loadTraySettings()
+  }
 
   speech = createSttProvider({
     ...runtimeConfig.stt,
     rootDir: runtimeConfig.rootDir
   }, stateDir)
+  await applySharedSpeechPreferencesOnStartup().catch(() => null)
   rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
+  void appendDiagnosticsLog('runtime-config', {
+    sttProvider: runtimeConfig?.stt?.provider,
+    pythonBin: runtimeConfig?.stt?.local?.pythonBin,
+    daemonScript: runtimeConfig?.stt?.local?.daemonScript,
+    transcribeScript: runtimeConfig?.stt?.local?.transcribeScript,
+    model: runtimeConfig?.stt?.local?.model,
+    modelDir: runtimeConfig?.stt?.local?.modelDir,
+    bundledRuntimeDir: process.env.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || '',
+    stateDir
+  })
+}
+
+async function reloadRuntimeConfig() {
+  if (runtimeReloadInFlight) {
+    return runtimeReloadInFlight
+  }
+
+  runtimeReloadInFlight = (async () => {
+    await applyRuntimeConfig(await loadConfig(), { loadPersistentState: false })
+    sttReadyForDictation = false
+    sttReadyNotificationAttached = false
+    clearSttKeepWarmTimer()
+    startSttKeepWarmTimer()
+    return runtimeConfig
+  })().finally(() => {
+    runtimeReloadInFlight = null
+  })
+
+  return runtimeReloadInFlight
+}
+
+async function bootstrap() {
+  if (app.isPackaged && !String(process.env.DICTATION_TRAY_STATE_DIR || '').trim()) {
+    process.env.DICTATION_TRAY_STATE_DIR = path.join(app.getPath('userData'), 'state')
+  }
+  await applyRuntimeConfig(await loadConfig(), { loadPersistentState: true })
   systemVolume = new SystemVolumeBridge()
   uiAutomation = new UiAutomationBridge()
 }
@@ -2161,6 +3696,7 @@ app.on('before-quit', (event) => {
   clearSttKeepWarmTimer()
   stopHotkeyBridge()
   globalShortcut.unregisterAll()
+  void speech?.dispose?.().catch(() => null)
 
   if (!isRestoringVolumeForQuit && volumeDuckState) {
     event.preventDefault()
@@ -2180,11 +3716,14 @@ app.whenReady().then(async () => {
   await createTray()
   await ensureVoiceWindow()
   await maybeShowOnboarding()
-  void scheduleSttWarmup({ notifyReady: true }).catch(() => {})
+  await scheduleSttWarmup({ notifyReady: true }).catch(() => null)
   await refreshRuntimeState(false)
   await registerHotkey()
 
   refreshTimer = setInterval(() => {
+    if (shouldSkipBackgroundRuntimeRefresh()) {
+      return
+    }
     void refreshRuntimeState(false)
   }, 15000)
   startSttKeepWarmTimer()

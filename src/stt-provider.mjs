@@ -2,8 +2,8 @@ import { legacySttProviderId, normalizeSttProviderId } from './config.mjs'
 import { SpeechTools } from './speech-tools.mjs'
 
 const PROVIDER_LABELS = {
-  local: 'Local',
-  wsl: 'WSL'
+  local: 'Speech to Text',
+  http: 'Speech to Text'
 }
 
 function compactProviderLabel(providerId) {
@@ -22,7 +22,6 @@ export class SttProvider {
         timeoutMs: config?.timeoutMs,
         keepWarmIntervalMs: config?.keepWarmIntervalMs,
         local: config?.local,
-        wsl: config?.wsl,
         http: config?.http
       }
     }
@@ -30,7 +29,7 @@ export class SttProvider {
   }
 
   supportsRuntimePreferences() {
-    return false
+    return this.id === 'http'
   }
 
   supportsLocalServiceControl() {
@@ -64,6 +63,10 @@ export class SttProvider {
 
   transcribeAudioBuffer(audioBuffer, contentType, options = {}) {
     return this.tools.transcribeAudioBuffer(audioBuffer, contentType, options)
+  }
+
+  async dispose() {
+    await this.tools.dispose()
   }
 
   async getRuntime() {
@@ -177,6 +180,10 @@ class UnsupportedSttProvider {
     throw new Error(`Unsupported STT provider: ${this.id}`)
   }
 
+  async dispose() {
+    return
+  }
+
   async getRuntime() {
     return {
       ok: false,
@@ -228,7 +235,7 @@ class UnsupportedSttProvider {
 
 export function createSttProvider(config, stateDir) {
   const providerId = normalizeSttProviderId(config?.provider)
-  if (providerId === 'local' || providerId === 'wsl') {
+  if (providerId === 'local' || providerId === 'http') {
     return new SttProvider(config, stateDir)
   }
   return new UnsupportedSttProvider(config)

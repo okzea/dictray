@@ -2,12 +2,13 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; media-src 'self' data: blob:; object-src 'none'; base-uri 'none'">
     <title>DicTray Quick Start</title>
     <style>
       :root {
         color-scheme: dark;
         --bg: #08131a;
-        --panel: rgba(10, 24, 31, 0.92);
+        --panel: rgba(10, 24, 31, 0.94);
         --panel-border: rgba(117, 217, 176, 0.18);
         --panel-muted: rgba(18, 37, 47, 0.88);
         --text: #ecfff7;
@@ -42,12 +43,13 @@
         min-height: calc(100vh - 36px);
       }
 
-      .hero {
-        padding: 18px 18px 12px;
+      .hero,
+      .panel {
+        padding: 18px;
         border: 1px solid var(--panel-border);
         border-radius: 20px;
         background: var(--panel);
-        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.32);
       }
 
       .eyebrow {
@@ -59,10 +61,16 @@
         text-transform: uppercase;
       }
 
+      .progress {
+        margin: 0 0 10px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
       h1 {
         margin: 0;
-        font-size: 26px;
-        line-height: 1.1;
+        font-size: 28px;
+        line-height: 1.12;
       }
 
       .subtitle {
@@ -79,35 +87,18 @@
         background: rgba(255, 255, 255, 0.04);
         color: #c9f6df;
         font-size: 12px;
+        line-height: 1.45;
       }
 
-      .step {
-        padding: 18px;
-        border: 1px solid var(--panel-border);
-        border-radius: 20px;
-        background: var(--panel);
-      }
-
-      .step h2 {
-        margin: 0 0 8px;
-        font-size: 18px;
-      }
-
-      .step p {
+      .step-copy {
         margin: 0 0 16px;
         color: var(--muted);
-        line-height: 1.5;
-      }
-
-      .check-grid {
-        display: grid;
-        gap: 12px;
+        line-height: 1.55;
       }
 
       .input-block {
         display: grid;
         gap: 8px;
-        margin-bottom: 14px;
       }
 
       .input-label {
@@ -115,9 +106,10 @@
         color: var(--muted);
       }
 
-      .input-field {
+      .input-field,
+      textarea {
         width: 100%;
-        padding: 12px 14px;
+        padding: 13px 14px;
         border: 1px solid rgba(117, 217, 176, 0.18);
         border-radius: 14px;
         outline: none;
@@ -126,53 +118,37 @@
         font: inherit;
       }
 
-      .input-field:focus {
+      .input-field:focus,
+      textarea:focus {
         border-color: rgba(66, 211, 146, 0.65);
         box-shadow: 0 0 0 4px rgba(66, 211, 146, 0.12);
       }
 
-      .name-hint {
-        color: var(--muted);
-        font-size: 13px;
+      textarea {
+        min-height: 124px;
+        resize: none;
         line-height: 1.45;
       }
 
-      .name-hint[data-state="ready"] {
+      .hint,
+      .summary,
+      .managed-note {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .hint[data-state="ready"],
+      .summary[data-state="ready"] {
         color: var(--accent);
       }
 
-      .name-hint[data-state="error"] {
+      .hint[data-state="progress"] {
+        color: var(--warn);
+      }
+
+      .hint[data-state="error"] {
         color: var(--error);
-      }
-
-      .check-card {
-        display: grid;
-        grid-template-columns: auto 1fr;
-        gap: 12px;
-        align-items: start;
-        padding: 14px;
-        border: 1px solid rgba(117, 217, 176, 0.16);
-        border-radius: 16px;
-        background: var(--panel-muted);
-      }
-
-      .check-card input {
-        margin-top: 3px;
-        width: 18px;
-        height: 18px;
-        accent-color: var(--accent);
-      }
-
-      .check-card strong {
-        display: block;
-        margin-bottom: 4px;
-        font-size: 14px;
-      }
-
-      .check-card span {
-        color: var(--muted);
-        font-size: 13px;
-        line-height: 1.45;
       }
 
       .sample {
@@ -183,51 +159,67 @@
         border: 1px solid rgba(66, 211, 146, 0.18);
         font-size: 22px;
         font-weight: 700;
-        letter-spacing: 0.02em;
+        letter-spacing: 0.01em;
+        line-height: 1.35;
       }
 
-      .benchmark-summary {
-        margin-bottom: 12px;
-        color: #c9f6df;
-        font-size: 13px;
-        line-height: 1.45;
+      .option-stack {
+        display: grid;
+        gap: 10px;
       }
 
-      textarea {
-        width: 100%;
-        min-height: 124px;
-        padding: 14px 16px;
-        border: 1px solid rgba(117, 217, 176, 0.18);
+      .option-card {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 12px;
+        align-items: start;
+        padding: 14px;
+        border: 1px solid rgba(117, 217, 176, 0.16);
         border-radius: 16px;
-        outline: none;
-        resize: none;
-        background: rgba(3, 13, 18, 0.9);
-        color: var(--text);
-        font: inherit;
-        line-height: 1.45;
+        background: var(--panel-muted);
+        cursor: pointer;
       }
 
-      textarea:focus {
-        border-color: rgba(66, 211, 146, 0.65);
-        box-shadow: 0 0 0 4px rgba(66, 211, 146, 0.12);
+      .option-card input {
+        margin-top: 3px;
+        width: 18px;
+        height: 18px;
+        accent-color: var(--accent);
       }
 
-      .typing-hint {
-        margin-top: 10px;
+      .option-card strong {
+        display: block;
+        margin-bottom: 4px;
+        font-size: 14px;
+      }
+
+      .option-card span {
         color: var(--muted);
         font-size: 13px;
+        line-height: 1.45;
       }
 
-      .typing-hint[data-state="ready"] {
-        color: var(--accent);
+      .option-card[data-selected="true"] {
+        border-color: rgba(66, 211, 146, 0.58);
+        box-shadow: 0 0 0 4px rgba(66, 211, 146, 0.1);
       }
 
-      .typing-hint[data-state="progress"] {
-        color: var(--warn);
+      .summary-list {
+        display: grid;
+        gap: 10px;
       }
 
-      .typing-hint[data-state="error"] {
-        color: var(--error);
+      .summary-item {
+        padding: 12px 14px;
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .summary-item strong {
+        color: var(--text);
       }
 
       .actions {
@@ -271,51 +263,91 @@
     <main class="shell">
       <section class="hero">
         <p class="eyebrow">Quick Start</p>
-        <h1 id="title">DicTray runs from the Windows tray.</h1>
-        <p class="subtitle" id="subtitle">Start with direct local STT, keep Docker optional, and swap providers later without a separate full UI.</p>
+        <p class="progress" id="progress"></p>
+        <h1 id="title"></h1>
+        <p class="subtitle" id="subtitle"></p>
         <div class="runtime" id="runtime"></div>
       </section>
 
-      <section class="step" data-step="0">
-        <h2>Choose the setup you want to aim for</h2>
-        <p>These choices are just your starting profile. DicTray can run local speech directly, use Docker later if you want tray-managed runtime control, or point at other providers as they are added.</p>
-        <form id="setup-form" class="check-grid">
-          <label class="input-block">
-            <span class="input-label">What should DicTray call you?</span>
-            <input id="profile-name" class="input-field" type="text" maxlength="40" placeholder="Denim" autocomplete="name">
-            <span class="name-hint" id="name-hint" data-state="idle"></span>
-          </label>
-          <label class="check-card">
-            <input id="localStt" type="checkbox" checked>
-            <div>
-              <strong>Direct local STT on this machine</strong>
-              <span>Use local faster-whisper without Docker. CPU works everywhere, and CUDA can be used when it is available.</span>
-            </div>
-          </label>
-          <label class="check-card">
-            <input id="externalProviders" type="checkbox">
-            <div>
-              <strong>External STT providers later</strong>
-              <span>Keep the setup open so you can point this at external APIs or a remote backend when those adapters are added.</span>
-            </div>
-          </label>
-          <label class="check-card">
-            <input id="rewriteCleanup" type="checkbox" checked>
-            <div>
-              <strong>Transcript cleanup before insert</strong>
-              <span>Keep the rewrite pass on so spoken draft text becomes cleaner final text before it lands in the target app.</span>
-            </div>
-          </label>
-        </form>
-      </section>
+      <section class="panel">
+        <section data-step="0">
+          <p class="step-copy">DicTray lives in your tray, listens when you hold your shortcut, and turns speech into ready-to-insert text. Built-in speech to text is the core path. Text improvement is optional.</p>
+        </section>
 
-      <section class="step" data-step="1" hidden>
-        <h2>Capture your typing baseline</h2>
-        <p>Type this phrase once so DicTray can estimate how much typing time it saves each day.</p>
-        <div class="sample" id="sample-text"></div>
-        <div class="benchmark-summary" id="benchmark-summary"></div>
-        <textarea id="typing-input" spellcheck="false" placeholder="Type the phrase exactly once. The timer starts on your first keystroke."></textarea>
-        <div class="typing-hint" id="typing-hint" data-state="idle"></div>
+        <section data-step="1" hidden>
+          <div class="input-block">
+            <span class="input-label">Your name</span>
+            <input id="profile-name" class="input-field" type="text" maxlength="40" placeholder="Denim" autocomplete="name">
+            <span class="hint" id="name-hint" data-state="idle"></span>
+          </div>
+        </section>
+
+        <section data-step="2" hidden>
+          <p class="step-copy">Type this once so DicTray can estimate how much typing time it saves you each day.</p>
+          <div class="sample" id="sample-text"></div>
+          <div class="summary" id="benchmark-summary" data-state="idle"></div>
+          <textarea id="typing-input" spellcheck="false" placeholder="Type the sentence exactly once. The timer starts on your first keystroke."></textarea>
+          <div class="hint" id="typing-hint" data-state="idle"></div>
+        </section>
+
+        <section data-step="3" hidden>
+          <p class="step-copy">Use text improvement only if you want the transcript polished with app context before it is inserted.</p>
+          <div class="option-stack">
+            <label class="option-card" data-choice-card="rewrite">
+              <input type="radio" name="rewrite-choice" value="yes">
+              <div>
+                <strong>Yes</strong>
+                <span>Improve the text before insert. DicTray will default to Ollama for this today.</span>
+              </div>
+            </label>
+            <label class="option-card" data-choice-card="rewrite">
+              <input type="radio" name="rewrite-choice" value="no">
+              <div>
+                <strong>No</strong>
+                <span>Keep it simple and insert the raw speech result directly.</span>
+              </div>
+            </label>
+          </div>
+        </section>
+
+        <section data-step="4" hidden>
+          <p class="step-copy">Pick how much effort DicTray should spend on speech to text.</p>
+          <div class="option-stack">
+            <label class="option-card" data-choice-card="effort">
+              <input type="radio" name="speech-effort" value="low">
+              <div>
+                <strong>Low (Faster)</strong>
+                <span>Fastest response. Best when you want speed over accuracy.</span>
+              </div>
+            </label>
+            <label class="option-card" data-choice-card="effort">
+              <input type="radio" name="speech-effort" value="mid">
+              <div>
+                <strong>Mid (Balanced)</strong>
+                <span>Good default. A solid balance between speed and quality.</span>
+              </div>
+            </label>
+            <label class="option-card" data-choice-card="effort">
+              <input type="radio" name="speech-effort" value="high">
+              <div>
+                <strong>High (Quality)</strong>
+                <span>More work per turn for better accuracy when quality matters most.</span>
+              </div>
+            </label>
+          </div>
+        </section>
+
+        <section data-step="5" hidden>
+          <p class="step-copy">Choose the shortcut you want to hold when you speak.</p>
+          <div class="managed-note" id="shortcut-managed-note" hidden></div>
+          <div class="option-stack" id="shortcut-options"></div>
+          <div class="hint" id="shortcut-hint" data-state="idle"></div>
+        </section>
+
+        <section data-step="6" hidden>
+          <p class="step-copy">That is it. Here is what DicTray will use.</p>
+          <div class="summary-list" id="finish-summary"></div>
+        </section>
       </section>
 
       <section class="actions">

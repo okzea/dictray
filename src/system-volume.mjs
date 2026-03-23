@@ -2,18 +2,21 @@ import { access } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
+import { resolveBundledHelperExecutable } from './runtime-paths.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const SYSTEM_VOLUME_HELPER = String(process.env.DICTATION_TRAY_VOLUME_HELPER || '').trim() || path.join(
-  __dirname,
-  '..',
-  'scripts',
-  'windows-system-volume',
-  'bin',
-  'Release',
-  'net10.0-windows',
-  'WindowsSystemVolume.exe'
-)
+const SYSTEM_VOLUME_HELPER = String(process.env.DICTATION_TRAY_VOLUME_HELPER || '').trim()
+  || resolveBundledHelperExecutable('windows-system-volume', 'WindowsSystemVolume.exe')
+  || path.join(
+    __dirname,
+    '..',
+    'scripts',
+    'windows-system-volume',
+    'bin',
+    'Release',
+    'net10.0-windows',
+    'WindowsSystemVolume.exe'
+  )
 
 export class SystemVolumeBridge {
   constructor() {

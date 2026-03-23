@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-var shortcut = args.Length > 0 ? args[0] : "Alt+Space";
+var shortcut = args.Length > 0 ? args[0] : "CommandOrControl+Space";
 
 try
 {
@@ -151,8 +151,8 @@ internal static class KeyboardHookBridge
 
         Console.CancelKeyPress += (_, eventArgs) =>
         {
-          eventArgs.Cancel = true;
-          PostQuitMessage(0);
+            eventArgs.Cancel = true;
+            PostQuitMessage(0);
         };
         AppDomain.CurrentDomain.ProcessExit += (_, _) => Unhook();
 
@@ -250,6 +250,7 @@ internal static class KeyboardHookBridge
                 var vkCode = unchecked((int)data.vkCode);
                 if (IsRelevantKey(vkCode))
                 {
+                    var wasActive = _active;
                     var nextActive = ComboActiveForEvent(vkCode, isKeyDown);
                     if (nextActive && !_active)
                     {
@@ -264,7 +265,10 @@ internal static class KeyboardHookBridge
                         Console.Out.Flush();
                     }
 
-                    if (nextActive || _active)
+                    // Swallow both the active combo events and the final release event that ends the combo.
+                    // This prevents hotkeys like Alt+Space from leaking a trailing system-menu keyup into
+                    // the target app when dictation later restores focus and pastes text.
+                    if (nextActive || wasActive)
                     {
                         return (IntPtr)1;
                     }

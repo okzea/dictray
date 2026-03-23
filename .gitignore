@@ -4,6 +4,7 @@ local/
 .electron-cache/
 .runtime-helpers/
 .tmp/
+build/
 docker/stt/cache/*
 !docker/stt/cache/.gitkeep
 scripts/**/bin/

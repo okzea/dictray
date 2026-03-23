@@ -4,19 +4,58 @@
   "version": "0.1.0",
   "description": "Standalone Windows tray app for local speech-to-text dictation with focused-window-aware cleanup",
   "type": "module",
+  "main": "tray/main.mjs",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
+    "bundle:runtime": "node scripts/prepare-bundled-runtime.mjs",
+    "pack:win": "pnpm bundle:runtime && electron-builder --win --dir --x64",
+    "dist:win": "pnpm bundle:runtime && electron-builder --win --x64",
     "icon:export": "electron scripts/export-icon.mjs assets/app-icon.svg assets/app-icon.png assets/app-icon.ico",
     "start": "node scripts/start.mjs",
+    "start:ob": "node scripts/start-onboarding.mjs",
+    "smoke:two-turns": "node scripts/smoke-two-turns.mjs",
     "tray": "electron tray/main.mjs",
     "tray:dev": "electronmon tray/main.mjs",
-    "check": "node --check src/config.mjs && node --check src/ollama-client.mjs && node --check src/rewrite-provider.mjs && node --check src/speech-lexicon.mjs && node --check src/speech-tools.mjs && node --check src/stt-provider.mjs && node --check src/system-volume.mjs && node --check src/ui-automation.mjs && node --check scripts/export-icon.mjs && node --check scripts/start.mjs && node --check tray/main.mjs && node --check tray/onboarding-preload.mjs && node --check tray/onboarding-renderer.mjs && node --check tray/preload.mjs && node --check tray/voice-renderer.mjs",
+    "check": "node --check src/config.mjs && node --check src/ollama-client.mjs && node --check src/rewrite-provider.mjs && node --check src/runtime-paths.mjs && node --check src/speech-lexicon.mjs && node --check src/speech-tools.mjs && node --check src/stt-provider.mjs && node --check src/system-volume.mjs && node --check src/ui-automation.mjs && node --check scripts/export-icon.mjs && node --check scripts/prepare-bundled-runtime.mjs && node --check scripts/smoke-two-turns.mjs && node --check scripts/start.mjs && node --check scripts/start-onboarding.mjs && node --check scripts/stt-runtime-bootstrap.mjs && node --check tray/main.mjs && node --check tray/onboarding-preload.mjs && node --check tray/onboarding-renderer.mjs && node --check tray/preload.mjs && node --check tray/voice-renderer.mjs",
     "build:helpers": "dotnet build scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj -c Release && dotnet build scripts/windows-ui-automation/WindowsUiAutomation.csproj -c Release && dotnet build scripts/windows-system-volume/WindowsSystemVolume.csproj -c Release"
+  },
+  "build": {
+    "appId": "com.okzea.dictray",
+    "productName": "DicTray",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "assets/**/*",
+      "src/**/*",
+      "tray/**/*",
+      "scripts/faster_whisper_cli.py",
+      "dictation-tray.config.json",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build/bundled-runtime",
+        "to": "runtime"
+      }
+    ],
+    "win": {
+      "icon": "assets/app-icon.ico",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false
+    }
   },
   "devDependencies": {
     "electron": "^40.0.0",
+    "electron-builder": "26.0.19",
     "electronmon": "^2.0.4"
   }
 }

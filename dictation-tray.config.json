@@ -3,30 +3,29 @@
     "stateDir": "./local/state"
   },
   "stt": {
-    "provider": "local",
+    "provider": "http",
     "enabled": true,
     "timeoutMs": 120000,
-    "keepWarmIntervalMs": 900000,
-    "local": {
-      "pythonBin": "python",
-      "transcribeScript": "./scripts/faster_whisper_cli.py",
-      "model": "base.en",
-      "device": "auto",
-      "computeType": "auto"
+    "http": {
+      "baseUrl": "http://127.0.0.1:4593",
+      "path": "/transcribe",
+      "healthPath": "/health",
+      "timeoutMs": 120000
     }
   },
   "rewrite": {
-    "provider": "ollama",
+    "provider": "none",
     "ollama": {
       "baseUrl": "http://127.0.0.1:11434",
       "model": "qwen3-coder:30b",
       "timeoutMs": 45000,
       "keepAlive": "30m",
-      "think": "default"
+      "think": "off",
+      "temperature": 0.1
     }
   },
   "dictation": {
-    "rewriteEnabled": true,
+    "rewriteEnabled": false,
     "duckingEnabled": true,
     "duckingLevel": 0.3
   }

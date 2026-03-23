@@ -1,8 +1,10 @@
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { access, mkdir, mkdtemp, readdir, readFile, rm, stat, unlink, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+import readline from 'node:readline'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
@@ -89,35 +91,544 @@ function speechErrorText(error) {
     .join('\n')
 }
 
+function cudaRuntimeUnavailable(error) {
+  const raw = speechErrorText(error)
+  return /(cublas|cudnn|cublaslt).*?(not found|cannot be loaded|load failed)|cuda.*?(not found|cannot be loaded|load failed)/i.test(raw)
+}
+
+function explicitMissingScriptError(error, scriptName) {
+  const stderr = String(error?.stderr || '').trim()
+  const stdout = String(error?.stdout || '').trim()
+  const message = String(error?.message || '').trim()
+  const haystacks = [stderr, stdout, message].filter(Boolean)
+  const escapedScriptName = String(scriptName || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  if (!escapedScriptName) {
+    return false
+  }
+
+  const patterns = [
+    new RegExp(`can't open file[^\\n\\r]*${escapedScriptName}`, 'i'),
+    new RegExp(`cannot open[^\\n\\r]*${escapedScriptName}`, 'i'),
+    new RegExp(`no such file[^\\n\\r]*${escapedScriptName}`, 'i'),
+    new RegExp(`not found[^\\n\\r]*${escapedScriptName}`, 'i'),
+    new RegExp(`${escapedScriptName}[^\\n\\r]*(can't open file|cannot open|no such file|not found)`, 'i')
+  ]
+
+  return haystacks.some((text) => patterns.some((pattern) => pattern.test(text)))
+}
+
+function localSttDiagnosticFields(stt = {}) {
+  return {
+    pythonBin: String(stt?.pythonBin || '').trim(),
+    transcribeScript: String(stt?.transcribeScript || '').trim(),
+    workerScript: String(stt?.workerScript || '').trim(),
+    daemonScript: String(stt?.daemonScript || '').trim(),
+    model: String(stt?.model || '').trim(),
+    modelDir: String(stt?.modelDir || '').trim(),
+    device: String(stt?.device || '').trim(),
+    computeType: String(stt?.computeType || '').trim()
+  }
+}
+
+class LocalSttWorkerClient {
+  constructor(sttConfig = {}) {
+    this.sttConfig = sttConfig
+    this.child = null
+    this.stdoutReader = null
+    this.stderrReader = null
+    this.pending = new Map()
+    this.nextRequestId = 1
+    this.stderrLines = []
+    this.startPromise = null
+    this.requestQueue = Promise.resolve()
+  }
+
+  workerScriptPath() {
+    const configured = String(this.sttConfig?.workerScript || '').trim()
+    if (configured) {
+      return configured
+    }
+    const transcribeScript = String(this.sttConfig?.transcribeScript || '').trim()
+    if (!transcribeScript) {
+      return ''
+    }
+    return path.join(path.dirname(transcribeScript), 'faster_whisper_worker.py')
+  }
+
+  recordStderr(text) {
+    const normalized = String(text || '').trim()
+    if (!normalized) {
+      return
+    }
+    this.stderrLines.push(normalized)
+    if (this.stderrLines.length > 24) {
+      this.stderrLines = this.stderrLines.slice(-24)
+    }
+  }
+
+  stderrSnapshot() {
+    return this.stderrLines.join('\n').trim()
+  }
+
+  rejectPending(error) {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer)
+      pending.reject(error)
+    }
+    this.pending.clear()
+  }
+
+  reset() {
+    if (this.stdoutReader) {
+      this.stdoutReader.close()
+      this.stdoutReader = null
+    }
+    if (this.stderrReader) {
+      this.stderrReader.close()
+      this.stderrReader = null
+    }
+    this.child = null
+    this.startPromise = null
+  }
+
+  restart() {
+    const child = this.child
+    this.reset()
+    if (child && !child.killed) {
+      try {
+        child.kill()
+      } catch {
+        // ignore worker kill failures
+      }
+    }
+  }
+
+  shouldRestartAfterError(error) {
+    const text = speechErrorText(error)
+    return /timed out while handling|worker write failed|worker exited|worker failed to start/i.test(text)
+  }
+
+  async ensureStarted() {
+    if (this.child && !this.child.killed) {
+      return this.child
+    }
+    if (this.startPromise) {
+      return this.startPromise
+    }
+
+    this.startPromise = (async () => {
+      const pythonBin = expandHome(this.sttConfig?.pythonBin)
+      const workerScript = expandHome(this.workerScriptPath())
+      await access(workerScript)
+
+      this.stderrLines = []
+      const child = spawn(pythonBin, [workerScript], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: false
+      })
+
+      child.on('error', (error) => {
+        const detail = this.stderrSnapshot()
+        const wrapped = new Error(`Speech to Text worker failed to start: ${error?.message || error}`)
+        wrapped.detail = detail
+        this.rejectPending(wrapped)
+        this.reset()
+      })
+
+      child.on('exit', (code, signal) => {
+        const detail = this.stderrSnapshot()
+        const wrapped = new Error(`Speech to Text worker exited with code ${code ?? 'unknown'}${signal ? ` (signal ${signal})` : ''}.`)
+        wrapped.detail = detail
+        this.rejectPending(wrapped)
+        this.reset()
+      })
+
+      this.stdoutReader = readline.createInterface({ input: child.stdout })
+      this.stdoutReader.on('line', (line) => {
+        let payload
+        try {
+          payload = JSON.parse(String(line || '').trim())
+        } catch {
+          this.recordStderr(`Invalid worker JSON: ${String(line || '').trim()}`)
+          return
+        }
+
+        const id = Number(payload?.id || 0)
+        if (!id || !this.pending.has(id)) {
+          return
+        }
+
+        const pending = this.pending.get(id)
+        this.pending.delete(id)
+        clearTimeout(pending.timer)
+        pending.resolve(payload)
+      })
+
+      this.stderrReader = readline.createInterface({ input: child.stderr })
+      this.stderrReader.on('line', (line) => {
+        this.recordStderr(line)
+      })
+
+      this.child = child
+      return child
+    })()
+
+    try {
+      return await this.startPromise
+    } finally {
+      this.startPromise = null
+    }
+  }
+
+  async performRequest(action, payload = {}, timeoutMs = 120000) {
+    const child = await this.ensureStarted()
+    const id = this.nextRequestId++
+
+    return await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id)
+        const error = new Error(`Speech to Text worker timed out while handling ${action}.`)
+        error.detail = this.stderrSnapshot()
+        reject(error)
+      }, Math.max(1000, Number(timeoutMs) || 120000))
+
+      this.pending.set(id, {
+        resolve,
+        reject,
+        timer
+      })
+
+      const message = JSON.stringify({
+        id,
+        action,
+        ...payload
+      })
+
+      child.stdin.write(`${message}\n`, (error) => {
+        if (!error) {
+          return
+        }
+        this.pending.delete(id)
+        clearTimeout(timer)
+        const wrapped = new Error(`Speech to Text worker write failed: ${error?.message || error}`)
+        wrapped.detail = this.stderrSnapshot()
+        reject(wrapped)
+      })
+    })
+  }
+
+  async request(action, payload = {}, timeoutMs = 120000) {
+    const run = async () => {
+      try {
+        return await this.performRequest(action, payload, timeoutMs)
+      } catch (error) {
+        if (!this.shouldRestartAfterError(error)) {
+          throw error
+        }
+        this.restart()
+        return await this.performRequest(action, payload, timeoutMs)
+      }
+    }
+    const queued = this.requestQueue.then(run, run)
+    this.requestQueue = queued.catch(() => {})
+    return await queued
+  }
+}
+
+async function reserveLocalPort(host = '127.0.0.1') {
+  return await new Promise((resolve, reject) => {
+    const server = createServer()
+    server.on('error', reject)
+    server.listen(0, host, () => {
+      const address = server.address()
+      const port = typeof address === 'object' && address ? Number(address.port) : 0
+      server.close((error) => {
+        if (error) {
+          reject(error)
+          return
+        }
+        resolve(port)
+      })
+    })
+  })
+}
+
+class LocalSttDaemonClient {
+  constructor(sttConfig = {}) {
+    this.sttConfig = sttConfig
+    this.child = null
+    this.stdoutReader = null
+    this.stderrReader = null
+    this.stderrLines = []
+    this.startPromise = null
+    this.baseUrl = ''
+  }
+
+  daemonScriptPath() {
+    const configured = String(this.sttConfig?.daemonScript || '').trim()
+    if (configured) {
+      return configured
+    }
+    const transcribeScript = String(this.sttConfig?.transcribeScript || '').trim()
+    if (!transcribeScript) {
+      return ''
+    }
+    return path.join(path.dirname(transcribeScript), 'faster_whisper_daemon.py')
+  }
+
+  recordStderr(text) {
+    const normalized = String(text || '').trim()
+    if (!normalized) {
+      return
+    }
+    this.stderrLines.push(normalized)
+    if (this.stderrLines.length > 24) {
+      this.stderrLines = this.stderrLines.slice(-24)
+    }
+  }
+
+  stderrSnapshot() {
+    return this.stderrLines.join('\n').trim()
+  }
+
+  reset() {
+    if (this.stdoutReader) {
+      this.stdoutReader.close()
+      this.stdoutReader = null
+    }
+    if (this.stderrReader) {
+      this.stderrReader.close()
+      this.stderrReader = null
+    }
+    this.child = null
+    this.startPromise = null
+    this.baseUrl = ''
+  }
+
+  restart() {
+    const child = this.child
+    this.reset()
+    if (child && !child.killed) {
+      try {
+        child.kill()
+      } catch {
+        // ignore daemon kill failures
+      }
+    }
+  }
+
+  shouldRestartAfterError(error) {
+    const text = speechErrorText(error)
+    return /timed out|fetch failed|econnrefused|socket hang up|daemon exited|daemon failed to start|networkerror|terminated|aborted/i.test(text)
+  }
+
+  async waitUntilReachable(baseUrl, timeoutMs = 10000) {
+    const startedAt = Date.now()
+    while ((Date.now() - startedAt) < timeoutMs) {
+      if (!this.child || this.child.killed) {
+        const error = new Error('Speech to Text daemon exited before it became ready.')
+        error.detail = this.stderrSnapshot()
+        throw error
+      }
+
+      try {
+        const timeout = withTimeout(1000)
+        try {
+          const response = await fetch(`${baseUrl}/health`, {
+            method: 'GET',
+            signal: timeout.signal
+          })
+          if (response) {
+            return
+          }
+        } finally {
+          timeout.clear()
+        }
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 125))
+      }
+    }
+
+    const error = new Error('Speech to Text daemon did not become reachable in time.')
+    error.detail = this.stderrSnapshot()
+    throw error
+  }
+
+  async ensureStarted() {
+    if (this.child && !this.child.killed && this.baseUrl) {
+      return this.baseUrl
+    }
+    if (this.startPromise) {
+      return this.startPromise
+    }
+
+    this.startPromise = (async () => {
+      const pythonBin = expandHome(this.sttConfig?.pythonBin)
+      const daemonScript = expandHome(this.daemonScriptPath())
+      await access(daemonScript)
+
+      const port = await reserveLocalPort()
+      const baseUrl = `http://127.0.0.1:${port}`
+      const ffmpegBin = expandHome(this.sttConfig?.ffmpegBin)
+      this.stderrLines = []
+      const child = spawn(pythonBin, [daemonScript, '--host', '127.0.0.1', '--port', String(port)], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: false,
+        env: {
+          ...process.env,
+          STT_FFMPEG_BIN: ffmpegBin || process.env.STT_FFMPEG_BIN || 'ffmpeg'
+        }
+      })
+
+      child.on('error', (error) => {
+        this.recordStderr(`Speech to Text daemon failed to start: ${error?.message || error}`)
+        this.reset()
+      })
+
+      child.on('exit', (code, signal) => {
+        this.recordStderr(`Speech to Text daemon exited with code ${code ?? 'unknown'}${signal ? ` (signal ${signal})` : ''}.`)
+        this.reset()
+      })
+
+      this.stdoutReader = readline.createInterface({ input: child.stdout })
+      this.stdoutReader.on('line', (line) => {
+        const normalized = String(line || '').trim()
+        if (normalized) {
+          this.recordStderr(`[stdout] ${normalized}`)
+        }
+      })
+
+      this.stderrReader = readline.createInterface({ input: child.stderr })
+      this.stderrReader.on('line', (line) => {
+        this.recordStderr(line)
+      })
+
+      this.child = child
+      this.baseUrl = baseUrl
+      await this.waitUntilReachable(baseUrl)
+      return baseUrl
+    })()
+
+    try {
+      return await this.startPromise
+    } catch (error) {
+      this.restart()
+      throw error
+    } finally {
+      this.startPromise = null
+    }
+  }
+
+  async requestJson(pathname, options = {}, timeoutMs = 15000, retry = true) {
+    try {
+      const baseUrl = await this.ensureStarted()
+      const result = await fetchJson(`${baseUrl}${pathname}`, options, timeoutMs)
+      if (!result.ok) {
+        const error = new Error(result.payload?.detail || result.payload?.error || `Speech to Text daemon request failed with ${result.status}`)
+        error.detail = JSON.stringify(result.payload || {})
+        throw error
+      }
+      return result.payload || {}
+    } catch (error) {
+      if (retry && this.shouldRestartAfterError(error)) {
+        this.restart()
+        return await this.requestJson(pathname, options, timeoutMs, false)
+      }
+      throw error
+    }
+  }
+
+  async health(timeoutMs = 15000) {
+    return await this.requestJson('/health', { method: 'GET' }, timeoutMs)
+  }
+
+  async warm(payload = {}, timeoutMs = 120000) {
+    return await this.requestJson('/warm', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    }, timeoutMs)
+  }
+
+  async transcribe(audioBuffer, contentType, payload = {}, options = {}, retry = true) {
+    try {
+      const baseUrl = await this.ensureStarted()
+      const result = await fetchJson(`${baseUrl}/transcribe`, {
+        method: 'POST',
+        headers: {
+          'content-type': contentType || 'application/octet-stream',
+          'x-stt-model': String(payload?.model || '').trim() || 'base.en',
+          'x-stt-model-dir': String(payload?.modelDir || '').trim(),
+          'x-stt-device': String(payload?.device || '').trim() || 'auto',
+          'x-stt-compute-type': String(payload?.computeType || '').trim() || 'auto'
+        },
+        signal: options?.signal || null,
+        body: audioBuffer
+      }, options?.timeoutMs || 120000)
+
+      if (!result.ok) {
+        const error = new Error(result.payload?.detail || result.payload?.error || `Speech to Text daemon transcribe failed with ${result.status}`)
+        error.detail = JSON.stringify(result.payload || {})
+        throw error
+      }
+      return result.payload || {}
+    } catch (error) {
+      if (retry && this.shouldRestartAfterError(error)) {
+        this.restart()
+        return await this.transcribe(audioBuffer, contentType, payload, options, false)
+      }
+      throw error
+    }
+  }
+
+  async shutdown() {
+    if (!this.child || !this.baseUrl) {
+      this.restart()
+      return
+    }
+    try {
+      await fetchJson(`${this.baseUrl}/shutdown`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json'
+        },
+        body: '{}'
+      }, 2000).catch(() => null)
+    } finally {
+      this.restart()
+    }
+  }
+}
+
 function normalizeSpeechRuntimeError(kind, provider, error) {
   const raw = speechErrorText(error)
   const text = compactErrorText(raw, 240)
-  const providerLabel = provider === 'wsl'
-    ? 'WSL'
-    : provider === 'http'
-      ? 'HTTP'
-      : 'Local'
-  const kindLabel = kind === 'tts' ? 'TTS' : 'STT'
-  const target = `${providerLabel} ${kindLabel}`
+  const target = kind === 'tts'
+    ? provider === 'http'
+      ? 'Voice service'
+      : 'Voice playback'
+    : 'Speech to Text'
 
   if (/access is denied/i.test(raw)) {
     return `${target} is unavailable: access was denied.`
   }
 
   if (/ffmpeg/i.test(raw) && /(command not found|not recognized|enoent|no such file)/i.test(raw)) {
-    return `${target} is unavailable: ffmpeg is not installed${provider === 'wsl' ? ' in WSL' : ''}.`
+    return `${target} is unavailable: ffmpeg is not installed.`
   }
 
   if (kind === 'stt' && /python/i.test(raw) && /(command not found|not recognized|enoent|no such file)/i.test(raw)) {
-    return `${target} is unavailable: Python is not installed${provider === 'wsl' ? ' in WSL' : ''}.`
+    return `${target} is unavailable: Python is not installed.`
   }
 
-  if (kind === 'stt' && /faster_whisper_cli\.py/i.test(raw) && /(can't open file|cannot open|no such file|not found)/i.test(raw)) {
-    return `${target} is unavailable: faster-whisper CLI was not found${provider === 'wsl' ? ' in WSL' : ''}.`
+  if (kind === 'stt' && explicitMissingScriptError(error, 'faster_whisper_cli.py')) {
+    return `${target} is unavailable: faster-whisper CLI was not found.`
   }
 
   if (kind === 'tts' && /piper/i.test(raw) && /(command not found|not recognized|enoent|no such file|not found)/i.test(raw)) {
-    return `${target} is unavailable: Piper is not installed${provider === 'wsl' ? ' in WSL' : ''}.`
+    return `${target} is unavailable: Piper is not installed.`
   }
 
   if (provider === 'http' && /fetch failed|econnrefused|timed out|abort/i.test(raw)) {
@@ -176,15 +687,6 @@ async function cleanupOldFiles(directory, keep = 24) {
       // ignore
     }
   }
-}
-
-function toWslPath(filePath) {
-  const normalized = path.resolve(filePath).replace(/\\/g, '/')
-  const match = normalized.match(/^([A-Za-z]):\/(.*)$/)
-  if (match) {
-    return `/mnt/${match[1].toLowerCase()}/${match[2]}`
-  }
-  return normalized
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -257,6 +759,40 @@ export class SpeechTools {
     this.workDir = path.join(stateDir, 'voice-tmp')
     this._healthCache = null
     this._healthCacheAt = 0
+    this._localSttWorker = null
+    this._localSttDaemon = null
+    this._localSttQueue = Promise.resolve()
+  }
+
+  async runLocalSttTask(task) {
+    const queued = this._localSttQueue.then(task, task)
+    this._localSttQueue = queued.catch(() => {})
+    return await queued
+  }
+
+  localSttWorker() {
+    if (!this._localSttWorker) {
+      this._localSttWorker = new LocalSttWorkerClient(this.config?.stt?.local || {})
+    }
+    return this._localSttWorker
+  }
+
+  localSttDaemon() {
+    if (!this._localSttDaemon) {
+      this._localSttDaemon = new LocalSttDaemonClient(this.config?.stt?.local || {})
+    }
+    return this._localSttDaemon
+  }
+
+  async dispose() {
+    if (this._localSttDaemon) {
+      await this._localSttDaemon.shutdown().catch(() => null)
+      this._localSttDaemon = null
+    }
+    if (this._localSttWorker) {
+      this._localSttWorker.restart()
+      this._localSttWorker = null
+    }
   }
 
   /**
@@ -265,12 +801,57 @@ export class SpeechTools {
    */
   async warmStt() {
     if (!this.config.enabled) return { ok: false, reason: 'disabled' }
+    if (this.config?.stt?.provider === 'local') {
+      try {
+        return await this.runLocalSttTask(async () => {
+          const stt = this.config.stt.local
+          const payload = await this.localSttDaemon().warm({
+            model: String(stt.model || '').trim() || 'base.en',
+            modelDir: String(stt.modelDir || '').trim(),
+            device: String(stt.device || '').trim() || 'auto',
+            computeType: String(stt.computeType || '').trim() || 'auto'
+          }, 120000)
+          if (!payload?.ok) {
+            return {
+              ok: false,
+              reason: 'stt_unhealthy',
+              error: String(payload?.error || 'Speech to Text warmup failed.')
+            }
+          }
+          this._healthCache = {
+            ok: true,
+            provider: 'local',
+            ...localSttDiagnosticFields(stt),
+            model: String(payload.model || stt.model || '').trim(),
+            modelDir: String(payload.modelDir || stt.modelDir || '').trim(),
+            device: String(payload.device || stt.device || '').trim(),
+            computeType: String(payload.computeType || stt.computeType || '').trim(),
+            error: ''
+          }
+          this._healthCacheAt = Date.now()
+          return { ok: true }
+        })
+      } catch {
+        const health = await this.runLocalSttTask(() => this.checkLocalSttHealth()).catch(() => null)
+        return {
+          ok: false,
+          reason: health?.error ? 'stt_unhealthy' : 'warmup_failed',
+          error: String(health?.error || '').trim()
+        }
+      }
+    }
+
     try {
       const silentWav = buildSilentWav(0.1)
       await this.transcribeAudioBuffer(silentWav, 'audio/wav')
       return { ok: true }
     } catch {
-      return { ok: false, reason: 'warmup_failed' }
+      const health = await this.checkSttHealth().catch(() => null)
+      return {
+        ok: false,
+        reason: health?.error ? 'stt_unhealthy' : 'warmup_failed',
+        error: String(health?.error || '').trim()
+      }
     }
   }
 
@@ -329,80 +910,20 @@ export class SpeechTools {
           ok: false,
           provider: 'http',
           baseUrl: stt.http.baseUrl,
-          error: String(error?.message || error)
+          error: String(error?.message || error),
+          detail: speechErrorText(error)
         }
       }
     }
 
     if (stt.provider === 'local') {
-      try {
-        await access(expandHome(stt.local.transcribeScript))
-        const { stdout, stderr } = await execFileAsync(
-          expandHome(stt.local.pythonBin),
-          [
-            expandHome(stt.local.transcribeScript),
-            '--health',
-            '--model',
-            String(stt.local.model || '').trim() || 'base.en',
-            '--device',
-            String(stt.local.device || '').trim() || 'auto',
-            '--compute-type',
-            String(stt.local.computeType || '').trim() || 'auto'
-          ],
-          {
-            timeout: 4000,
-            maxBuffer: 1024 * 1024
-          }
-        )
-        const payload = JSON.parse(String(stdout || stderr || '{}'))
-        return {
-          ok: Boolean(payload.ok),
-          provider: 'local',
-          pythonBin: stt.local.pythonBin,
-          model: String(payload.model || stt.local.model || '').trim(),
-          device: String(payload.device || stt.local.device || '').trim(),
-          computeType: String(payload.computeType || stt.local.computeType || '').trim()
-        }
-      } catch (error) {
-        return {
-          ok: false,
-          provider: 'local',
-          error: String(error?.message || error)
-        }
-      }
+      return await this.runLocalSttTask(() => this.checkLocalSttHealth())
     }
 
-    try {
-      const { stdout } = await execFileAsync(
-        stt.wsl.wslBin,
-        [
-          '-e',
-          'bash',
-          '-c',
-          [
-            `command -v ${escapeShellArg(stt.wsl.pythonBin)} >/dev/null`,
-            `command -v ${escapeShellArg(stt.wsl.ffmpegBin)} >/dev/null`,
-            `test -f ${escapeShellArg(stt.wsl.transcribeScript)}`,
-            'printf ok'
-          ].join(' && ')
-        ],
-        {
-          timeout: 3000,
-          maxBuffer: 1024 * 1024
-        }
-      )
-      return {
-        ok: String(stdout || '').trim() === 'ok',
-        provider: 'wsl',
-        wslBin: stt.wsl.wslBin
-      }
-    } catch (error) {
-      return {
-        ok: false,
-        provider: 'wsl',
-        wslBin: stt.wsl.wslBin,
-        error: String(error?.message || error)
-      }
+    return {
+      ok: false,
+      provider: String(stt.provider || 'unknown').trim() || 'unknown',
+      error: `Unsupported speech provider: ${String(stt.provider || 'unknown').trim() || 'unknown'}`
     }
   }
 
@@ -455,38 +976,11 @@ export class SpeechTools {
       }
     }
 
-    try {
-      const { stdout } = await execFileAsync(
-        tts.wsl.wslBin,
-        [
-          '-e',
-          'bash',
-          '-c',
-          [
-            `command -v ${escapeShellArg(tts.wsl.ffmpegBin)} >/dev/null`,
-            `test -x ${escapeShellArg(tts.wsl.piperBin)}`,
-            'printf ok'
-          ].join(' && ')
-        ],
-        {
-          timeout: 3000,
-          maxBuffer: 1024 * 1024
-        }
-      )
-      return {
-        ok: String(stdout || '').trim() === 'ok',
-        provider: 'wsl',
-        voice: tts.voice,
-        wslBin: tts.wsl.wslBin
-      }
-    } catch (error) {
-      return {
-        ok: false,
-        provider: 'wsl',
-        voice: tts.voice,
-        wslBin: tts.wsl.wslBin,
-        error: String(error?.message || error)
-      }
+    return {
+      ok: false,
+      provider: String(tts.provider || 'unknown').trim() || 'unknown',
+      voice: tts.voice,
+      error: `Unsupported voice provider: ${String(tts.provider || 'unknown').trim() || 'unknown'}`
     }
   }
 
@@ -595,47 +1089,62 @@ export class SpeechTools {
     }
 
     const started = performance.now()
-    await mkdir(this.workDir, { recursive: true })
-    const tempDir = await mkdtemp(path.join(this.workDir, 'voice-turn-'))
-    const rawPath = path.join(tempDir, `input${inputExtension(contentType)}`)
-    const wavPath = path.join(tempDir, 'normalized.wav')
+    if (stt.provider !== 'local') {
+      throw new Error(`Unsupported speech provider: ${String(stt.provider || 'unknown').trim() || 'unknown'}`)
+    }
+    return await this.runLocalSttTask(() => this.transcribeViaLocal(audioBuffer, contentType, started, options))
+  }
 
+  async checkLocalSttHealth() {
+    const stt = this.config.stt
+    const diagnostic = localSttDiagnosticFields(stt.local)
     try {
-      await writeFile(rawPath, audioBuffer)
-      if (stt.provider === 'local') {
-        return await this.transcribeViaLocal(rawPath, wavPath, started)
+      await access(expandHome(stt.local.daemonScript || path.join(path.dirname(stt.local.transcribeScript || ''), 'faster_whisper_daemon.py')))
+      const payload = await this.localSttDaemon().health(15000)
+      return {
+        ok: Boolean(payload.ok),
+        provider: 'local',
+        ...diagnostic,
+        model: String(payload.model || stt.local.model || '').trim(),
+        modelDir: String(payload.modelDir || stt.local.modelDir || '').trim(),
+        device: String(payload.device || stt.local.device || '').trim(),
+        computeType: String(payload.computeType || stt.local.computeType || '').trim(),
+        error: String(payload.error || '').trim()
       }
-      return await this.transcribeViaWsl(rawPath, wavPath, started)
-    } finally {
-      await rm(tempDir, { recursive: true, force: true })
+    } catch (error) {
+      const detail = speechErrorText(error)
+      return {
+        ok: false,
+        provider: 'local',
+        ...diagnostic,
+        error: normalizeSpeechRuntimeError('stt', 'local', error),
+        detail
+      }
     }
   }
 
-  async transcribeViaLocal(rawPath, wavPath, started) {
+  async transcribeViaLocal(audioBuffer, contentType, started, options = {}) {
     const stt = this.config.stt.local
     try {
       const transcribeStarted = performance.now()
-      const { stdout, stderr } = await execFileAsync(
-        expandHome(stt.pythonBin),
-        [
-          expandHome(stt.transcribeScript),
-          rawPath,
-          '--model',
-          String(stt.model || '').trim() || 'base.en',
-          '--device',
-          String(stt.device || '').trim() || 'auto',
-          '--compute-type',
-          String(stt.computeType || '').trim() || 'auto'
-        ],
-        {
-          timeout: 120000,
-          maxBuffer: 1024 * 1024
-        }
-      )
-      const payload = JSON.parse(String(stdout || stderr || '{}'))
+      const payload = await this.localSttDaemon().transcribe(audioBuffer, contentType, {
+        model: String(stt.model || '').trim() || 'base.en',
+        modelDir: String(stt.modelDir || '').trim(),
+        device: String(stt.device || '').trim() || 'auto',
+        computeType: String(stt.computeType || '').trim() || 'auto'
+      }, {
+        signal: options?.signal || null,
+        timeoutMs: 120000
+      })
+
+      if (!payload?.ok) {
+        throw new Error(String(payload?.error || 'Speech to Text transcription failed.'))
+      }
+
       return {
         transcript: String(payload.transcript || '').trim(),
         language: String(payload.language || 'en'),
+        usedVadFallback: Boolean(payload?.usedVadFallback),
         timingsMs: {
           normalize: 0,
           transcribe: nowMs(transcribeStarted),
@@ -643,44 +1152,19 @@ export class SpeechTools {
         }
       }
     } catch (error) {
-      throw new Error(normalizeSpeechRuntimeError('stt', 'local', error))
-    }
-  }
-
-  async transcribeViaWsl(rawPath, wavPath, started) {
-    const stt = this.config.stt.wsl
-    const normalizeStarted = performance.now()
-    try {
-      // Use -c (not -lc) to skip login shell overhead — saves 2-4 seconds
-      const transcribeStarted = performance.now()
-      const { stdout, stderr } = await execFileAsync(
-        stt.wslBin,
-        [
-          '-e',
-          'bash',
-          '-c',
-          `${escapeShellArg(stt.ffmpegBin)} -v error -y -i "$1" -ac 1 -ar 16000 "$2" && ${escapeShellArg(stt.pythonBin)} ${escapeShellArg(stt.transcribeScript)} "$2"`,
-          'bash',
-          toWslPath(rawPath),
-          toWslPath(wavPath)
-        ],
-        {
-          timeout: this.config.stt.timeoutMs,
-          maxBuffer: 4 * 1024 * 1024
-        }
-      )
-      const payload = JSON.parse(String(stdout || stderr || '{}'))
-      return {
-        transcript: String(payload.transcript || '').trim(),
-        language: String(payload.language || 'en'),
-        timingsMs: {
-          normalize: nowMs(normalizeStarted),
-          transcribe: nowMs(transcribeStarted),
-          total: nowMs(started)
-        }
+      if (isAbortError(error)) {
+        throw error
       }
-    } catch (error) {
-      throw new Error(normalizeSpeechRuntimeError('stt', 'wsl', error))
+      const wrapped = new Error(normalizeSpeechRuntimeError('stt', 'local', error))
+      wrapped.detail = speechErrorText(error)
+      wrapped.pythonBin = String(stt.pythonBin || '').trim()
+      wrapped.daemonScript = String(stt.daemonScript || '').trim()
+      wrapped.transcribeScript = String(stt.transcribeScript || '').trim()
+      wrapped.model = String(stt.model || '').trim()
+      wrapped.modelDir = String(stt.modelDir || '').trim()
+      wrapped.device = String(stt.device || '').trim()
+      wrapped.computeType = String(stt.computeType || '').trim()
+      throw wrapped
     }
   }
 
@@ -708,6 +1192,7 @@ export class SpeechTools {
       return {
         transcript: String(payload.transcript || '').trim(),
         language: String(payload.language || 'en'),
+        usedVadFallback: Boolean(payload?.usedVadFallback),
         timingsMs: {
           normalize: Number(payload?.timingsMs?.normalize || 0),
           transcribe: Number(payload?.timingsMs?.transcribe || nowMs(started)),
@@ -718,7 +1203,10 @@ export class SpeechTools {
       if (isAbortError(error)) {
         throw error
       }
-      throw new Error(normalizeSpeechRuntimeError('stt', 'http', error))
+      const wrapped = new Error(normalizeSpeechRuntimeError('stt', 'http', error))
+      wrapped.detail = speechErrorText(error)
+      wrapped.baseUrl = String(stt.baseUrl || '').trim()
+      throw wrapped
     }
   }
 
@@ -745,7 +1233,7 @@ export class SpeechTools {
       if (this.config.tts.provider === 'local') {
         await this.synthesizeViaLocal(textPath, wavPath, fullPath)
       } else {
-        await this.synthesizeViaWsl(textPath, wavPath, fullPath)
+        throw new Error(`Unsupported voice provider: ${String(this.config.tts.provider || 'unknown').trim() || 'unknown'}`)
       }
 
       await cleanupOldFiles(this.audioDir, 48)
@@ -824,32 +1312,6 @@ export class SpeechTools {
       )
     } catch (error) {
       throw new Error(normalizeSpeechRuntimeError('tts', 'local', error))
-    }
-  }
-
-  async synthesizeViaWsl(textPath, wavPath, fullPath) {
-    const tts = this.config.tts
-    try {
-      await execFileAsync(
-        tts.wsl.wslBin,
-        [
-          '-e',
-          'bash',
-          '-c',
-          `${escapeShellArg(tts.wsl.piperBin)} --voice "$1" --text-file "$2" --audio-format wav --output "$3" && ${escapeShellArg(tts.wsl.ffmpegBin)} -v error -y -i "$3" -codec:a libmp3lame -q:a 4 "$4"`,
-          'bash',
-          tts.voice,
-          toWslPath(textPath),
-          toWslPath(wavPath),
-          toWslPath(fullPath)
-        ],
-        {
-          timeout: tts.timeoutMs,
-          maxBuffer: 4 * 1024 * 1024
-        }
-      )
-    } catch (error) {
-      throw new Error(normalizeSpeechRuntimeError('tts', 'wsl', error))
     }
   }
 
