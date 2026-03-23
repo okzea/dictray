@@ -68,6 +68,14 @@ Run syntax checks:
 npm.cmd run check
 ```
 
+Regenerate the app icon assets from the SVG source:
+
+```powershell
+pnpm icon:export
+```
+
+The Windows tray uses the generated `assets/app-icon.ico`.
+
 ## Voice-Friendly Developer Aliases
 
 If you use DicTray inside a terminal, short commands like `cd`, `ls`, `rg`, or `gs` are usually worse for speech than full words.

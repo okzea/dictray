@@ -632,6 +632,8 @@ internal static class UiAutomationActions
     private const int FocusSettleDelayMs = 20;
     private const int ClipboardSettleDelayMs = 10;
     private const int PasteSettleDelayMs = 40;
+    private const int ClipboardRetryAttempts = 8;
+    private const int ClipboardRetryDelayMs = 20;
 
     public static object? Perform(string action, WindowMatch window, AutomationElement target, ActionRequest request)
     {
@@ -751,15 +753,20 @@ internal static class UiAutomationActions
 
         System.Windows.Forms.IDataObject? previousClipboard = null;
         var hadClipboard = false;
+        string? previousClipboardText = null;
         long clipboardSetMs = 0;
         long pasteShortcutMs = 0;
         long clipboardRestoreMs = 0;
+        int clipboardRestoreAttempts = 0;
+        bool clipboardRestoreSuccess = false;
+        string? clipboardRestoreError = null;
         try
         {
             try
             {
                 previousClipboard = System.Windows.Forms.Clipboard.GetDataObject();
                 hadClipboard = previousClipboard is not null;
+                previousClipboardText = GetClipboardText(previousClipboard);
             }
             catch
             {
@@ -779,21 +786,11 @@ internal static class UiAutomationActions
         finally
         {
             var clipboardRestoreTimer = Stopwatch.StartNew();
-            try
-            {
-                if (hadClipboard && previousClipboard is not null)
-                {
-                    System.Windows.Forms.Clipboard.SetDataObject(previousClipboard, true);
-                }
-                else
-                {
-                    System.Windows.Forms.Clipboard.Clear();
-                }
-            }
-            catch
-            {
-            }
+            var restoreResult = RestoreClipboard(previousClipboard, previousClipboardText, hadClipboard);
             clipboardRestoreMs = clipboardRestoreTimer.ElapsedMilliseconds;
+            clipboardRestoreAttempts = restoreResult.Attempts;
+            clipboardRestoreSuccess = restoreResult.Success;
+            clipboardRestoreError = restoreResult.Error;
         }
 
         return new
@@ -801,9 +798,99 @@ internal static class UiAutomationActions
             focus = focusMs,
             clipboardSet = clipboardSetMs,
             paste = pasteShortcutMs,
-            clipboardRestore = clipboardRestoreMs
+            clipboardRestore = clipboardRestoreMs,
+            clipboardRestoreSuccess,
+            clipboardRestoreAttempts,
+            clipboardRestoreError
         };
     }
+
+    private static string? GetClipboardText(System.Windows.Forms.IDataObject? clipboardData)
+    {
+        if (clipboardData is null)
+        {
+            return null;
+        }
+
+        string? Read(string format)
+        {
+            try
+            {
+                if (!clipboardData.GetDataPresent(format))
+                {
+                    return null;
+                }
+
+                return clipboardData.GetData(format) as string;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        return string.IsNullOrWhiteSpace(Read(DataFormats.UnicodeText))
+            ? string.IsNullOrWhiteSpace(Read(DataFormats.Text))
+                ? string.IsNullOrWhiteSpace(Read(DataFormats.StringFormat))
+                    ? null
+                    : Read(DataFormats.StringFormat)
+                : Read(DataFormats.Text)
+            : Read(DataFormats.UnicodeText);
+    }
+
+    private static ClipboardRestoreResult RestoreClipboard(System.Windows.Forms.IDataObject? previousClipboard, string? previousText, bool hadClipboard)
+    {
+        if (hadClipboard && previousClipboard is not null)
+        {
+            var restoreOriginal = SetClipboardWithRetry(
+                () => System.Windows.Forms.Clipboard.SetDataObject(previousClipboard, true, ClipboardRetryAttempts, ClipboardRetryDelayMs),
+                "restore original clipboard data"
+            );
+            if (restoreOriginal.Success)
+            {
+                return restoreOriginal;
+            }
+
+            if (!string.IsNullOrWhiteSpace(previousText))
+            {
+                var restoreText = SetClipboardWithRetry(
+                    () => System.Windows.Forms.Clipboard.SetText(previousText),
+                    "restore previous clipboard text"
+                );
+                if (restoreText.Success)
+                {
+                    return restoreText with { Attempts = restoreOriginal.Attempts + restoreText.Attempts };
+                }
+            }
+        }
+
+        return SetClipboardWithRetry(System.Windows.Forms.Clipboard.Clear, "clear clipboard");
+    }
+
+    private static ClipboardRestoreResult SetClipboardWithRetry(Action setAction, string operation)
+    {
+        var lastError = (string?)null;
+        for (var attempt = 1; attempt <= ClipboardRetryAttempts; attempt++)
+        {
+            try
+            {
+                setAction();
+                return new ClipboardRestoreResult(attempt, true, null);
+            }
+            catch (Exception error)
+            {
+                lastError = $"{operation}: {error.Message}";
+                if (attempt < ClipboardRetryAttempts)
+                {
+                    System.Threading.Thread.Sleep(ClipboardRetryDelayMs);
+                }
+            }
+        }
+
+        return new ClipboardRestoreResult(ClipboardRetryAttempts, false, lastError);
+    }
+
+    private readonly record struct ClipboardRestoreResult(int Attempts, bool Success, string? Error);
 
     private static void SendPasteShortcut()
     {

@@ -3117,6 +3117,7 @@ async function insertText(text, windowContext, options = {}) {
   const waitTargetMs = 0
   let enterMs = 0
   let enterError
+  let helperNote
 
   try {
     const helperStartedAt = performance.now()
@@ -3128,6 +3129,12 @@ async function insertText(text, windowContext, options = {}) {
       signal: options?.signal || null
     })
     const helperMs = Math.round(performance.now() - helperStartedAt)
+    const actionDetail = result?.timings?.action || null
+    const clipboardRestoreSuccess = actionDetail?.clipboardRestoreSuccess
+    const clipboardRestoreError = actionDetail?.clipboardRestoreError
+    if (clipboardRestoreSuccess === false) {
+      helperNote = `Clipboard restore may not have completed: ${String(clipboardRestoreError || 'Clipboard busy/unavailable').trim()}`
+    }
 
     if (pressEnterAfterInsert) {
       try {
@@ -3159,7 +3166,8 @@ async function insertText(text, windowContext, options = {}) {
         enter: enterMs,
         helperDetail: result?.timings || null
       },
-      enterError
+      enterError,
+      note: helperNote
     }
   } catch (error) {
     if (isAbortError(error)) {
@@ -3402,11 +3410,16 @@ async function processAudioSubmission(payload = {}) {
     const insertResult = await insertText(finalText, windowContext, { signal })
     throwIfSubmissionCancelled(submission)
     const insertMs = nowMs(insertStartedAt)
+    if (insertResult.note) {
+      const insertNote = compactText(String(insertResult.note), 120)
+      note = note ? `${note} ${insertNote}` : insertNote
+    }
     if (!insertResult.ok && insertResult.copied) {
       note = `Paste failed. Copied the final text to the clipboard instead. ${insertResult.error ? `Reason: ${compactText(insertResult.error, 80)}` : ''}`.trim()
       showNotification(APP_NAME, compactText(note, 180))
     } else if (insertResult?.enterError) {
-      note = `Insert succeeded, but Enter failed. ${compactText(insertResult.enterError, 80)}`
+      const baseNote = `Insert succeeded, but Enter failed. ${compactText(insertResult.enterError, 80)}`
+      note = note ? `${note} ${baseNote}` : baseNote
       showNotification(APP_NAME, compactText(note, 180))
     }
 
