@@ -55,8 +55,9 @@ const EARCON_LEVELS = {
 function buildOverlayCopy(payload = {}) {
   const phase = String(payload?.phase || 'idle').trim() || 'idle'
   const targetWindow = String(payload?.targetWindow || '').trim()
+  const targetWindowName = simplifyTargetWindow(targetWindow)
   const message = String(payload?.error || payload?.note || '').trim()
-  const meta = targetWindow || (phase === 'pending_insert' ? 'Waiting' : 'DicTray')
+  const meta = phase === 'pending_insert' ? 'Waiting' : 'DicTray'
 
   switch (phase) {
     case 'listening':
@@ -64,10 +65,8 @@ function buildOverlayCopy(payload = {}) {
         phase,
         chip: 'Listening',
         meta,
-        headline: 'Speak now',
-        subline: targetWindow
-          ? `Locked on ${targetWindow}. Release the shortcut when you are done.`
-          : 'Release the shortcut when you are done.'
+        headline: 'Release when you are done',
+        subline: targetWindowName || 'Current window'
       }
     case 'processing':
       return {
@@ -75,9 +74,7 @@ function buildOverlayCopy(payload = {}) {
         chip: 'Processing',
         meta,
         headline: 'Finishing capture',
-        subline: targetWindow
-          ? `Holding your place in ${targetWindow}.`
-          : 'Wrapping up the recording.'
+        subline: targetWindowName || 'Current window'
       }
     case 'transcribing':
       return {
@@ -85,7 +82,7 @@ function buildOverlayCopy(payload = {}) {
         chip: 'Transcribing',
         meta,
         headline: 'Turning speech into text',
-        subline: message || (targetWindow ? `Preparing output for ${targetWindow}.` : 'Preparing your draft.')
+        subline: targetWindowName || message || 'Current window'
       }
     case 'rewriting':
       return {
@@ -93,15 +90,15 @@ function buildOverlayCopy(payload = {}) {
         chip: 'Improving',
         meta,
         headline: 'Cleaning up the draft',
-        subline: message || (targetWindow ? `Shaping the final text for ${targetWindow}.` : 'Polishing the wording.')
+        subline: targetWindowName || message || 'Current window'
       }
     case 'pending_insert':
       return {
         phase,
         chip: 'Ready',
-        meta: targetWindow || 'Waiting',
-        headline: targetWindow ? `Return to ${targetWindow}` : 'Return to the target window',
-        subline: message || 'The text will paste as soon as that window is active again.'
+        meta: 'Waiting',
+        headline: targetWindowName ? `Return to ${targetWindowName}` : 'Return to the target window',
+        subline: targetWindowName || message || 'The text will paste when that window is active.'
       }
     case 'inserting':
       return {
@@ -109,7 +106,7 @@ function buildOverlayCopy(payload = {}) {
         chip: 'Inserting',
         meta,
         headline: 'Sending text',
-        subline: message || (targetWindow ? `Dispatching into ${targetWindow}.` : 'Dispatching into the active app.')
+        subline: targetWindowName || 'Current window'
       }
     default:
       if (payload?.error) {
@@ -138,6 +135,16 @@ function buildOverlayCopy(payload = {}) {
         subline: 'Press the shortcut to start dictation.'
       }
   }
+}
+
+function simplifyTargetWindow(value) {
+  const text = String(value || '').trim()
+  if (!text) {
+    return ''
+  }
+
+  const match = text.match(/^(.*?)(?:\s+\([^()]+\))$/)
+  return (match?.[1] || text).trim()
 }
 
 function clampUnitInterval(value) {

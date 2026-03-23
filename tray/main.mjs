@@ -1950,7 +1950,6 @@ function rebuildMenu() {
     { label: greetingMenuLabel, enabled: false },
     { label: dailyTimeSavedLabel, enabled: false },
     { label: dailyCharacterLabel, enabled: false },
-    { label: phaseLabel(), enabled: false },
     { label: `Target: ${compactText(targetLabel, 90)}`, enabled: false },
     { label: `${SPEECH_TO_TEXT_LABEL}: ${healthValue(latestHealth.stt?.ok, runtimeLabel(), compactText(latestHealth.stt?.error || runtimeLabel(), 70))}`, enabled: false },
     { label: `${TEXT_IMPROVEMENT_LABEL}: ${healthValue(latestHealth.rewrite?.ok, rewriteStatusLabel(), compactText(latestHealth.rewrite?.error || rewriteStatusLabel(), 70))}`, enabled: false },
@@ -2042,12 +2041,6 @@ function rebuildMenu() {
           }))
     },
     { type: 'separator' },
-    {
-      label: 'Refresh Health',
-      click: () => {
-        void refreshRuntimeState(true)
-      }
-    },
     {
       label: quickStartMenuLabel,
       click: () => {
