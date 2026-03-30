@@ -984,9 +984,22 @@ export class SpeechTools {
     }
   }
 
+  _sttRuntimeBaseUrl() {
+    const stt = this.config.stt
+    if (stt.provider === 'http') {
+      return { baseUrl: stt.http.baseUrl, timeoutMs: stt.http.timeoutMs }
+    }
+    if (stt.provider === 'local') {
+      const daemon = this.localSttDaemon()
+      return { baseUrl: daemon.baseUrl, timeoutMs: stt.http?.timeoutMs || 120000, daemon }
+    }
+    return null
+  }
+
   async getSttRuntime() {
     const stt = this.config.stt
-    if (stt.provider !== 'http') {
+    const endpoint = this._sttRuntimeBaseUrl()
+    if (!endpoint) {
       return {
         ok: false,
         supported: false,
@@ -994,17 +1007,40 @@ export class SpeechTools {
       }
     }
 
+    let baseUrl = endpoint.baseUrl
+    if (!baseUrl && endpoint.daemon) {
+      try {
+        baseUrl = await endpoint.daemon.ensureStarted()
+      } catch {
+        return {
+          ok: false,
+          supported: true,
+          provider: stt.provider,
+          error: 'Speech to Text daemon is not running.'
+        }
+      }
+    }
+
+    if (!baseUrl) {
+      return {
+        ok: false,
+        supported: true,
+        provider: stt.provider,
+        error: 'Speech to Text endpoint is not available.'
+      }
+    }
+
     try {
       const result = await fetchJson(
-        `${stt.http.baseUrl}/runtime`,
+        `${baseUrl}/runtime`,
         { method: 'GET' },
-        stt.http.timeoutMs
+        endpoint.timeoutMs
       )
       return {
         ok: Boolean(result.ok),
         supported: true,
-        provider: 'http',
-        baseUrl: stt.http.baseUrl,
+        provider: stt.provider,
+        baseUrl,
         device: String(result.payload?.device || '').trim(),
         availableDevices: Array.isArray(result.payload?.availableDevices)
           ? result.payload.availableDevices.map((item) => String(item || '').trim()).filter(Boolean)
@@ -1016,8 +1052,8 @@ export class SpeechTools {
       return {
         ok: false,
         supported: true,
-        provider: 'http',
-        baseUrl: stt.http.baseUrl,
+        provider: stt.provider,
+        baseUrl,
         error: String(error?.message || error)
       }
     }
@@ -1025,11 +1061,35 @@ export class SpeechTools {
 
   async updateSttRuntime(input = {}) {
     const stt = this.config.stt
-    if (stt.provider !== 'http') {
+    const endpoint = this._sttRuntimeBaseUrl()
+    if (!endpoint) {
       return {
         ok: false,
         supported: false,
         provider: stt.provider
+      }
+    }
+
+    let baseUrl = endpoint.baseUrl
+    if (!baseUrl && endpoint.daemon) {
+      try {
+        baseUrl = await endpoint.daemon.ensureStarted()
+      } catch {
+        return {
+          ok: false,
+          supported: true,
+          provider: stt.provider,
+          error: 'Speech to Text daemon is not running.'
+        }
+      }
+    }
+
+    if (!baseUrl) {
+      return {
+        ok: false,
+        supported: true,
+        provider: stt.provider,
+        error: 'Speech to Text endpoint is not available.'
       }
     }
 
@@ -1046,7 +1106,7 @@ export class SpeechTools {
 
     try {
       const result = await fetchJson(
-        `${stt.http.baseUrl}/runtime`,
+        `${baseUrl}/runtime`,
         {
           method: 'PUT',
           headers: {
@@ -1054,7 +1114,7 @@ export class SpeechTools {
           },
           body: JSON.stringify(payload)
         },
-        stt.http.timeoutMs
+        endpoint.timeoutMs
       )
       if (!result.ok) {
         throw new Error(result.payload?.detail || result.payload?.error || `STT runtime update failed with ${result.status}`)
@@ -1062,8 +1122,8 @@ export class SpeechTools {
       return {
         ok: true,
         supported: true,
-        provider: 'http',
-        baseUrl: stt.http.baseUrl,
+        provider: stt.provider,
+        baseUrl,
         device: String(result.payload?.device || '').trim(),
         availableDevices: Array.isArray(result.payload?.availableDevices)
           ? result.payload.availableDevices.map((item) => String(item || '').trim()).filter(Boolean)
@@ -1075,8 +1135,8 @@ export class SpeechTools {
       return {
         ok: false,
         supported: true,
-        provider: 'http',
-        baseUrl: stt.http.baseUrl,
+        provider: stt.provider,
+        baseUrl,
         error: String(error?.message || error)
       }
     }

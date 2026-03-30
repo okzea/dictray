@@ -29,7 +29,7 @@ export class SttProvider {
   }
 
   supportsRuntimePreferences() {
-    return this.id === 'http'
+    return this.id === 'local' || this.id === 'http'
   }
 
   supportsLocalServiceControl() {

@@ -2,7 +2,7 @@
   "name": "dictray",
   "private": true,
   "version": "0.1.0",
-  "description": "Standalone Windows tray app for local speech-to-text dictation with focused-window-aware cleanup",
+  "description": "Tray app for local speech-to-text dictation with focused-window-aware text insertion",
   "type": "module",
   "main": "tray/main.mjs",
   "engines": {
@@ -12,7 +12,10 @@
     "bundle:runtime": "node scripts/prepare-bundled-runtime.mjs",
     "pack:win": "pnpm bundle:runtime && electron-builder --win --dir --x64",
     "dist:win": "pnpm bundle:runtime && electron-builder --win --x64",
+    "pack:linux": "pnpm bundle:runtime && electron-builder --linux --dir --x64",
+    "dist:linux": "pnpm bundle:runtime && electron-builder --linux --x64",
     "icon:export": "electron scripts/export-icon.mjs assets/app-icon.svg assets/app-icon.png assets/app-icon.ico",
+    "gnome:reload": "node scripts/reload-gnome-extension.mjs",
     "start": "node scripts/start.mjs",
     "start:ob": "node scripts/start-onboarding.mjs",
     "smoke:two-turns": "node scripts/smoke-two-turns.mjs",
@@ -51,6 +54,14 @@
     "nsis": {
       "oneClick": true,
       "perMachine": false
+    },
+    "linux": {
+      "icon": "assets/app-icon.png",
+      "target": [
+        "AppImage",
+        "rpm"
+      ],
+      "category": "Utility"
     }
   },
   "devDependencies": {

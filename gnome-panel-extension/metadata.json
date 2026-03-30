@@ -1,0 +1,10 @@
+{
+  "uuid": "dictray-gnome-panel@okzea",
+  "name": "DicTray Panel",
+  "description": "Shows DicTray dictation status and quick controls in the GNOME top bar.",
+  "version": 2,
+  "version-name": "2.0",
+  "url": "https://github.com/okzea/dictray",
+  "shell-version": ["49"],
+  "settings-schema": "org.gnome.shell.extensions.dictray-gnome-panel"
+}

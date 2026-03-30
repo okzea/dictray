@@ -3,6 +3,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolveBundledHelperExecutable } from './runtime-paths.mjs'
+import { LinuxSystemVolumeBridge } from './linux-system-volume.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SYSTEM_VOLUME_HELPER = String(process.env.DICTATION_TRAY_VOLUME_HELPER || '').trim()
@@ -22,9 +23,13 @@ export class SystemVolumeBridge {
   constructor() {
     this.helperAvailable = false
     this.warningShown = false
+    this._linuxBridge = process.platform === 'linux' ? new LinuxSystemVolumeBridge() : null
   }
 
   async checkHealth() {
+    if (this._linuxBridge) {
+      return this._linuxBridge.checkHealth()
+    }
     if (process.platform !== 'win32') {
       return {
         ok: false,
@@ -64,11 +69,17 @@ export class SystemVolumeBridge {
   }
 
   async getState() {
+    if (this._linuxBridge) {
+      return this._linuxBridge.getState()
+    }
     await this.requireHelper()
     return this.run('state')
   }
 
   async setState(input = {}) {
+    if (this._linuxBridge) {
+      return this._linuxBridge.setState(input)
+    }
     await this.requireHelper()
     return this.run('set', input)
   }
@@ -96,6 +107,9 @@ export class SystemVolumeBridge {
   }
 
   async requireHelper() {
+    if (this._linuxBridge) {
+      return
+    }
     if (process.platform !== 'win32') {
       throw new Error('Windows system volume control is only available on Windows.')
     }

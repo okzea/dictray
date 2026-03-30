@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.dictray-gnome-panel"
+          path="/org/gnome/shell/extensions/dictray-gnome-panel/">
+    <key name="dictray-toggle" type="as">
+      <default>['&lt;Control&gt;space']</default>
+      <summary>Toggle dictation</summary>
+      <description>Keyboard shortcut to start/stop dictation</description>
+    </key>
+  </schema>
+</schemalist>

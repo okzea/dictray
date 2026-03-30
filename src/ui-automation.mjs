@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { resolveBundledHelperExecutable } from './runtime-paths.mjs'
+import { LinuxUiAutomationBridge } from './linux-ui-automation.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const UI_AUTOMATION_HELPER = String(process.env.DICTATION_TRAY_UI_AUTOMATION_HELPER || '').trim()
@@ -34,9 +35,13 @@ export class UiAutomationBridge {
     this.pending = new Map()
     this.nextRequestId = 0
     this.startPromise = null
+    this._linuxBridge = process.platform === 'linux' ? new LinuxUiAutomationBridge() : null
   }
 
   async checkHealth() {
+    if (this._linuxBridge) {
+      return this._linuxBridge.checkHealth()
+    }
     if (process.platform !== 'win32') {
       return {
         ok: false,
@@ -76,16 +81,25 @@ export class UiAutomationBridge {
   }
 
   async listWindows(input = {}) {
+    if (this._linuxBridge) {
+      return this._linuxBridge.listWindows(input)
+    }
     await this.requireHelper()
     return this.run('list-windows', input)
   }
 
   async snapshot(input = {}) {
+    if (this._linuxBridge) {
+      return this._linuxBridge.snapshot(input)
+    }
     await this.requireHelper()
     return this.run('snapshot', input)
   }
 
   async action(input = {}, options = {}) {
+    if (this._linuxBridge) {
+      return this._linuxBridge.action(input, options)
+    }
     await this.requireHelper()
     return this.run('action', input, options)
   }
@@ -113,6 +127,9 @@ export class UiAutomationBridge {
   }
 
   async requireHelper() {
+    if (this._linuxBridge) {
+      return
+    }
     if (process.platform !== 'win32') {
       throw new Error('Windows UI automation is only available on Windows.')
     }

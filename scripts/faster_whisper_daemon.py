@@ -490,13 +490,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # pragma: no cover - simple stdlib entrypoint
         parsed = urlparse(self.path)
-        if parsed.path != "/health":
-            self.send_json(404, {"ok": False, "error": "Not found"})
+        if parsed.path == "/health":
+            if IMPORT_ERROR:
+                self.send_json(503, runtime_payload(ok=False, error=IMPORT_ERROR))
+                return
+            self.send_json(200, runtime_payload())
             return
-        if IMPORT_ERROR:
-            self.send_json(503, runtime_payload(ok=False, error=IMPORT_ERROR))
+        if parsed.path == "/runtime":
+            if IMPORT_ERROR:
+                self.send_json(503, runtime_payload(ok=False, error=IMPORT_ERROR))
+                return
+            payload = runtime_payload()
+            payload["availableDevices"] = ["cpu", "cuda"] if cuda_device_count() > 0 else ["cpu"]
+            self.send_json(200, payload)
             return
-        self.send_json(200, runtime_payload())
+        self.send_json(404, {"ok": False, "error": "Not found"})
 
     def do_POST(self) -> None:  # pragma: no cover - simple stdlib entrypoint
         parsed = urlparse(self.path)
@@ -526,6 +534,27 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/shutdown":
                 self.send_json(200, {"ok": True, "shutdown": True})
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
+                return
+
+            self.send_json(404, {"ok": False, "error": "Not found"})
+        except Exception as error:
+            self.send_json(503, runtime_payload(ok=False, error=error_text(error) or "Unknown daemon error"))
+
+    def do_PUT(self) -> None:  # pragma: no cover - simple stdlib entrypoint
+        parsed = urlparse(self.path)
+        content_length = max(0, int(self.headers.get("Content-Length", "0") or 0))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+
+        try:
+            if IMPORT_ERROR:
+                raise RuntimeError(IMPORT_ERROR)
+
+            if parsed.path == "/runtime":
+                command = read_json_bytes(raw_body)
+                # Apply the requested runtime settings by warming with the new config
+                payload = warm_runtime(command)
+                payload["availableDevices"] = ["cpu", "cuda"] if cuda_device_count() > 0 else ["cpu"]
+                self.send_json(200, payload)
                 return
 
             self.send_json(404, {"ok": False, "error": "Not found"})

@@ -87,7 +87,10 @@ export function resolveBundledSttConfig() {
       continue
     }
 
-    const pythonBin = resolveManifestPath(runtimeRoot, manifest.pythonBin, 'stt/python/Scripts/python.exe')
+    const defaultPythonBin = process.platform === 'win32'
+      ? 'stt/python/Scripts/python.exe'
+      : 'stt/python/bin/python3'
+    const pythonBin = resolveManifestPath(runtimeRoot, manifest.pythonBin, defaultPythonBin)
     const transcribeScript = resolveManifestPath(runtimeRoot, manifest.transcribeScript, 'stt/scripts/faster_whisper_cli.py')
     const workerScript = resolveManifestPath(runtimeRoot, manifest.workerScript, 'stt/scripts/faster_whisper_worker.py')
     const daemonScript = resolveManifestPath(runtimeRoot, manifest.daemonScript, 'stt/scripts/faster_whisper_daemon.py')

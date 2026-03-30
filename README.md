@@ -193,7 +193,12 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 - `pnpm bundle:runtime` will try to auto-create a private bundled Python runtime and install `faster-whisper` into it. If you already have a private runtime you want to reuse, point `DICTATION_TRAY_BUNDLED_PYTHON_DIR` or `DICTATION_TRAY_BUNDLED_PYTHON` at it instead. Use `DICTATION_TRAY_BUNDLED_PYTHON_BOOTSTRAP` to choose the bootstrap interpreter, and `DICTATION_TRAY_BUNDLED_STT_MODEL_DIR` to stage a local model cache into the bundle.
 - STT now sends a background keep-warm ping every `900000` ms by default (`15` minutes). Set `stt.keepWarmIntervalMs` to change it, or `0` to disable it.
 - This repo does not include TTS at all.
-- STT device/model changes currently happen through config plus restart rather than live tray switching.
+- STT device/model changes can be changed live from the tray or GNOME panel when the active STT provider supports runtime preferences.
 - For local STT, the tray reports the active device/model in the status line.
 - Rewrite model selection is currently available for the optional Ollama provider only.
 - If focused-window paste fails, the final text is copied to the clipboard as a fallback.
+- GNOME (Linux) can show DicTray in the top bar using the companion extension under `gnome-panel-extension/`.
+  1) Copy it to `~/.local/share/gnome-shell/extensions/dictray-gnome-panel@okzea`
+  2) `gnome-extensions enable dictray-gnome-panel@okzea`
+  3) Log out / log in on Wayland (or `Alt+F2`, `r`, Enter on X11)
+  4) After local extension edits, run `pnpm gnome:reload`

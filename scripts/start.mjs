@@ -270,36 +270,38 @@ async function main() {
   await ensureElectronRuntime(childEnv)
   await requestExistingTrayExit(childEnv)
 
-  const helperRoot = runtimeHelperRoot()
-  const hotkeyHelperDir = path.join(helperRoot, 'windows-hotkey-hook')
-  const uiAutomationHelperDir = path.join(helperRoot, 'windows-ui-automation')
-  const volumeHelperDir = path.join(helperRoot, 'windows-system-volume')
-  const hotkeyHelperPath = path.join(hotkeyHelperDir, 'WindowsHotkeyHook.exe')
-  const uiAutomationHelperPath = path.join(uiAutomationHelperDir, 'WindowsUiAutomation.exe')
-  const volumeHelperPath = path.join(volumeHelperDir, 'WindowsSystemVolume.exe')
+  const electronEnv = {
+    ...childEnv,
+    ELECTRON_ENABLE_LOGGING: '1',
+    DICTATION_TRAY_BUNDLED_RUNTIME_DIR: childEnv.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || ''
+  }
 
-  log('Building Windows hotkey helper.')
-  await buildDotnetHelper('scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj', hotkeyHelperDir, childEnv)
+  if (process.platform === 'win32') {
+    const helperRoot = runtimeHelperRoot()
+    const hotkeyHelperDir = path.join(helperRoot, 'windows-hotkey-hook')
+    const uiAutomationHelperDir = path.join(helperRoot, 'windows-ui-automation')
+    const volumeHelperDir = path.join(helperRoot, 'windows-system-volume')
 
-  log('Building Windows UI automation helper.')
-  await buildDotnetHelper('scripts/windows-ui-automation/WindowsUiAutomation.csproj', uiAutomationHelperDir, childEnv)
+    log('Building Windows hotkey helper.')
+    await buildDotnetHelper('scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj', hotkeyHelperDir, childEnv)
 
-  log('Building Windows system volume helper.')
-  await buildDotnetHelper('scripts/windows-system-volume/WindowsSystemVolume.csproj', volumeHelperDir, childEnv)
+    log('Building Windows UI automation helper.')
+    await buildDotnetHelper('scripts/windows-ui-automation/WindowsUiAutomation.csproj', uiAutomationHelperDir, childEnv)
+
+    log('Building Windows system volume helper.')
+    await buildDotnetHelper('scripts/windows-system-volume/WindowsSystemVolume.csproj', volumeHelperDir, childEnv)
+
+    electronEnv.DICTATION_TRAY_HOTKEY_HELPER = path.join(hotkeyHelperDir, 'WindowsHotkeyHook.exe')
+    electronEnv.DICTATION_TRAY_UI_AUTOMATION_HELPER = path.join(uiAutomationHelperDir, 'WindowsUiAutomation.exe')
+    electronEnv.DICTATION_TRAY_VOLUME_HELPER = path.join(volumeHelperDir, 'WindowsSystemVolume.exe')
+  }
 
   await warmSttRuntime(sttProvider)
 
   const electronCli = electronCliPath()
   log('Launching tray.')
   await run(process.execPath, [electronCli, 'tray/main.mjs'], {
-    env: {
-      ...childEnv,
-      ELECTRON_ENABLE_LOGGING: '1',
-      DICTATION_TRAY_BUNDLED_RUNTIME_DIR: childEnv.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || '',
-      DICTATION_TRAY_HOTKEY_HELPER: hotkeyHelperPath,
-      DICTATION_TRAY_UI_AUTOMATION_HELPER: uiAutomationHelperPath,
-      DICTATION_TRAY_VOLUME_HELPER: volumeHelperPath
-    }
+    env: electronEnv
   })
 }
 

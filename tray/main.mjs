@@ -1,9 +1,10 @@
 import { spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
-import { access, appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
+import { readFileSync, watch as fsWatch, writeFileSync } from 'node:fs'
+import { access, appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import os from 'node:os'
 import {
   app,
   BrowserWindow,
@@ -27,12 +28,22 @@ import { SystemVolumeBridge } from '../src/system-volume.mjs'
 import { UiAutomationBridge } from '../src/ui-automation.mjs'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+if (process.platform === 'linux') {
+  // Use software GL on Linux to avoid NVIDIA driver crashes that can
+  // freeze the entire desktop session (especially on Wayland + proprietary drivers).
+  app.commandLine.appendSwitch('use-gl', 'angle')
+  app.commandLine.appendSwitch('use-angle', 'swiftshader')
+}
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.okzea.dictray')
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const APP_NAME = 'DicTray'
+const XDG_CONFIG_HOME = String(process.env.XDG_CONFIG_HOME || '').trim() || path.join(os.homedir(), '.config')
+const GNOME_PANEL_DIR = path.join(XDG_CONFIG_HOME, 'dictray', 'gnome-panel')
+const GNOME_PANEL_STATE_PATH = path.join(GNOME_PANEL_DIR, 'status.json')
+const GNOME_PANEL_COMMAND_PATH = path.join(GNOME_PANEL_DIR, 'command.json')
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -97,6 +108,8 @@ const INPUT_SOURCE_WINDOW_HEIGHT = 520
 const TARGET_WINDOW_POLL_INTERVAL_MS = 280
 const EXIT_EXISTING_INSTANCE_ARG = '--dictray-exit-existing'
 const REQUEST_EXIT_EXISTING_INSTANCE = process.argv.includes(EXIT_EXISTING_INSTANCE_ARG)
+const GNOME_PANEL_POLL_INTERVAL_MS = 900
+const GNOME_PANEL_ACTIVE_PHASES = new Set(['listening', 'processing', 'transcribing', 'rewriting', 'inserting', 'pending_insert'])
 
 let runtimeConfig = null
 let speech = null
@@ -128,6 +141,10 @@ let voiceOverlayFocusedBounds = null
 let voiceOverlayFocusedBoundsRefresh = null
 let isQuitting = false
 let isRestoringVolumeForQuit = false
+let gnomePanelPollTimer = null
+let gnomePanelCommandWatcher = null
+let gnomePanelBridgeEnabled = false
+let gnomePanelLastToggleMs = 0
 let trayHotkey = DEFAULT_HOTKEY
 let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
@@ -257,6 +274,555 @@ function colorTimingText(text, colorName) {
         ? '\u001b[31m'
         : ''
   return code ? `${code}${text}\u001b[0m` : text
+}
+
+function isGnomeSession() {
+  const currentDesktop = String(process.env.XDG_CURRENT_DESKTOP || '').toLowerCase()
+  const sessionType = String(process.env.XDG_SESSION_TYPE || '').toLowerCase()
+  const sessionDesktop = String(process.env.DESKTOP_SESSION || '').toLowerCase()
+  return currentDesktop.includes('gnome')
+    || sessionDesktop.includes('gnome')
+    || sessionType === 'wayland'
+    && (currentDesktop.includes('ubuntu') || currentDesktop.includes('pop'))
+}
+
+function isActiveDictationPhase(value) {
+  return GNOME_PANEL_ACTIVE_PHASES.has(String(value || 'idle').trim())
+}
+
+function buildGnomePanelMenu() {
+  const greetingMenuLabel = greetingLabel()
+  const dailyCharacterLabel = `Keys Saved Today: ${formatCount(currentDailyCharacterCount())}`
+  const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
+  const quickStartMenuLabel = onboardingCompleted() ? 'Open Quick Start' : 'Finish Quick Start'
+  const historyMenu = outputHistory.entries.length > 0
+    ? [{
+        label: 'Click any entry to copy it',
+        enabled: false
+      }, {
+        type: 'separator'
+      }, ...outputHistory.entries.map((entry) => ({
+        label: outputHistoryMenuLabel(entry),
+        command: {
+          action: 'copy_history',
+          value: String(entry?.text || '')
+        }
+      }))]
+    : [{
+        label: 'No saved text yet',
+        enabled: false
+      }]
+
+  const modelMenu = rewriteSupportsModelSelection()
+    ? rewriteModels.length
+      ? rewriteModels.map((model) => ({
+        label: String(model?.name || '').trim() || 'unknown',
+        type: 'radio',
+        checked: String(model?.name || '').trim() === currentRewriteModel,
+        command: {
+          action: 'switch_rewrite_model',
+          value: String(model?.name || '').trim()
+        }
+      }))
+      : [{
+          label: latestHealth.rewrite?.ok === false
+            ? `Unavailable: ${compactText(latestHealth.rewrite?.error || `${rewriteProviderLabel()} is down`, 70)}`
+            : `No ${rewriteProviderLabel()} models found`,
+          enabled: false
+        }]
+    : [{
+        label: rewriteProviderId() === 'none'
+          ? 'Choose Text Improvement Provider first'
+          : `Model selection unavailable for ${rewriteProviderLabel()}`,
+        enabled: false
+      }]
+
+  const rewriteThinkMenu = [{
+    label: rewriteThinkMenuOptionLabel('off'),
+    type: 'radio',
+    checked: normalizeRewriteThink(currentRewriteThink) === 'off',
+    command: {
+      action: 'set_rewrite_think',
+      value: 'off'
+    }
+  }, {
+    label: rewriteThinkMenuOptionLabel('default'),
+    type: 'radio',
+    checked: normalizeRewriteThink(currentRewriteThink) === 'default',
+    command: {
+      action: 'set_rewrite_think',
+      value: 'default'
+    }
+  }, {
+    label: rewriteThinkMenuOptionLabel('on'),
+    type: 'radio',
+    checked: normalizeRewriteThink(currentRewriteThink) === 'on',
+    command: {
+      action: 'set_rewrite_think',
+      value: 'on'
+    }
+  }]
+
+  const rewriteTemperatureMenu = REWRITE_TEMPERATURE_OPTIONS.map((value) => ({
+    label: rewriteTemperatureMenuOptionLabel(value),
+    type: 'radio',
+    checked: normalizeRewriteTemperature(currentRewriteTemperature) === value,
+    command: {
+      action: 'set_rewrite_temperature',
+      value
+    }
+  }))
+
+  const rewriteProviderMenu = [{
+    label: 'Off (skip text improvement)',
+    type: 'radio',
+    checked: rewriteProviderId() === 'none',
+    command: {
+      action: 'set_rewrite_provider',
+      value: 'none'
+    }
+  }, {
+    label: 'Ollama (local rewrite provider)',
+    type: 'radio',
+    checked: rewriteProviderId() === 'ollama',
+    command: {
+      action: 'set_rewrite_provider',
+      value: 'ollama'
+    }
+  }]
+
+  const selectedInputDevice = selectedInputSource()
+  const inputSourceMenu = [
+    {
+      label: 'Open Live Preview',
+      command: {
+        action: 'open_input_preview'
+      }
+    },
+    { type: 'separator' },
+    ...(preferredInputDeviceId && inputDeviceState.available.length && !selectedInputDevice
+      ? [{
+          label: 'Selected microphone is unavailable. Falling back to the system default when needed.',
+          enabled: false
+        }]
+      : []),
+    ...(inputDeviceState.error
+      ? [{
+          label: `Status: ${compactText(inputDeviceState.error, 72)}`,
+          enabled: false
+        }]
+      : []),
+    {
+      label: 'System Default',
+      type: 'radio',
+      checked: !preferredInputDeviceId,
+      command: {
+        action: 'set_input_source',
+        value: ''
+      }
+    },
+    ...(inputDeviceState.available.length
+      ? inputDeviceState.available.map((device) => ({
+          label: compactText(device.label, 56),
+          type: 'radio',
+          checked: preferredInputDeviceId === device.deviceId,
+          command: {
+            action: 'set_input_source',
+            value: device.deviceId
+          }
+        }))
+      : [{
+          label: inputDeviceState.permission === 'denied'
+            ? 'Microphone access denied'
+            : inputDeviceState.permission === 'granted'
+              ? 'No microphones detected'
+              : 'Start dictation once to grant microphone access',
+          enabled: false
+        }]),
+    { type: 'separator' },
+    {
+      label: 'Refresh Inputs',
+      command: {
+        action: 'refresh_inputs'
+      }
+    }
+  ]
+
+  const sttDeviceMenu = sttPreferences.supported
+    ? sttPreferences.options.map((value) => ({
+        label: sttDeviceMenuLabel(value),
+        type: 'radio',
+        checked: sttPreferences.selectedDevice === value,
+        command: {
+          action: 'set_stt_device',
+          value
+        }
+      }))
+    : [{
+        label: 'Not available for this STT provider',
+        enabled: false
+      }]
+
+  const sttModelMenu = sttPreferences.supported
+    ? sttPreferences.modelOptions.map((value) => ({
+        label: sttModelMenuOptionLabel(value),
+        type: 'radio',
+        checked: sttPreferences.selectedModel === value,
+        command: {
+          action: 'set_stt_model',
+          value
+        }
+      }))
+    : [{
+        label: 'Not available for this STT provider',
+        enabled: false
+      }]
+
+  const duckingLevelMenu = DUCKING_LEVEL_OPTIONS.map((value) => ({
+    label: duckingLevelMenuLabel(value),
+    type: 'radio',
+    checked: duckingLevel === value,
+    command: {
+      action: 'set_ducking_level',
+      value
+    }
+  }))
+
+  return [
+    { label: greetingMenuLabel, enabled: false },
+    { label: dailyTimeSavedLabel, enabled: false },
+    { label: dailyCharacterLabel, enabled: false },
+    {
+      label: 'History',
+      submenu: historyMenu
+    },
+    { type: 'separator' },
+    {
+      label: voiceState.phase === 'listening'
+        ? 'Stop Dictation'
+        : voiceState.phase === 'pending_insert'
+          ? 'Cancel Pending Insert'
+          : 'Start Dictation',
+      command: {
+        action: 'toggle'
+      }
+    },
+    {
+      label: 'Improve Text',
+      type: 'checkbox',
+      checked: rewriteEnabled,
+      command: {
+        action: 'set_rewrite_enabled',
+        value: !rewriteEnabled
+      }
+    },
+    {
+      label: 'Send Enter After Insert',
+      type: 'checkbox',
+      checked: pressEnterAfterInsert,
+      command: {
+        action: 'set_press_enter_after_insert',
+        value: !pressEnterAfterInsert
+      }
+    },
+    {
+      label: 'Text Improvement Provider',
+      submenu: rewriteProviderMenu
+    },
+    {
+      label: 'Output Ducking',
+      submenu: [
+        {
+          label: duckingEnabled ? `Enabled (${duckingPercentLabel()})` : 'Disabled',
+          enabled: false
+        },
+        {
+          label: 'Enable Ducking',
+          type: 'checkbox',
+          checked: duckingEnabled,
+          command: {
+            action: 'set_ducking_enabled',
+            value: !duckingEnabled
+          }
+        },
+        { type: 'separator' },
+        ...duckingLevelMenu
+      ]
+    },
+    {
+      label: 'Text Improvement Model',
+      submenu: modelMenu
+    },
+    {
+      label: 'Text Improvement Thinking',
+      submenu: rewriteThinkMenu
+    },
+    {
+      label: 'Text Improvement Temperature',
+      submenu: rewriteTemperatureMenu
+    },
+    {
+      label: 'Input Source',
+      submenu: inputSourceMenu
+    },
+    {
+      label: 'Speech to Text Device',
+      submenu: sttDeviceMenu
+    },
+    {
+      label: 'Speech to Text Model',
+      submenu: sttModelMenu
+    },
+    {
+      label: 'Dictation Shortcut',
+      submenu: hotkeyManagedByEnv()
+        ? [{
+            label: `Managed by DICTATION_TRAY_HOTKEY: ${formatHotkey(trayHotkey)}`,
+            enabled: false
+          }]
+        : HOTKEY_PRESETS.map((preset) => ({
+            label: preset.label,
+            type: 'radio',
+            checked: trayHotkey === preset.value,
+            command: {
+              action: 'set_tray_hotkey',
+              value: preset.value
+            }
+          }))
+    },
+    {
+      label: 'Submit Shortcut (with Enter)',
+      submenu: PROMPT_HOTKEY_PRESETS.map((preset) => ({
+        label: preset.label,
+        type: 'radio',
+        checked: promptTrayHotkey === preset.value,
+        command: {
+          action: 'set_prompt_hotkey',
+          value: preset.value
+        }
+      }))
+    },
+    { type: 'separator' },
+    {
+      label: quickStartMenuLabel,
+      command: {
+        action: 'open_quick_start'
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit',
+      command: {
+        action: 'quit_app'
+      }
+    }
+  ]
+}
+
+function buildGnomePanelPayload() {
+  return {
+    version: 1,
+    app: APP_NAME,
+    updatedAt: Date.now(),
+    phase: String(voiceState?.phase || 'idle').trim() || 'idle',
+    phaseLabel: phaseLabel().replace('State: ', ''),
+    dictating: isActiveDictationPhase(voiceState?.phase),
+    rewriteEnabled: Boolean(rewriteEnabled),
+    duckingEnabled: Boolean(duckingEnabled),
+    hotkey: trayHotkey,
+    targetWindow: compactText(voiceState?.targetWindow || '', 70),
+    note: compactText(voiceState?.note || '', 110),
+    error: compactText(voiceState?.error || '', 180),
+    menu: buildGnomePanelMenu()
+  }
+}
+
+async function syncGnomePanelState() {
+  if (!gnomePanelBridgeEnabled) {
+    return
+  }
+  try {
+    await writeFile(GNOME_PANEL_STATE_PATH, JSON.stringify(buildGnomePanelPayload()), { encoding: 'utf8' })
+  } catch (error) {
+    console.error('[dictray] Failed to sync GNOME panel state:', error?.message || error)
+  }
+}
+
+let gnomePanelCommandProcessing = false
+
+async function processGnomePanelCommand() {
+  if (!gnomePanelBridgeEnabled || gnomePanelCommandProcessing) {
+    return
+  }
+  gnomePanelCommandProcessing = true
+  try {
+    await processGnomePanelCommandInner()
+  } finally {
+    gnomePanelCommandProcessing = false
+  }
+}
+
+async function processGnomePanelCommandInner() {
+  let rawCommand = ''
+  try {
+    rawCommand = await readFile(GNOME_PANEL_COMMAND_PATH, 'utf8')
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error('[dictray] Failed to read GNOME panel command file:', error?.message || error)
+    }
+    return
+  }
+  if (!String(rawCommand || '').trim()) {
+    await unlink(GNOME_PANEL_COMMAND_PATH).catch(() => {})
+    return
+  }
+
+  // Delete before processing to avoid re-reading the same command
+  await unlink(GNOME_PANEL_COMMAND_PATH).catch(() => {})
+
+  let command = {}
+  try {
+    command = JSON.parse(String(rawCommand || '').trim())
+  } catch {
+    return
+  }
+
+  const action = String(command?.action || '').trim()
+
+  switch (action) {
+    case 'toggle': {
+      const now = Date.now()
+      if ((now - gnomePanelLastToggleMs) < 400) {
+        break
+      }
+      gnomePanelLastToggleMs = now
+      void toggleDictationCapture()
+      break
+    }
+    case 'start':
+      if (voiceState.phase !== 'listening') {
+        void startDictationCapture()
+      }
+      break
+    case 'stop':
+      if (voiceState.phase === 'listening') {
+        void stopDictationCapture()
+      }
+      break
+    case 'copy_history':
+      clipboard.writeText(String(command?.value || ''))
+      showNotification(APP_NAME, 'Saved text copied to clipboard.')
+      break
+    case 'set_rewrite_enabled':
+      void updateRewriteEnabled(Boolean(command?.value))
+      break
+    case 'set_press_enter_after_insert':
+      void updatePressEnterAfterInsert(Boolean(command?.value))
+      break
+    case 'set_rewrite_provider':
+      void updateRewriteProvider(command?.value)
+      break
+    case 'set_ducking_enabled':
+      void updateDuckingEnabled(Boolean(command?.value))
+      break
+    case 'set_ducking_level':
+      void updateDuckingLevel(command?.value)
+      break
+    case 'switch_rewrite_model':
+      if (String(command?.value || '').trim()) {
+        void switchRewriteModel(String(command.value).trim())
+      }
+      break
+    case 'set_rewrite_think':
+      void updateRewriteThink(command?.value)
+      break
+    case 'set_rewrite_temperature':
+      void updateRewriteTemperature(command?.value)
+      break
+    case 'open_input_preview':
+      void openInputSourceWindow()
+      break
+    case 'set_input_source':
+      void updateInputSourcePreference(command?.value)
+      break
+    case 'refresh_inputs':
+      void refreshInputSources()
+      break
+    case 'set_stt_device':
+      void updateSttPreferences({ sttDevice: command?.value })
+      break
+    case 'set_stt_model':
+      void updateSttPreferences({ sttModel: command?.value })
+      break
+    case 'set_tray_hotkey':
+      void updateTrayHotkey(command?.value)
+      break
+    case 'set_prompt_hotkey':
+      void updatePromptTrayHotkey(command?.value)
+      break
+    case 'open_quick_start':
+      void openOnboardingWindow({ markSeen: true })
+      break
+    case 'quit_app':
+      app.quit()
+      break
+    default:
+      break
+  }
+}
+
+async function initGnomePanelBridge() {
+  if (process.platform !== 'linux' || !isGnomeSession()) {
+    return false
+  }
+
+  try {
+    await mkdir(GNOME_PANEL_DIR, { recursive: true })
+  } catch (error) {
+    console.error('[dictray] Failed to prepare GNOME panel state directory:', error?.message || error)
+    return false
+  }
+
+  gnomePanelBridgeEnabled = true
+  if (!gnomePanelPollTimer) {
+    gnomePanelPollTimer = setInterval(() => {
+      void processGnomePanelCommand().catch(() => {})
+    }, GNOME_PANEL_POLL_INTERVAL_MS)
+  }
+
+  if (!gnomePanelCommandWatcher) {
+    try {
+      gnomePanelCommandWatcher = fsWatch(GNOME_PANEL_DIR, { persistent: false }, (eventType, filename) => {
+        if (filename === 'command.json') {
+          void processGnomePanelCommand().catch(() => {})
+        }
+      })
+      gnomePanelCommandWatcher.on('error', () => {})
+    } catch {
+      // fs.watch not supported on this filesystem — poll timer is the fallback
+    }
+  }
+
+  await syncGnomePanelState()
+  return true
+}
+
+function stopGnomePanelBridge() {
+  if (gnomePanelPollTimer) {
+    clearInterval(gnomePanelPollTimer)
+    gnomePanelPollTimer = null
+  }
+  if (gnomePanelCommandWatcher) {
+    gnomePanelCommandWatcher.close()
+    gnomePanelCommandWatcher = null
+  }
+  gnomePanelBridgeEnabled = false
+
+  try {
+    writeFileSync(GNOME_PANEL_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
 }
 
 function timingColor(value, warnMs, badMs) {
@@ -904,17 +1470,21 @@ function computeVoiceOverlayBounds(state = voiceState) {
         width: VOICE_OVERLAY_WIDTH,
         height: VOICE_OVERLAY_HEIGHT
       }
-  const display = windowBounds ? screen.getDisplayMatching(matchingRect) : screen.getPrimaryDisplay()
-  const workArea = display?.workArea || {
-    x: 0,
-    y: 0,
-    width: VOICE_OVERLAY_WIDTH + (VOICE_OVERLAY_MARGIN * 2),
-    height: VOICE_OVERLAY_HEIGHT + (VOICE_OVERLAY_MARGIN * 2)
-  }
+  const display = windowBounds
+    ? screen.getDisplayMatching(matchingRect)
+    : screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+      || screen.getPrimaryDisplay()
+      || screen.getAllDisplays()[0]
+      || null
+  const workArea = (display?.workArea?.width > 0 && display?.workArea?.height > 0)
+    ? display.workArea
+    : (display?.bounds?.width > 0 && display?.bounds?.height > 0)
+      ? display.bounds
+      : { x: 0, y: 0, width: 1920, height: 1080 }
 
   let x = workArea.x + Math.round((workArea.width - VOICE_OVERLAY_WIDTH) / 2)
   let y = workArea.y + workArea.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
-  if (windowBounds) {
+  if (windowBounds && process.platform !== 'linux') {
     x = windowBounds.left + Math.round((windowBounds.width - VOICE_OVERLAY_WIDTH) / 2)
     y = windowBounds.top + windowBounds.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
   }
@@ -1513,8 +2083,10 @@ async function ensureVoiceWindow() {
     movable: false,
     minimizable: false,
     maximizable: false,
+    focusable: false,
     hasShadow: false,
     backgroundColor: '#00000000',
+    ...(process.platform === 'linux' ? { type: 'notification' } : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.mjs'),
       contextIsolation: true,
@@ -1736,6 +2308,7 @@ function updateVoiceState(patch = {}) {
   }
   rebuildMenu()
   syncVoiceOverlay()
+  void syncGnomePanelState()
 }
 
 function clearVoiceState(error = '') {
@@ -2024,7 +2597,7 @@ function rebuildMenu() {
         }
       }))
     : [{
-        label: 'Available only for the HTTP STT provider',
+        label: 'Not available for this STT provider',
         enabled: false
       }]
 
@@ -2038,7 +2611,7 @@ function rebuildMenu() {
         }
       }))
     : [{
-        label: 'Available only for the HTTP STT provider',
+        label: 'Not available for this STT provider',
         enabled: false
       }]
 
@@ -2177,6 +2750,7 @@ function rebuildMenu() {
   tray.setImage(currentTrayIcon())
   tray.setContextMenu(menu)
   tray.setToolTip(`${APP_NAME} - ${phaseLabel().replace('State: ', '')}`)
+  void syncGnomePanelState()
 }
 
 async function listRewriteModels() {
@@ -2281,7 +2855,7 @@ async function waitForPendingSttWarmup(signal = null) {
 }
 
 async function duckSystemVolumeForPushToTalk(force = false) {
-  if (process.platform !== 'win32' || !systemVolume || !duckingEnabled) {
+  if (!['win32', 'linux'].includes(process.platform) || !systemVolume || !duckingEnabled) {
     return
   }
   if (volumeDuckState && !force) {
@@ -2321,7 +2895,7 @@ async function duckSystemVolumeForPushToTalk(force = false) {
 }
 
 async function restoreSystemVolumeAfterPushToTalk() {
-  if (process.platform !== 'win32' || !systemVolume || !volumeDuckState) {
+  if (!['win32', 'linux'].includes(process.platform) || !systemVolume || !volumeDuckState) {
     return
   }
 
@@ -2662,8 +3236,8 @@ async function updateSttPreferences(input = {}) {
     return
   }
 
-  if (!providerUsesHttpStt()) {
-    showNotification(APP_NAME, `Live ${SPEECH_TO_TEXT_LABEL.toLowerCase()} switching is only supported for the HTTP STT provider, not ${runtimeConfig.stt.provider}.`)
+  if (typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
+    showNotification(APP_NAME, `Live ${SPEECH_TO_TEXT_LABEL.toLowerCase()} switching is not supported for ${runtimeConfig.stt.provider}.`)
     return
   }
 
@@ -2734,7 +3308,7 @@ async function updateSttPreferences(input = {}) {
 
 async function applySharedSpeechPreferencesOnStartup() {
   const stored = await readSharedSpeechPreferences()
-  if ((!stored.sttDevice && !stored.sttModel) || !providerUsesHttpStt()) {
+  if ((!stored.sttDevice && !stored.sttModel) || typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
     return
   }
 
@@ -2958,10 +3532,12 @@ async function captureFocusedWindowContext() {
 
   const selector = focusedWindow?.hwnd
     ? { hwnd: String(focusedWindow.hwnd).trim() }
-    : {
-        processName: String(focusedWindow?.processName || '').trim(),
-        titleContains: compactText(focusedWindow?.title || '', 120)
-      }
+    : focusedWindow?.linuxWindowId
+      ? { linuxWindowId: String(focusedWindow.linuxWindowId).trim() }
+      : {
+          processName: String(focusedWindow?.processName || '').trim(),
+          titleContains: compactText(focusedWindow?.title || '', 120)
+        }
 
   let snapshotResult = null
   try {
@@ -3460,6 +4036,13 @@ async function processAudioSubmission(payload = {}) {
       error: ''
     })
 
+    // On Wayland, the voice overlay can steal focus from the target window
+    // even with showInactive/setIgnoreMouseEvents. Hide it before pasting so
+    // wtype sends Ctrl+V to the user's app, not the overlay.
+    if (process.platform === 'linux' && voiceWindow && !voiceWindow.isDestroyed() && voiceWindow.isVisible()) {
+      voiceWindow.hide()
+    }
+
     const insertStartedAt = performance.now()
     const insertResult = await insertText(finalText, windowContext, {
       signal,
@@ -3774,6 +4357,11 @@ async function registerHotkey() {
     }
   }
 
+  if (process.platform === 'linux' && gnomePanelBridgeEnabled) {
+    console.log('[dictray] Shortcuts are managed by the GNOME Shell extension (Ctrl+Space). Skipping Electron globalShortcut.')
+    return
+  }
+
   registerPressOnlyHotkey()
 }
 
@@ -3956,6 +4544,7 @@ app.on('before-quit', (event) => {
     clearInterval(refreshTimer)
     refreshTimer = null
   }
+  stopGnomePanelBridge()
   clearSttKeepWarmTimer()
   stopHotkeyBridge()
   globalShortcut.unregisterAll()
@@ -3976,6 +4565,7 @@ app.on('before-quit', (event) => {
 app.whenReady().then(async () => {
   installPermissionHandlers()
   await bootstrap()
+  await initGnomePanelBridge().catch(() => {})
   await createTray()
   await ensureVoiceWindow()
   await maybeShowOnboarding()

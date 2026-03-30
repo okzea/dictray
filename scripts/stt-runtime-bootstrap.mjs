@@ -6,6 +6,12 @@ import { fileURLToPath } from 'node:url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_ROOT_DIR = path.resolve(__dirname, '..')
 
+const IS_WIN = process.platform === 'win32'
+// Python venv executable paths differ between Windows and Unix
+const VENV_BIN_DIR = IS_WIN ? 'Scripts' : 'bin'
+const VENV_PYTHON_NAME = IS_WIN ? 'python.exe' : 'python3'
+const VENV_PYTHON_REL = path.join(VENV_BIN_DIR, VENV_PYTHON_NAME)
+
 function createLogger(logger) {
   if (typeof logger === 'function') {
     return logger
@@ -118,24 +124,24 @@ export async function ensureBundledSttRuntime(options = {}) {
     return [
       explicitRuntimeDir && {
         sourceRoot: explicitRuntimeDir,
-        relativePythonBin: path.join('Scripts', 'python.exe'),
+        relativePythonBin: VENV_PYTHON_REL,
         sourceType: 'explicit-runtime-dir'
       },
       ...fromExe.filter(Boolean).map((candidateRoot) => ({
         sourceRoot: candidateRoot,
-        relativePythonBin: path.basename(candidateRoot).toLowerCase() === 'scripts'
-          ? 'python.exe'
-          : path.join('Scripts', 'python.exe'),
+        relativePythonBin: path.basename(candidateRoot).toLowerCase() === VENV_BIN_DIR.toLowerCase()
+          ? VENV_PYTHON_NAME
+          : VENV_PYTHON_REL,
         sourceType: 'explicit-python-exe'
       })),
       {
         sourceRoot: autoPythonRoot,
-        relativePythonBin: path.join('Scripts', 'python.exe'),
+        relativePythonBin: VENV_PYTHON_REL,
         sourceType: 'generated-runtime'
       },
       {
         sourceRoot: path.join(rootDir, '.venv'),
-        relativePythonBin: path.join('Scripts', 'python.exe'),
+        relativePythonBin: VENV_PYTHON_REL,
         sourceType: 'repo-venv'
       }
     ].filter(Boolean)
@@ -148,11 +154,11 @@ export async function ensureBundledSttRuntime(options = {}) {
         return candidate
       }
 
-      const standalonePython = path.join(candidate.sourceRoot, 'python.exe')
+      const standalonePython = path.join(candidate.sourceRoot, VENV_PYTHON_NAME)
       if (await pathExists(standalonePython)) {
         return {
           ...candidate,
-          relativePythonBin: 'python.exe'
+          relativePythonBin: VENV_PYTHON_NAME
         }
       }
     }
@@ -221,7 +227,7 @@ export async function ensureBundledSttRuntime(options = {}) {
       env
     })
 
-    const pythonExe = path.join(autoPythonRoot, 'Scripts', 'python.exe')
+    const pythonExe = path.join(autoPythonRoot, VENV_PYTHON_REL)
     log('Installing bundled STT Python dependencies.')
     await run(pythonExe, ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], {
       cwd: rootDir,
@@ -234,7 +240,7 @@ export async function ensureBundledSttRuntime(options = {}) {
 
     return {
       sourceRoot: autoPythonRoot,
-      relativePythonBin: path.join('Scripts', 'python.exe'),
+      relativePythonBin: VENV_PYTHON_REL,
       sourceType: 'generated-runtime'
     }
   }
@@ -324,7 +330,7 @@ export async function ensureBundledSttRuntime(options = {}) {
   async function resolveExistingStagedRuntime() {
     const manifestPath = path.join(outputRoot, 'stt', 'manifest.json')
     const pythonRoot = path.join(outputRoot, 'stt', 'python')
-    const pythonExe = path.join(pythonRoot, 'Scripts', 'python.exe')
+    const pythonExe = path.join(pythonRoot, VENV_PYTHON_REL)
     const transcribeScript = path.join(outputRoot, 'stt', 'scripts', 'faster_whisper_cli.py')
     const workerScript = path.join(outputRoot, 'stt', 'scripts', 'faster_whisper_worker.py')
     const daemonScript = path.join(outputRoot, 'stt', 'scripts', 'faster_whisper_daemon.py')
@@ -354,7 +360,7 @@ export async function ensureBundledSttRuntime(options = {}) {
   }
 
   async function resolveExistingPythonRuntime() {
-    const pythonExe = path.join(outputRoot, 'stt', 'python', 'Scripts', 'python.exe')
+    const pythonExe = path.join(outputRoot, 'stt', 'python', VENV_PYTHON_REL)
     const modelDir = path.join(outputRoot, 'stt', 'models')
     if (!await pathExists(pythonExe)) {
       return null
