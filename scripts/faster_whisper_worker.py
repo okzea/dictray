@@ -56,6 +56,10 @@ def normalize_compute_type(requested: str, device: str) -> str:
     return value
 
 
+def allow_cpu_fallback(requested_device: str) -> bool:
+    return (requested_device or "auto").strip().lower() in {"", "auto"}
+
+
 def print_json(payload: dict) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
     sys.stdout.write("\n")
@@ -89,7 +93,8 @@ def load_model(model_name: str, model_dir: str, requested_device: str, requested
     selected_device = normalize_device(requested_device)
     selected_compute_type = normalize_compute_type(requested_compute_type, selected_device)
     attempts = [(selected_device, selected_compute_type)]
-    if selected_device != "cpu":
+    fallback_allowed = allow_cpu_fallback(requested_device)
+    if selected_device != "cpu" and fallback_allowed:
         attempts.append(("cpu", "int8"))
 
     last_error = None
@@ -117,7 +122,7 @@ def load_model(model_name: str, model_dir: str, requested_device: str, requested
             model = WhisperModel(model_name, **model_kwargs)
         except Exception as error:  # pragma: no cover - native runtime surface
             last_error = error
-            if attempt_device != "cpu" and cuda_runtime_unavailable(error_text(error)):
+            if fallback_allowed and attempt_device != "cpu" and cuda_runtime_unavailable(error_text(error)):
                 continue
             raise
 
@@ -154,14 +159,20 @@ def discard_runtime(runtime: dict) -> None:
         ACTIVE_RUNTIME = None
 
 
-def run_transcribe(model, input_path: str, vad_filter: bool):
+def run_transcribe(model, input_path: str, vad_filter: bool, initial_prompt: str = ""):
+    transcribe_kwargs = {
+        "beam_size": 1,
+        "best_of": 1,
+        "temperature": 0.0,
+        "vad_filter": vad_filter,
+        "condition_on_previous_text": False,
+    }
+    normalized_prompt = str(initial_prompt or "").strip()
+    if normalized_prompt:
+        transcribe_kwargs["initial_prompt"] = normalized_prompt
     segments, info = model.transcribe(
         input_path,
-        beam_size=1,
-        best_of=1,
-        temperature=0.0,
-        vad_filter=vad_filter,
-        condition_on_previous_text=False,
+        **transcribe_kwargs,
     )
     # Fully consume the generator to release internal ctranslate2 resources.
     segment_list = list(segments)
@@ -170,25 +181,24 @@ def run_transcribe(model, input_path: str, vad_filter: bool):
     return transcript, language
 
 
-def perform_transcribe(model, input_path: str):
-    transcript, language = run_transcribe(model, input_path, True)
-    if transcript:
-        return transcript, language
-
-    transcript, language = run_transcribe(model, input_path, False)
+def perform_transcribe(model, input_path: str, initial_prompt: str = ""):
+    # Match the daemon path: prefer the full-audio pass so quiet leading and
+    # trailing words are not discarded by the VAD gate.
+    transcript, language = run_transcribe(model, input_path, False, initial_prompt)
     return transcript, language
 
 
-def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str, input_path: str):
+def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str, input_path: str, initial_prompt: str = ""):
     model, runtime = load_model(model_name, model_dir, requested_device, requested_compute_type)
+    fallback_allowed = allow_cpu_fallback(requested_device)
     try:
-        transcript, language = perform_transcribe(model, input_path)
+        transcript, language = perform_transcribe(model, input_path, initial_prompt)
         return runtime, transcript, language
     except Exception as error:
-        if runtime.get("device") != "cpu" and cuda_runtime_unavailable(error_text(error)):
+        if fallback_allowed and runtime.get("device") != "cpu" and cuda_runtime_unavailable(error_text(error)):
             discard_runtime(runtime)
             fallback_model, fallback_runtime = load_model(model_name, model_dir, "cpu", "int8")
-            transcript, language = perform_transcribe(fallback_model, input_path)
+            transcript, language = perform_transcribe(fallback_model, input_path, initial_prompt)
             return fallback_runtime, transcript, language
         raise
 
@@ -249,6 +259,7 @@ def handle_warm(command: dict) -> dict:
             str(command.get("device") or "auto").strip() or "auto",
             str(command.get("computeType") or "auto").strip() or "auto",
             temp_path,
+            str(command.get("initialPrompt") or "").strip(),
         )
     finally:
         if temp_path:
@@ -278,6 +289,7 @@ def handle_transcribe(command: dict) -> dict:
         str(command.get("device") or "auto").strip() or "auto",
         str(command.get("computeType") or "auto").strip() or "auto",
         input_path,
+        str(command.get("initialPrompt") or "").strip(),
     )
     ACTIVE_RUNTIME = runtime
     return {

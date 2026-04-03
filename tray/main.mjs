@@ -1,13 +1,44 @@
-import { spawn } from 'node:child_process'
-import { readFileSync, watch as fsWatch, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, watch as fsWatch, writeFileSync } from 'node:fs'
 import { access, appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
+import { isLinuxHeadlessHost, loadHostRuntime } from '../src/host-runtime.mjs'
+import { loadConfig, normalizeRewriteProviderId } from '../src/config.mjs'
+import { createCaptureBridge } from '../src/capture-bridge.mjs'
+import { createEarconPlayer } from '../src/earcon-player.mjs'
 import {
+  CAPTURE_BACKEND_NATIVE,
+  CAPTURE_EVENT_ERROR,
+  CAPTURE_EVENT_INPUT_DEVICES,
+  CAPTURE_EVENT_INPUT_LEVEL,
+  CAPTURE_EVENT_READY,
+  CAPTURE_EVENT_RECORDING_STATE,
+  CAPTURE_REQUEST_SUBMIT_AUDIO,
+  createCaptureResponse
+} from '../src/capture-protocol.mjs'
+import { buildLinuxLauncherManifest, ensureLinuxProductSetup } from '../src/linux-product-integration.mjs'
+import { launchLinuxNativeUi } from '../src/linux-native-ui.mjs'
+import { createRewriteProvider } from '../src/rewrite-provider.mjs'
+import { resolveBundledHelperExecutable, resolveBundledSttConfig } from '../src/runtime-paths.mjs'
+import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
+import {
+  defaultSttPromptTemplate,
+  normalizeSttPromptTemplate,
+  sttPromptTemplateLabel,
+  sttPromptTemplateMenuLabel,
+  sttPromptTemplateOptions,
+  sttPromptTextForTemplate
+} from '../src/stt-prompt-templates.mjs'
+import { createSttProvider } from '../src/stt-provider.mjs'
+import { SystemVolumeBridge } from '../src/system-volume.mjs'
+import { UiAutomationBridge } from '../src/ui-automation.mjs'
+
+const HOST_RUNTIME = await loadHostRuntime()
+const {
   app,
-  BrowserWindow,
   clipboard,
   globalShortcut,
   ipcMain,
@@ -18,14 +49,8 @@ import {
   session,
   shell,
   Tray
-} from 'electron'
-import { loadConfig, normalizeRewriteProviderId } from '../src/config.mjs'
-import { createRewriteProvider } from '../src/rewrite-provider.mjs'
-import { resolveBundledHelperExecutable } from '../src/runtime-paths.mjs'
-import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
-import { createSttProvider } from '../src/stt-provider.mjs'
-import { SystemVolumeBridge } from '../src/system-volume.mjs'
-import { UiAutomationBridge } from '../src/ui-automation.mjs'
+} = HOST_RUNTIME
+const LINUX_HEADLESS_HOST = HOST_RUNTIME.headless === true && isLinuxHeadlessHost()
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 if (process.platform === 'linux') {
@@ -44,6 +69,13 @@ const XDG_CONFIG_HOME = String(process.env.XDG_CONFIG_HOME || '').trim() || path
 const GNOME_PANEL_DIR = path.join(XDG_CONFIG_HOME, 'dictray', 'gnome-panel')
 const GNOME_PANEL_STATE_PATH = path.join(GNOME_PANEL_DIR, 'status.json')
 const GNOME_PANEL_COMMAND_PATH = path.join(GNOME_PANEL_DIR, 'command.json')
+const GNOME_PANEL_LEVEL_SYNC_MS = 90
+const LINUX_NATIVE_UI_DIR = path.join(XDG_CONFIG_HOME, 'dictray', 'linux-ui')
+const LINUX_INPUT_SOURCE_STATE_PATH = path.join(LINUX_NATIVE_UI_DIR, 'input-source-state.json')
+const LINUX_INPUT_SOURCE_COMMAND_PATH = path.join(LINUX_NATIVE_UI_DIR, 'input-source-command.json')
+const LINUX_ONBOARDING_STATE_PATH = path.join(LINUX_NATIVE_UI_DIR, 'onboarding-state.json')
+const LINUX_ONBOARDING_COMMAND_PATH = path.join(LINUX_NATIVE_UI_DIR, 'onboarding-command.json')
+const LINUX_NATIVE_UI_POLL_INTERVAL_MS = 220
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -103,6 +135,7 @@ const VOICE_OVERLAY_HEIGHT = 104
 const VOICE_OVERLAY_MARGIN = 18
 const VOICE_OVERLAY_GAP = 14
 const VOICE_OVERLAY_IDLE_HIDE_DELAY_MS = 1800
+const VOICE_STATE_NOTICE_CLEAR_DELAY_MS = 2200
 const INPUT_SOURCE_WINDOW_WIDTH = 420
 const INPUT_SOURCE_WINDOW_HEIGHT = 520
 const TARGET_WINDOW_POLL_INTERVAL_MS = 280
@@ -116,6 +149,9 @@ let speech = null
 let rewriteProvider = null
 let systemVolume = null
 let uiAutomation = null
+let captureBridge = null
+let earconPlayer = null
+let captureRecordingPhase = 'idle'
 let stateDir = ''
 let traySettingsPath = ''
 let speechPreferencesPath = ''
@@ -137,14 +173,24 @@ let hotkeyBridgeRestartAtMs = []
 let refreshTimer = null
 let sttKeepWarmTimer = null
 let voiceOverlayHideTimer = null
+let voiceStateNoticeClearTimer = null
 let voiceOverlayFocusedBounds = null
 let voiceOverlayFocusedBoundsRefresh = null
 let isQuitting = false
 let isRestoringVolumeForQuit = false
+let quitCleanupPromise = null
+let quitCleanupComplete = false
 let gnomePanelPollTimer = null
 let gnomePanelCommandWatcher = null
 let gnomePanelBridgeEnabled = false
 let gnomePanelLastToggleMs = 0
+let gnomePanelInputLevel = 0
+let gnomePanelStateSyncTimer = null
+let linuxNativeUiPollTimer = null
+let linuxNativeUiCommandWatcher = null
+let linuxNativeUiCommandProcessing = false
+let linuxOnboardingUiPending = false
+let linuxOnboardingUiError = ''
 let trayHotkey = DEFAULT_HOTKEY
 let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
@@ -165,8 +211,11 @@ let sttPreferences = {
   supported: false,
   options: [],
   modelOptions: [],
+  templateSupported: false,
+  templateOptions: [],
   selectedDevice: '',
   selectedModel: '',
+  selectedTemplate: defaultSttPromptTemplate(),
   currentDevice: '',
   currentModel: '',
   provider: '',
@@ -286,6 +335,96 @@ function isGnomeSession() {
     && (currentDesktop.includes('ubuntu') || currentDesktop.includes('pop'))
 }
 
+function normalizeAbsoluteEnvPath(value) {
+  const text = String(value || '').trim()
+  return text && path.isAbsolute(text) ? path.resolve(text) : ''
+}
+
+function resolveLinuxHeadlessLauncherExecPath() {
+  const envCandidates = [
+    process.env.DICTATION_TRAY_NODE_BIN,
+    process.env.npm_node_execpath,
+    process.env.NODE
+  ]
+
+  for (const candidate of envCandidates) {
+    const resolved = normalizeAbsoluteEnvPath(candidate)
+    if (resolved) {
+      return resolved
+    }
+  }
+
+  const currentExecName = path.basename(String(process.execPath || '')).toLowerCase()
+  if (currentExecName === 'node' || currentExecName === 'node.exe') {
+    return process.execPath
+  }
+
+  try {
+    const result = spawnSync('which', ['node'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+    if (result.status === 0) {
+      const resolved = normalizeAbsoluteEnvPath(String(result.stdout || '').split(/\r?\n/, 1)[0])
+      if (resolved) {
+        return resolved
+      }
+    }
+  } catch {
+    // ignore node lookup failures and fall back to the current runtime
+  }
+
+  return process.execPath
+}
+
+function runtimeResourcesDir() {
+  return normalizeAbsoluteEnvPath(
+    process.env.DICTATION_TRAY_RESOURCES_DIR
+      || process.env.DICTATION_TRAY_BUNDLED_RESOURCES_DIR
+      || process.resourcesPath
+  )
+}
+
+function packagedLinuxHeadlessLauncherPaths() {
+  const resourcesDir = runtimeResourcesDir()
+  const nodeExec = resourcesDir ? path.join(resourcesDir, 'runtime', 'node', 'bin', 'node') : ''
+  const nodeLibDir = resourcesDir ? path.join(resourcesDir, 'runtime', 'node', 'lib') : ''
+  const mainEntryPath = resourcesDir ? path.join(resourcesDir, 'runtime', 'linux-core', 'tray', 'main.mjs') : ''
+  return {
+    resourcesDir,
+    nodeExec,
+    nodeLibDir,
+    mainEntryPath,
+    available: Boolean(resourcesDir && existsSync(nodeExec) && existsSync(mainEntryPath))
+  }
+}
+
+function linuxNativeUiEnabled() {
+  const override = String(process.env.DICTATION_TRAY_LINUX_NATIVE_UI || '').trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(override)) {
+    return true
+  }
+  if (['0', 'false', 'no', 'off'].includes(override)) {
+    return false
+  }
+  return process.platform === 'linux' && isGnomeSession()
+}
+
+function linuxHeadlessLauncherEnabled() {
+  const override = String(process.env.DICTATION_TRAY_ENABLE_LINUX_HEADLESS_LAUNCHER || '').trim().toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(override)) {
+    return true
+  }
+  if (['0', 'false', 'no', 'off'].includes(override)) {
+    return false
+  }
+  return process.platform === 'linux'
+}
+
+function gnomeNativeOverlayActive() {
+  return linuxNativeUiEnabled()
+}
+
 function isActiveDictationPhase(value) {
   return GNOME_PANEL_ACTIVE_PHASES.has(String(value || 'idle').trim())
 }
@@ -394,7 +533,7 @@ function buildGnomePanelMenu() {
   const selectedInputDevice = selectedInputSource()
   const inputSourceMenu = [
     {
-      label: 'Open Live Preview',
+      label: linuxNativeUtilityWindowsEnabled() ? 'Open Microphone Setup' : 'Open Live Preview',
       command: {
         action: 'open_input_preview'
       }
@@ -475,6 +614,21 @@ function buildGnomePanelMenu() {
       }))
     : [{
         label: 'Not available for this STT provider',
+        enabled: false
+      }]
+
+  const sttPromptTemplateMenu = sttPreferences.templateSupported
+    ? sttPreferences.templateOptions.map((value) => ({
+        label: sttPromptTemplateMenuLabel(value),
+        type: 'radio',
+        checked: sttPreferences.selectedTemplate === value,
+        command: {
+          action: 'set_stt_prompt_template',
+          value
+        }
+      }))
+    : [{
+        label: 'Only available for local Speech to Text',
         enabled: false
       }]
 
@@ -574,6 +728,10 @@ function buildGnomePanelMenu() {
       submenu: sttModelMenu
     },
     {
+      label: 'Speech to Text Template',
+      submenu: sttPromptTemplateMenu
+    },
+    {
       label: 'Dictation Shortcut',
       submenu: hotkeyManagedByEnv()
         ? [{
@@ -630,9 +788,12 @@ function buildGnomePanelPayload() {
     rewriteEnabled: Boolean(rewriteEnabled),
     duckingEnabled: Boolean(duckingEnabled),
     hotkey: trayHotkey,
+    promptHotkey: promptTrayHotkey,
     targetWindow: compactText(voiceState?.targetWindow || '', 70),
     note: compactText(voiceState?.note || '', 110),
     error: compactText(voiceState?.error || '', 180),
+    nativeOverlay: gnomeNativeOverlayActive(),
+    inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
     menu: buildGnomePanelMenu()
   }
 }
@@ -646,6 +807,31 @@ async function syncGnomePanelState() {
   } catch (error) {
     console.error('[dictray] Failed to sync GNOME panel state:', error?.message || error)
   }
+}
+
+function scheduleGnomePanelStateSync(delayMs = 0) {
+  if (!gnomePanelBridgeEnabled) {
+    return
+  }
+
+  const delay = Math.max(0, Number(delayMs) || 0)
+  if (delay === 0) {
+    if (gnomePanelStateSyncTimer) {
+      clearTimeout(gnomePanelStateSyncTimer)
+      gnomePanelStateSyncTimer = null
+    }
+    void syncGnomePanelState()
+    return
+  }
+
+  if (gnomePanelStateSyncTimer) {
+    return
+  }
+
+  gnomePanelStateSyncTimer = setTimeout(() => {
+    gnomePanelStateSyncTimer = null
+    void syncGnomePanelState()
+  }, delay)
 }
 
 let gnomePanelCommandProcessing = false
@@ -696,7 +882,10 @@ async function processGnomePanelCommandInner() {
         break
       }
       gnomePanelLastToggleMs = now
-      void toggleDictationCapture()
+      const overridePressEnter = Boolean(command?.value?.pressEnterAfterInsert)
+      void toggleDictationCapture({
+        pressEnterAfterInsert: overridePressEnter
+      })
       break
     }
     case 'start':
@@ -708,6 +897,9 @@ async function processGnomePanelCommandInner() {
       if (voiceState.phase === 'listening') {
         void stopDictationCapture()
       }
+      break
+    case 'cancel':
+      void cancelDictationCapture('Dictation was cancelled.')
       break
     case 'copy_history':
       clipboard.writeText(String(command?.value || ''))
@@ -753,6 +945,9 @@ async function processGnomePanelCommandInner() {
       break
     case 'set_stt_model':
       void updateSttPreferences({ sttModel: command?.value })
+      break
+    case 'set_stt_prompt_template':
+      void updateSttPromptTemplate(command?.value)
       break
     case 'set_tray_hotkey':
       void updateTrayHotkey(command?.value)
@@ -815,6 +1010,10 @@ function stopGnomePanelBridge() {
   if (gnomePanelCommandWatcher) {
     gnomePanelCommandWatcher.close()
     gnomePanelCommandWatcher = null
+  }
+  if (gnomePanelStateSyncTimer) {
+    clearTimeout(gnomePanelStateSyncTimer)
+    gnomePanelStateSyncTimer = null
   }
   gnomePanelBridgeEnabled = false
 
@@ -1062,6 +1261,10 @@ function selectedInputSource() {
   return inputDeviceState.available.find((device) => device.deviceId === preferredInputDeviceId) || null
 }
 
+function captureBackendId() {
+  return String(runtimeConfig?.capture?.backend || CAPTURE_BACKEND_NATIVE).trim().toLowerCase() || CAPTURE_BACKEND_NATIVE
+}
+
 function inputSourceMenuLabel() {
   if (preferredInputDeviceId) {
     if (!inputDeviceState.available.length) {
@@ -1131,6 +1334,18 @@ function sttModelNameForPreference(value) {
       return 'small.en'
     default:
       return ''
+  }
+}
+
+function applySttPromptTemplateToConfig(templateId) {
+  if (!runtimeConfig?.stt?.local) {
+    return
+  }
+
+  const initialPrompt = sttPromptTextForTemplate(templateId)
+  runtimeConfig.stt.local.initialPrompt = initialPrompt
+  if (speech?.config?.stt?.local) {
+    speech.config.stt.local.initialPrompt = initialPrompt
   }
 }
 
@@ -1207,6 +1422,32 @@ function speechPreferenceRuntimePatch(devicePreference) {
   }
 }
 
+function applySttRuntimePatchToConfig(runtimePatch = {}) {
+  if (!runtimeConfig?.stt?.local) {
+    return
+  }
+
+  if (runtimePatch.device !== undefined && String(runtimePatch.device || '').trim()) {
+    runtimeConfig.stt.local.device = String(runtimePatch.device || '').trim()
+  }
+  if (runtimePatch.computeType !== undefined && String(runtimePatch.computeType || '').trim()) {
+    runtimeConfig.stt.local.computeType = String(runtimePatch.computeType || '').trim()
+  }
+  if (runtimePatch.model !== undefined && String(runtimePatch.model || '').trim()) {
+    runtimeConfig.stt.local.model = String(runtimePatch.model || '').trim()
+  }
+}
+
+function sttRuntimeMatchesPatch(runtime = {}, runtimePatch = {}) {
+  const sameDevice = runtimePatch.device === undefined
+    || String(runtime.device || '').trim().toLowerCase() === String(runtimePatch.device || '').trim().toLowerCase()
+  const sameComputeType = runtimePatch.computeType === undefined
+    || String(runtime.computeType || '').trim().toLowerCase() === String(runtimePatch.computeType || '').trim().toLowerCase()
+  const sameModel = runtimePatch.model === undefined
+    || String(runtime.model || '').trim() === String(runtimePatch.model || '').trim()
+  return sameDevice && sameComputeType && sameModel
+}
+
 function normalizeRewriteEnabled(value) {
   return value === undefined ? true : Boolean(value)
 }
@@ -1228,6 +1469,15 @@ function showNotification(title, body) {
     body,
     icon: appIcon()
   }).show()
+}
+
+function maybePlayCaptureEarcon(kind) {
+  if (captureBackendId() !== 'native' || !earconPlayer) {
+    return
+  }
+  void earconPlayer.play(kind).catch((error) => {
+    console.error('[dictray] Failed to play earcon:', error?.message || error)
+  })
 }
 
 function notifySttReady() {
@@ -1363,6 +1613,42 @@ function cancelActiveSubmission(reason = 'Dictation was cancelled by a new push-
   return true
 }
 
+async function cancelDictationCapture(reason = 'Dictation was cancelled.') {
+  let cancelled = cancelActiveSubmission(reason)
+
+  if (
+    voiceState.phase === 'listening'
+    || voiceState.phase === 'processing'
+    || captureRecordingPhase === 'listening'
+    || captureRecordingPhase === 'processing'
+  ) {
+    try {
+      const bridge = await ensureCaptureBackend()
+      const result = await bridge.cancelRecording()
+      cancelled = Boolean(result?.cancelled) || cancelled
+    } catch {
+      // Best effort. An in-flight submission is still covered by aborting activeSubmission.
+    }
+    void restoreSystemVolumeAfterPushToTalk().catch(() => {})
+  }
+
+  if (cancelled || voiceState.phase !== 'idle') {
+    maybePlayCaptureEarcon('cancel')
+    updateVoiceState({
+      phase: 'idle',
+      transcript: '',
+      finalText: '',
+      targetWindow: '',
+      targetBounds: null,
+      targetElementBounds: null,
+      note: String(reason || 'Dictation was cancelled.'),
+      error: ''
+    })
+  }
+
+  return cancelled
+}
+
 function throwIfSubmissionCancelled(submission) {
   if (!submission) {
     return
@@ -1384,6 +1670,33 @@ function clearVoiceOverlayHideTimer() {
     clearTimeout(voiceOverlayHideTimer)
     voiceOverlayHideTimer = null
   }
+}
+
+function clearVoiceStateNoticeClearTimer() {
+  if (voiceStateNoticeClearTimer) {
+    clearTimeout(voiceStateNoticeClearTimer)
+    voiceStateNoticeClearTimer = null
+  }
+}
+
+function scheduleVoiceStateNoticeClear() {
+  clearVoiceStateNoticeClearTimer()
+  const scheduledNote = String(voiceState.note || '').trim()
+  const scheduledError = String(voiceState.error || '').trim()
+  if (voiceState.phase !== 'idle' || (!scheduledNote && !scheduledError)) {
+    return
+  }
+
+  voiceStateNoticeClearTimer = setTimeout(() => {
+    voiceStateNoticeClearTimer = null
+    if (voiceState.phase !== 'idle') {
+      return
+    }
+    if (String(voiceState.note || '').trim() !== scheduledNote || String(voiceState.error || '').trim() !== scheduledError) {
+      return
+    }
+    clearVoiceState()
+  }, VOICE_STATE_NOTICE_CLEAR_DELAY_MS)
 }
 
 function normalizeOverlayBounds(bounds, { allowPoint = false } = {}) {
@@ -1511,7 +1824,7 @@ function buildVoiceOverlayPayload(state = voiceState) {
   }
 }
 
-function syncAudioInputConfig(window, { refresh = false } = {}) {
+function syncInputSourceWindowConfig(window, { refresh = false } = {}) {
   if (!window || window.isDestroyed() || window.webContents.isDestroyed()) {
     return
   }
@@ -1522,9 +1835,42 @@ function syncAudioInputConfig(window, { refresh = false } = {}) {
   })
 }
 
+async function ensureCaptureBackend() {
+  const backendId = captureBackendId()
+  if (captureBridge && captureBridge.backendId === backendId) {
+    return captureBridge
+  }
+
+  if (captureBridge) {
+    await captureBridge.dispose().catch(() => null)
+  }
+
+  captureBridge = createCaptureBridge({
+    backendId,
+    onEvent: handleCaptureBackendEvent,
+    onRequest: handleCaptureBackendRequest,
+    logger: (message) => {
+      console.log(message)
+    }
+  })
+
+  return captureBridge
+}
+
+async function syncCaptureBackendConfig({ refresh = false } = {}) {
+  const bridge = await ensureCaptureBackend()
+  await bridge.configure({
+    preferredInputDeviceId,
+    refresh: Boolean(refresh)
+  })
+}
+
 function syncAllAudioInputConfig({ refresh = false } = {}) {
-  syncAudioInputConfig(voiceWindow, { refresh })
-  syncAudioInputConfig(inputSourceWindow, { refresh })
+  syncInputSourceWindowConfig(inputSourceWindow, { refresh })
+  void syncLinuxInputSourceState().catch(() => {})
+  void syncCaptureBackendConfig({ refresh }).catch((error) => {
+    console.error('[dictray] Failed to sync capture backend config:', error?.message || error)
+  })
 }
 
 function scheduleVoiceOverlayHide(delayMs = VOICE_OVERLAY_IDLE_HIDE_DELAY_MS) {
@@ -1563,6 +1909,23 @@ async function refreshVoiceOverlayFocusedBounds() {
   return voiceOverlayFocusedBoundsRefresh
 }
 
+function syncVoiceInputLevel(level = 0) {
+  const normalizedLevel = Math.max(0, Math.min(1, Number(level) || 0))
+  gnomePanelInputLevel = normalizedLevel
+
+  if (gnomeNativeOverlayActive()) {
+    scheduleGnomePanelStateSync(GNOME_PANEL_LEVEL_SYNC_MS)
+  }
+
+  if (!voiceWindow || voiceWindow.isDestroyed() || voiceWindow.webContents.isDestroyed()) {
+    return
+  }
+
+  voiceWindow.webContents.send('dictation:input-level', {
+    level: normalizedLevel
+  })
+}
+
 function syncVoiceOverlay() {
   if (!voiceWindow || voiceWindow.isDestroyed()) {
     return
@@ -1572,6 +1935,7 @@ function syncVoiceOverlay() {
   const payload = buildVoiceOverlayPayload()
   if (!payload.visible) {
     voiceOverlayFocusedBounds = null
+    syncVoiceInputLevel(0)
     if (voiceWindow.isVisible()) {
       voiceWindow.hide()
     }
@@ -1603,6 +1967,165 @@ async function readJsonFile(filePath, fallback = {}) {
 async function writeJsonFile(filePath, payload) {
   await mkdir(path.dirname(filePath), { recursive: true })
   await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+}
+
+function linuxNativeUtilityWindowsEnabled() {
+  return process.platform === 'linux' && linuxNativeUiEnabled()
+}
+
+function buildLinuxInputSourceState() {
+  return {
+    preferredInputDeviceId,
+    activeDeviceId: inputDeviceState.activeDeviceId,
+    activeLabel: inputDeviceState.activeLabel,
+    permission: inputDeviceState.permission,
+    error: inputDeviceState.error,
+    devices: inputDeviceState.available.map((device) => ({
+      deviceId: device.deviceId,
+      groupId: device.groupId,
+      label: device.label
+    }))
+  }
+}
+
+function buildLinuxOnboardingState() {
+  return {
+    ...onboardingStatePayload(),
+    ui: {
+      pending: linuxOnboardingUiPending,
+      error: linuxOnboardingUiError
+    }
+  }
+}
+
+async function syncLinuxInputSourceState() {
+  if (!linuxNativeUtilityWindowsEnabled()) {
+    return
+  }
+  await writeJsonFile(LINUX_INPUT_SOURCE_STATE_PATH, buildLinuxInputSourceState())
+}
+
+async function syncLinuxOnboardingState() {
+  if (!linuxNativeUtilityWindowsEnabled()) {
+    return
+  }
+  await writeJsonFile(LINUX_ONBOARDING_STATE_PATH, buildLinuxOnboardingState())
+}
+
+async function launchLinuxNativeInputSourceWindow() {
+  await syncLinuxInputSourceState()
+  await launchLinuxNativeUi('input-source.mjs', {
+    statePath: LINUX_INPUT_SOURCE_STATE_PATH,
+    commandPath: LINUX_INPUT_SOURCE_COMMAND_PATH
+  })
+}
+
+async function launchLinuxNativeOnboardingWindow() {
+  await syncLinuxOnboardingState()
+  await launchLinuxNativeUi('onboarding.mjs', {
+    statePath: LINUX_ONBOARDING_STATE_PATH,
+    commandPath: LINUX_ONBOARDING_COMMAND_PATH
+  })
+}
+
+async function handleLinuxNativeInputSourceCommand(command = {}) {
+  switch (String(command?.action || '').trim()) {
+    case 'set_input_source':
+      await updateInputSourcePreference(command?.value)
+      return
+    case 'refresh_inputs':
+      await refreshInputSources()
+      return
+    default:
+      return
+  }
+}
+
+async function handleLinuxNativeOnboardingCommand(command = {}) {
+  switch (String(command?.action || '').trim()) {
+    case 'complete_onboarding': {
+      linuxOnboardingUiPending = true
+      linuxOnboardingUiError = ''
+      await syncLinuxOnboardingState().catch(() => null)
+      try {
+        await completeOnboarding(command?.payload || {})
+      } catch (error) {
+        linuxOnboardingUiError = compactText(error?.message || error || 'Failed to finish Quick Start.', 160)
+      } finally {
+        linuxOnboardingUiPending = false
+        await syncLinuxOnboardingState().catch(() => null)
+      }
+      return
+    }
+    default:
+      return
+  }
+}
+
+async function processLinuxNativeUiCommands() {
+  if (!linuxNativeUtilityWindowsEnabled() || linuxNativeUiCommandProcessing) {
+    return
+  }
+
+  linuxNativeUiCommandProcessing = true
+  try {
+    const inputCommand = await readJsonFile(LINUX_INPUT_SOURCE_COMMAND_PATH, null)
+    if (inputCommand && typeof inputCommand === 'object') {
+      await unlink(LINUX_INPUT_SOURCE_COMMAND_PATH).catch(() => null)
+      await handleLinuxNativeInputSourceCommand(inputCommand)
+    }
+
+    const onboardingCommand = await readJsonFile(LINUX_ONBOARDING_COMMAND_PATH, null)
+    if (onboardingCommand && typeof onboardingCommand === 'object') {
+      await unlink(LINUX_ONBOARDING_COMMAND_PATH).catch(() => null)
+      await handleLinuxNativeOnboardingCommand(onboardingCommand)
+    }
+  } finally {
+    linuxNativeUiCommandProcessing = false
+  }
+}
+
+async function initLinuxNativeUiBridge() {
+  if (!linuxNativeUtilityWindowsEnabled()) {
+    return
+  }
+
+  await mkdir(LINUX_NATIVE_UI_DIR, { recursive: true })
+  await syncLinuxInputSourceState().catch(() => null)
+  await syncLinuxOnboardingState().catch(() => null)
+
+  if (!linuxNativeUiPollTimer) {
+    linuxNativeUiPollTimer = setInterval(() => {
+      void processLinuxNativeUiCommands().catch(() => {})
+    }, LINUX_NATIVE_UI_POLL_INTERVAL_MS)
+  }
+
+  if (!linuxNativeUiCommandWatcher) {
+    try {
+      linuxNativeUiCommandWatcher = fsWatch(LINUX_NATIVE_UI_DIR, { persistent: false }, (eventType, filename) => {
+        if (eventType === 'rename' || eventType === 'change') {
+          const target = String(filename || '').trim()
+          if (target === path.basename(LINUX_INPUT_SOURCE_COMMAND_PATH) || target === path.basename(LINUX_ONBOARDING_COMMAND_PATH)) {
+            void processLinuxNativeUiCommands().catch(() => {})
+          }
+        }
+      })
+      linuxNativeUiCommandWatcher.on('error', () => {})
+    } catch {
+      linuxNativeUiCommandWatcher = null
+    }
+  }
+}
+
+function stopLinuxNativeUiBridge() {
+  if (linuxNativeUiPollTimer) {
+    clearInterval(linuxNativeUiPollTimer)
+    linuxNativeUiPollTimer = null
+  }
+  if (linuxNativeUiCommandWatcher) {
+    linuxNativeUiCommandWatcher.close()
+    linuxNativeUiCommandWatcher = null
+  }
 }
 
 function dayKeyForDate(date = new Date()) {
@@ -1850,14 +2373,17 @@ async function readSharedSpeechPreferences() {
   const parsed = await readJsonFile(speechPreferencesPath, {})
   return {
     sttDevice: normalizeSttDevicePreference(parsed?.sttDevice),
-    sttModel: normalizeSttModelPreference(parsed?.sttModel)
+    sttModel: normalizeSttModelPreference(parsed?.sttModel),
+    sttPromptTemplate: normalizeSttPromptTemplate(parsed?.sttPromptTemplate, defaultSttPromptTemplate())
   }
 }
 
 async function writeSharedSpeechPreferences(input = {}) {
+  const previous = await readJsonFile(speechPreferencesPath, {})
   const payload = {
-    sttDevice: normalizeSttDevicePreference(input?.sttDevice),
-    sttModel: normalizeSttModelPreference(input?.sttModel)
+    sttDevice: normalizeSttDevicePreference(input?.sttDevice ?? previous?.sttDevice),
+    sttModel: normalizeSttModelPreference(input?.sttModel ?? previous?.sttModel),
+    sttPromptTemplate: normalizeSttPromptTemplate(input?.sttPromptTemplate ?? previous?.sttPromptTemplate, defaultSttPromptTemplate())
   }
   await writeJsonFile(speechPreferencesPath, payload)
   return payload
@@ -2067,144 +2593,60 @@ function installPermissionHandlers() {
 }
 
 async function ensureVoiceWindow() {
-  if (voiceWindow && !voiceWindow.isDestroyed()) {
-    return voiceWindow
-  }
-
-  voiceWindow = new BrowserWindow({
-    show: false,
-    width: VOICE_OVERLAY_WIDTH,
-    height: VOICE_OVERLAY_HEIGHT,
-    icon: appIcon(),
-    skipTaskbar: true,
-    frame: false,
-    transparent: true,
-    resizable: false,
-    movable: false,
-    minimizable: false,
-    maximizable: false,
-    focusable: false,
-    hasShadow: false,
-    backgroundColor: '#00000000',
-    ...(process.platform === 'linux' ? { type: 'notification' } : {}),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      backgroundThrottling: false,
-      sandbox: false
-    }
+  await ensureCaptureBackend().catch(() => null)
+  await syncCaptureBackendConfig({ refresh: true }).catch((error) => {
+    console.error('[dictray] Failed to initialize native capture backend:', error?.message || error)
   })
-
-  voiceWindow.on('close', (event) => {
-    if (!isQuitting) {
-      event.preventDefault()
-      voiceWindow.hide()
-    }
-  })
-
-  await voiceWindow.loadFile(path.join(__dirname, 'voice.html'))
-  voiceWindow.setAlwaysOnTop(true, 'screen-saver')
-  voiceWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
-  voiceWindow.setIgnoreMouseEvents(true, { forward: true })
-  syncVoiceOverlay()
-  syncAudioInputConfig(voiceWindow, { refresh: true })
-  return voiceWindow
+  return null
 }
 
 async function ensureInputSourceWindow() {
-  if (inputSourceWindow && !inputSourceWindow.isDestroyed()) {
-    return inputSourceWindow
-  }
-
-  inputSourceWindow = new BrowserWindow({
-    show: false,
-    width: INPUT_SOURCE_WINDOW_WIDTH,
-    height: INPUT_SOURCE_WINDOW_HEIGHT,
-    minWidth: INPUT_SOURCE_WINDOW_WIDTH,
-    minHeight: INPUT_SOURCE_WINDOW_HEIGHT,
-    autoHideMenuBar: true,
-    backgroundColor: '#08131a',
-    title: `${APP_NAME} Input Source`,
-    icon: appIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.mjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      backgroundThrottling: false,
-      sandbox: false
-    }
-  })
-
-  inputSourceWindow.on('closed', () => {
-    inputSourceWindow = null
-  })
-
-  await inputSourceWindow.loadFile(path.join(__dirname, 'input-source.html'))
-  syncAudioInputConfig(inputSourceWindow, { refresh: true })
-  return inputSourceWindow
+  return null
 }
 
 async function openInputSourceWindow() {
-  const window = await ensureInputSourceWindow()
-  if (window.isMinimized()) {
-    window.restore()
+  if (!linuxNativeUtilityWindowsEnabled()) {
+    showNotification(APP_NAME, 'Microphone setup now requires the native GNOME utility window.')
+    return null
   }
-  window.show()
-  window.focus()
-  return window
+
+  try {
+    await launchLinuxNativeInputSourceWindow()
+    return null
+  } catch (error) {
+    console.error('[dictray] Failed to open native Linux input source window:', error?.message || error)
+    showNotification(APP_NAME, compactText(error?.message || error || 'Failed to open input source window.', 180))
+    return null
+  }
 }
 
 async function ensureOnboardingWindow() {
-  if (onboardingWindow && !onboardingWindow.isDestroyed()) {
-    return onboardingWindow
-  }
-
-  onboardingWindow = new BrowserWindow({
-    show: false,
-    width: 520,
-    height: 660,
-    minWidth: 520,
-    minHeight: 660,
-    maxWidth: 520,
-    maxHeight: 660,
-    resizable: false,
-    minimizable: false,
-    maximizable: false,
-    autoHideMenuBar: true,
-    backgroundColor: '#08131a',
-    title: `${APP_NAME} Quick Start`,
-    icon: appIcon(),
-    webPreferences: {
-      preload: path.join(__dirname, 'onboarding-preload.mjs'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      backgroundThrottling: false,
-      sandbox: false
-    }
-  })
-
-  onboardingWindow.on('closed', () => {
-    onboardingWindow = null
-  })
-
-  await onboardingWindow.loadFile(path.join(__dirname, 'onboarding.html'))
-  return onboardingWindow
+  return null
 }
 
 async function openOnboardingWindow({ markSeen = false } = {}) {
-  const window = await ensureOnboardingWindow()
   if (markSeen && !onboardingState.seenAt) {
     onboardingState.seenAt = new Date().toISOString()
     await saveOnboardingState().catch(() => null)
     rebuildMenu()
   }
-  if (window.isMinimized()) {
-    window.restore()
+
+  if (!linuxNativeUtilityWindowsEnabled()) {
+    showNotification(APP_NAME, 'Quick Start now requires the native GNOME utility window.')
+    return null
   }
-  window.show()
-  window.focus()
-  return window
+
+  linuxOnboardingUiPending = false
+  linuxOnboardingUiError = ''
+  await syncLinuxOnboardingState().catch(() => null)
+  try {
+    await launchLinuxNativeOnboardingWindow()
+    return null
+  } catch (error) {
+    console.error('[dictray] Failed to open native Linux onboarding window:', error?.message || error)
+    showNotification(APP_NAME, compactText(error?.message || error || 'Failed to open Quick Start.', 180))
+    return null
+  }
 }
 
 async function maybeShowOnboarding() {
@@ -2298,6 +2740,8 @@ async function completeOnboarding(input = {}) {
   await scheduleSttWarmup({ notifyReady: false }).catch(() => null)
   await refreshRuntimeState(false)
   rebuildMenu()
+  linuxOnboardingUiError = ''
+  await syncLinuxOnboardingState().catch(() => null)
   return onboardingStatePayload()
 }
 
@@ -2306,9 +2750,14 @@ function updateVoiceState(patch = {}) {
     ...voiceState,
     ...patch
   }
+  if (voiceState.phase === 'idle' && (String(voiceState.note || '').trim() || String(voiceState.error || '').trim())) {
+    scheduleVoiceStateNoticeClear()
+  } else {
+    clearVoiceStateNoticeClearTimer()
+  }
   rebuildMenu()
   syncVoiceOverlay()
-  void syncGnomePanelState()
+  scheduleGnomePanelStateSync()
 }
 
 function clearVoiceState(error = '') {
@@ -2535,7 +2984,7 @@ function rebuildMenu() {
   const selectedInputDevice = selectedInputSource()
   const inputSourceMenu = [
     {
-      label: 'Open Live Preview',
+      label: linuxNativeUtilityWindowsEnabled() ? 'Open Microphone Setup' : 'Open Live Preview',
       click: () => {
         void openInputSourceWindow()
       }
@@ -2612,6 +3061,20 @@ function rebuildMenu() {
       }))
     : [{
         label: 'Not available for this STT provider',
+        enabled: false
+      }]
+
+  const sttPromptTemplateMenu = sttPreferences.templateSupported
+    ? sttPreferences.templateOptions.map((value) => ({
+        label: sttPromptTemplateMenuLabel(value),
+        type: 'radio',
+        checked: sttPreferences.selectedTemplate === value,
+        click: () => {
+          void updateSttPromptTemplate(value)
+        }
+      }))
+    : [{
+        label: 'Only available for local Speech to Text',
         enabled: false
       }]
 
@@ -2705,6 +3168,10 @@ function rebuildMenu() {
     {
       label: 'Speech to Text Model',
       submenu: sttModelMenu
+    },
+    {
+      label: 'Speech to Text Template',
+      submenu: sttPromptTemplateMenu
     },
     {
       label: 'Dictation Shortcut',
@@ -2989,17 +3456,38 @@ async function refreshRuntimeState(notify = false) {
   const currentModel = String(runtime.model || '').trim() || (sttHealth?.ok ? String(sttHealth.model || '').trim() : '')
 
   const supported = Boolean(runtime.supported && typeof speech?.supportsRuntimePreferences === 'function' && speech.supportsRuntimePreferences())
+  const templateSupported = String(speech?.id || '').trim() === 'local'
   const availableDevices = runtimeSttDeviceOptions(runtime.availableDevices)
-  const storedPreferences = supported
-    ? await readSharedSpeechPreferences().catch(() => ({ sttDevice: '', sttModel: '' }))
-    : { sttDevice: '', sttModel: '' }
+  const storedPreferences = (supported || templateSupported)
+    ? await readSharedSpeechPreferences().catch(() => ({
+        sttDevice: '',
+        sttModel: '',
+        sttPromptTemplate: defaultSttPromptTemplate()
+      }))
+    : {
+        sttDevice: '',
+        sttModel: '',
+        sttPromptTemplate: defaultSttPromptTemplate()
+      }
+  const selectedStoredDevice = availableDevices.includes(storedPreferences.sttDevice)
+    ? storedPreferences.sttDevice
+    : ''
+  const currentModelPreference = runtimeSttModelPreference(currentModel)
+  const selectedTemplate = normalizeSttPromptTemplate(storedPreferences.sttPromptTemplate, defaultSttPromptTemplate())
+
+  if (templateSupported) {
+    applySttPromptTemplateToConfig(selectedTemplate)
+  }
 
   sttPreferences = {
     supported,
     options: availableDevices,
     modelOptions: sttModelPreferenceOptions(),
-    selectedDevice: storedPreferences.sttDevice || currentDevice || availableDevices[0] || '',
-    selectedModel: storedPreferences.sttModel || runtimeSttModelPreference(currentModel) || STT_MODEL_MIDDLE,
+    templateSupported,
+    templateOptions: sttPromptTemplateOptions(),
+    selectedDevice: selectedStoredDevice || currentDevice || availableDevices[0] || '',
+    selectedModel: currentModelPreference || storedPreferences.sttModel || STT_MODEL_MIDDLE,
+    selectedTemplate,
     provider: String(sttHealth?.providerLabel || speech?.label || runtimeConfig?.stt?.provider || '').trim(),
     currentDevice,
     currentModel,
@@ -3229,6 +3717,42 @@ async function refreshInputSources() {
   syncAllAudioInputConfig({ refresh: true })
 }
 
+async function updateSttPromptTemplate(value) {
+  const nextTemplate = normalizeSttPromptTemplate(value, defaultSttPromptTemplate())
+  if (!nextTemplate) {
+    return
+  }
+
+  if (String(speech?.id || '').trim() !== 'local') {
+    showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} templates are only available for local Speech to Text.`)
+    return
+  }
+
+  if (nextTemplate === sttPreferences.selectedTemplate
+    && String(runtimeConfig?.stt?.local?.initialPrompt || '') === sttPromptTextForTemplate(nextTemplate)) {
+    return
+  }
+
+  sttPreferences = {
+    ...sttPreferences,
+    selectedTemplate: nextTemplate,
+    error: ''
+  }
+  rebuildMenu()
+
+  applySttPromptTemplateToConfig(nextTemplate)
+  await writeSharedSpeechPreferences({
+    sttPromptTemplate: nextTemplate
+  })
+
+  if (nextTemplate === 'off') {
+    showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} template disabled.`)
+    return
+  }
+
+  showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} template set to ${sttPromptTemplateLabel(nextTemplate)}.`)
+}
+
 async function updateSttPreferences(input = {}) {
   const requestedDevice = normalizeSttDevicePreference(input?.sttDevice)
   const requestedModel = normalizeSttModelPreference(input?.sttModel)
@@ -3275,6 +3799,13 @@ async function updateSttPreferences(input = {}) {
       await refreshRuntimeState(false)
       return
     }
+    if (!sttRuntimeMatchesPatch(result, runtimePatch)) {
+      showNotification(APP_NAME, `${SPEECH_TO_TEXT_LABEL} update failed: requested runtime was not applied.`)
+      await refreshRuntimeState(false)
+      return
+    }
+
+    applySttRuntimePatchToConfig(result)
 
     await writeSharedSpeechPreferences({
       sttDevice: nextSelectedDevice,
@@ -3308,6 +3839,9 @@ async function updateSttPreferences(input = {}) {
 
 async function applySharedSpeechPreferencesOnStartup() {
   const stored = await readSharedSpeechPreferences()
+  if (String(speech?.id || '').trim() === 'local') {
+    applySttPromptTemplateToConfig(stored.sttPromptTemplate)
+  }
   if ((!stored.sttDevice && !stored.sttModel) || typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
     return
   }
@@ -3319,15 +3853,15 @@ async function applySharedSpeechPreferencesOnStartup() {
     runtimePatch.model = sttModelNameForPreference(stored.sttModel)
   }
   const currentRuntime = await speech.getSttRuntime().catch(() => null)
-  if (currentRuntime?.ok) {
-    const sameDevice = runtimePatch.device === undefined || String(currentRuntime.device || '').trim().toLowerCase() === String(runtimePatch.device || '').trim().toLowerCase()
-    const sameComputeType = runtimePatch.computeType === undefined || String(currentRuntime.computeType || '').trim().toLowerCase() === String(runtimePatch.computeType || '').trim().toLowerCase()
-    const sameModel = runtimePatch.model === undefined || String(currentRuntime.model || '').trim() === String(runtimePatch.model || '').trim()
-    if (sameDevice && sameComputeType && sameModel) {
-      return currentRuntime
-    }
+  if (currentRuntime?.ok && sttRuntimeMatchesPatch(currentRuntime, runtimePatch)) {
+    applySttRuntimePatchToConfig(currentRuntime)
+    return currentRuntime
   }
-  await speech.updateSttRuntime(runtimePatch).catch(() => null)
+  const result = await speech.updateSttRuntime(runtimePatch).catch(() => null)
+  if (result?.ok && sttRuntimeMatchesPatch(result, runtimePatch)) {
+    applySttRuntimePatchToConfig(result)
+  }
+  return result
 }
 
 async function switchRewriteModel(modelName) {
@@ -3948,14 +4482,15 @@ async function processAudioSubmission(payload = {}) {
     const sttMs = nowMs(sttStartedAt)
     const rawTranscript = String(transcribePayload?.transcript || '').trim()
     const transcript = normalizeSpeechTranscript(rawTranscript)
+    throwIfSubmissionCancelled(submission)
     if (!transcript) {
       const audioStats = transcribePayload?.audioStats || null
       const peakDb = Number(audioStats?.inputPeakDb)
       const rmsDb = Number(audioStats?.inputRmsDb)
       const lowSignal = (Number.isFinite(peakDb) && peakDb < -45) || (Number.isFinite(rmsDb) && rmsDb < -55)
       const message = lowSignal
-        ? 'Speech to Text captured an extremely quiet signal. Check your microphone selection and Windows input volume.'
-        : 'Speech to Text returned empty text. Hold the shortcut a bit longer and start speaking after the listening cue.'
+        ? 'Nothing detected. The input signal was extremely quiet, so check your microphone selection and input volume.'
+        : 'Nothing detected. Try holding the shortcut a bit longer and start speaking after the listening cue.'
       const debugSample = await saveFailedSubmissionSample('empty-transcript', audioBytes, payload?.mimeType, {
         recordingMs,
         rawTranscriptLength: rawTranscript.length,
@@ -3978,14 +4513,21 @@ async function processAudioSubmission(payload = {}) {
         captureDevice: payload?.captureDevice || null,
         debugSample: debugSample || null
       })
-      clearVoiceState(message)
-      showNotification(APP_NAME, message)
+      updateVoiceState({
+        phase: 'idle',
+        transcript: '',
+        finalText: '',
+        targetWindow: '',
+        targetBounds: null,
+        targetElementBounds: null,
+        note: message,
+        error: ''
+      })
       return {
         ok: false,
         cancelled: true,
         reason: 'empty_transcript',
-        error: message,
-        earcon: 'cancel'
+        error: message
       }
     }
 
@@ -4195,15 +4737,22 @@ async function startDictationCapture({
     targetWindow: ''
   })
 
-  const window = await ensureVoiceWindow()
+  await ensureVoiceWindow()
   await duckSystemVolumeForPushToTalk()
-  window.webContents.send('dictation:start-recording')
+  try {
+    const bridge = await ensureCaptureBackend()
+    await bridge.startRecording()
+  } catch (error) {
+    clearVoiceState(String(error?.message || error || 'Failed to start recording.'))
+    void restoreSystemVolumeAfterPushToTalk().catch(() => {})
+    showNotification(APP_NAME, compactText(error?.message || error || 'Failed to start recording.', 180))
+  }
 }
 
 async function stopDictationCapture() {
   try {
-    const window = await ensureVoiceWindow()
-    window.webContents.send('dictation:stop-recording')
+    const bridge = await ensureCaptureBackend()
+    await bridge.stopRecording()
   } finally {
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
   }
@@ -4225,6 +4774,10 @@ function stopHotkeyBridge() {
 }
 
 function registerPressOnlyHotkey() {
+  if (LINUX_HEADLESS_HOST) {
+    return
+  }
+
   globalShortcut.unregisterAll()
   const ok = globalShortcut.register(trayHotkey, () => {
     void toggleDictationCapture()
@@ -4240,6 +4793,10 @@ function registerPressOnlyHotkey() {
 }
 
 function registerPromptShortcut() {
+  if (LINUX_HEADLESS_HOST) {
+    return true
+  }
+
   if (promptTrayHotkey === trayHotkey) {
     return true
   }
@@ -4345,6 +4902,11 @@ function startHotkeyBridge() {
 }
 
 async function registerHotkey() {
+  if (LINUX_HEADLESS_HOST) {
+    console.log('[dictray] Linux headless host: shortcuts are managed by the GNOME Shell extension.')
+    return
+  }
+
   globalShortcut.unregisterAll()
   if (process.platform === 'win32') {
     try {
@@ -4358,16 +4920,20 @@ async function registerHotkey() {
   }
 
   if (process.platform === 'linux' && gnomePanelBridgeEnabled) {
-    console.log('[dictray] Shortcuts are managed by the GNOME Shell extension (Ctrl+Space). Skipping Electron globalShortcut.')
+    console.log('[dictray] Shortcuts are managed by the GNOME Shell extension on Linux GNOME.')
     return
   }
 
   registerPressOnlyHotkey()
 }
 
-ipcMain.handle('dictation:submit-audio', async (_event, payload) => {
+async function handleCaptureSubmitAudio(payload = {}) {
   try {
-    return await processAudioSubmission(payload)
+    const result = await processAudioSubmission(payload)
+    if (result?.cancelled && result?.earcon === 'cancel') {
+      maybePlayCaptureEarcon('cancel')
+    }
+    return result
   } catch (error) {
     if (isAbortError(error)) {
       return {
@@ -4383,6 +4949,109 @@ ipcMain.handle('dictation:submit-audio', async (_event, payload) => {
       error: String(error?.message || error)
     }
   }
+}
+
+async function handleCaptureBackendEvent(message = {}) {
+  const type = String(message?.type || '').trim().toLowerCase()
+  const payload = message?.payload || {}
+
+  switch (type) {
+    case CAPTURE_EVENT_RECORDING_STATE: {
+      const nextPhase = String(payload?.phase || voiceState.phase || 'idle').trim() || 'idle'
+      if (captureBackendId() === 'native') {
+        if (nextPhase === 'listening' && captureRecordingPhase !== 'listening') {
+          maybePlayCaptureEarcon('listen')
+        } else if (nextPhase === 'processing' && captureRecordingPhase === 'listening') {
+          maybePlayCaptureEarcon('submit')
+        }
+      }
+      captureRecordingPhase = nextPhase
+      updateVoiceState({
+        phase: nextPhase,
+        error: '',
+        note: voiceState.note
+      })
+      return
+    }
+    case CAPTURE_EVENT_INPUT_LEVEL:
+      syncVoiceInputLevel(payload?.level)
+      return
+    case CAPTURE_EVENT_INPUT_DEVICES: {
+      const available = normalizeAvailableInputDevices(payload?.devices)
+      const activeDeviceId = normalizeInputDeviceId(payload?.activeDeviceId)
+      const activeLabel = compactText(
+        String(payload?.activeLabel || available.find((device) => device.deviceId === activeDeviceId)?.label || '').trim(),
+        64
+      )
+
+      inputDeviceState = {
+        available,
+        permission: normalizeInputPermission(payload?.permission),
+        activeDeviceId,
+        activeLabel,
+        error: compactText(String(payload?.error || '').trim(), 120)
+      }
+      rebuildMenu()
+      void syncLinuxInputSourceState().catch(() => {})
+      return
+    }
+    case CAPTURE_EVENT_ERROR:
+      captureRecordingPhase = 'idle'
+      clearVoiceState(String(payload?.message || 'Unknown dictation error'))
+      void restoreSystemVolumeAfterPushToTalk().catch(() => {})
+      showNotification(APP_NAME, compactText(payload?.message || 'Unknown dictation error', 180))
+      return
+    case CAPTURE_EVENT_READY:
+      console.log(`[dictray] Capture backend ready: ${captureBackendId()}`)
+      return
+    default:
+      return
+  }
+}
+
+async function handleCaptureBackendRequest(message = {}) {
+  const requestId = String(message?.id || '').trim()
+  switch (String(message?.type || '').trim().toLowerCase()) {
+    case CAPTURE_REQUEST_SUBMIT_AUDIO: {
+      const requestPayload = {
+        ...(message?.payload || {})
+      }
+      const audioBase64 = String(requestPayload.audioBase64 || '').trim()
+      if (audioBase64 && !requestPayload.audioBytes) {
+        requestPayload.audioBytes = new Uint8Array(Buffer.from(audioBase64, 'base64'))
+      }
+      const payload = await handleCaptureSubmitAudio(requestPayload)
+      return createCaptureResponse(requestId, {
+        ok: true,
+        payload
+      })
+    }
+    default:
+      return createCaptureResponse(requestId, {
+        ok: false,
+        error: 'Unsupported capture request.'
+      })
+  }
+}
+
+ipcMain.handle('dictation:submit-audio', async (_event, payload) => {
+  return handleCaptureSubmitAudio(payload)
+})
+
+ipcMain.handle('dictation:get-capture-runtime', async () => {
+  return {
+    backend: captureBackendId()
+  }
+})
+
+ipcMain.on('dictation:capture-event', (_event, payload) => {
+  void handleCaptureBackendEvent(payload).catch((error) => {
+    console.error('[dictray] Failed to handle capture backend event:', error?.message || error)
+  })
+})
+
+ipcMain.handle('dictation:capture-request', async (_event, payload) => {
+  return handleCaptureBackendRequest(payload)
 })
 
 ipcMain.on('dictation:state', (_event, payload) => {
@@ -4409,6 +5078,7 @@ ipcMain.on('dictation:input-devices', (_event, payload) => {
     error: compactText(String(payload?.error || '').trim(), 120)
   }
   rebuildMenu()
+  void syncLinuxInputSourceState().catch(() => {})
 })
 
 ipcMain.handle('dictation:set-input-device', async (_event, payload) => {
@@ -4444,6 +5114,10 @@ ipcMain.on('onboarding:close', () => {
 })
 
 async function createTray() {
+  if (LINUX_HEADLESS_HOST) {
+    return null
+  }
+
   tray = new Tray(currentTrayIcon())
   tray.on('click', () => {
     void toggleDictationCapture()
@@ -4498,7 +5172,9 @@ async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = 
   }, stateDir)
   await applySharedSpeechPreferencesOnStartup().catch(() => null)
   rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
+  await ensureCaptureBackend()
   void appendDiagnosticsLog('runtime-config', {
+    captureBackend: runtimeConfig?.capture?.backend,
     sttProvider: runtimeConfig?.stt?.provider,
     pythonBin: runtimeConfig?.stt?.local?.pythonBin,
     daemonScript: runtimeConfig?.stt?.local?.daemonScript,
@@ -4533,39 +5209,132 @@ async function bootstrap() {
   if (app.isPackaged && !String(process.env.DICTATION_TRAY_STATE_DIR || '').trim()) {
     process.env.DICTATION_TRAY_STATE_DIR = path.join(app.getPath('userData'), 'state')
   }
+  if (app.isPackaged && !String(process.env.DICTATION_TRAY_STT_PROVIDER || '').trim() && resolveBundledSttConfig()) {
+    process.env.DICTATION_TRAY_STT_PROVIDER = 'local'
+  }
   await applyRuntimeConfig(await loadConfig(), { loadPersistentState: true })
   systemVolume = new SystemVolumeBridge()
   uiAutomation = new UiAutomationBridge()
+  earconPlayer = createEarconPlayer({
+    logger: (message) => {
+      console.log(message)
+    }
+  })
 }
 
-app.on('before-quit', (event) => {
-  isQuitting = true
+async function setupLinuxProductIntegration() {
+  if (process.platform !== 'linux') {
+    return
+  }
+
+  const rootDir = path.resolve(__dirname, '..')
+  const resourcesDir = runtimeResourcesDir()
+  const useLinuxHeadlessLauncher = linuxHeadlessLauncherEnabled()
+  const packagedHeadlessPaths = packagedLinuxHeadlessLauncherPaths()
+  if (useLinuxHeadlessLauncher && app.isPackaged && !packagedHeadlessPaths.available) {
+    throw new Error('Packaged Linux headless runtime is incomplete. Rebuild the Linux package bundle.')
+  }
+
+  const launcherMainEntryPath = useLinuxHeadlessLauncher
+    ? app.isPackaged
+      ? packagedHeadlessPaths.mainEntryPath
+      : path.join(rootDir, 'tray', 'main.mjs')
+    : ''
+  const launcherExecPath = useLinuxHeadlessLauncher
+    ? app.isPackaged
+      ? packagedHeadlessPaths.nodeExec
+      : resolveLinuxHeadlessLauncherExecPath()
+    : process.execPath
+  const launcherEnv = useLinuxHeadlessLauncher
+    ? {
+        DICTATION_TRAY_LINUX_HEADLESS: '1',
+        ...(app.isPackaged ? { DICTATION_TRAY_PACKAGED: '1' } : {}),
+        ...(resourcesDir ? { DICTATION_TRAY_RESOURCES_DIR: resourcesDir } : {}),
+        ...(app.isPackaged && packagedHeadlessPaths.nodeLibDir
+          ? {
+              LD_LIBRARY_PATH: packagedHeadlessPaths.nodeLibDir
+            }
+          : {})
+      }
+    : {}
+  const launcher = buildLinuxLauncherManifest({
+    packaged: app.isPackaged,
+    rootDir,
+    execPath: launcherExecPath,
+    appImagePath: '',
+    mainEntryPath: launcherMainEntryPath,
+    env: launcherEnv
+  })
+
+  await ensureLinuxProductSetup({
+    packaged: app.isPackaged,
+    appVersion: app.getVersion(),
+    rootDir,
+    resourcesPath: resourcesDir,
+    launcher,
+    sessionIsGnome: isGnomeSession(),
+    logger: (message) => {
+      console.log(`[dictray] ${message}`)
+    }
+  })
+}
+
+async function performQuitCleanup() {
+  if (quitCleanupPromise) {
+    return quitCleanupPromise
+  }
+
   if (refreshTimer) {
     clearInterval(refreshTimer)
     refreshTimer = null
   }
   stopGnomePanelBridge()
+  stopLinuxNativeUiBridge()
   clearSttKeepWarmTimer()
   stopHotkeyBridge()
   globalShortcut.unregisterAll()
-  void speech?.dispose?.().catch(() => null)
 
-  if (!isRestoringVolumeForQuit && volumeDuckState) {
-    event.preventDefault()
-    isRestoringVolumeForQuit = true
-    void restoreSystemVolumeAfterPushToTalk().catch(() => null).finally(() => {
-      isRestoringVolumeForQuit = false
-      app.quit()
+  quitCleanupPromise = (async () => {
+    await captureBridge?.dispose?.().catch((error) => {
+      console.error('[dictray] Failed to dispose capture bridge during quit:', error?.message || error)
     })
+    await speech?.dispose?.().catch((error) => {
+      console.error('[dictray] Failed to dispose speech runtime during quit:', error?.message || error)
+    })
+
+    if (volumeDuckState) {
+      isRestoringVolumeForQuit = true
+      await restoreSystemVolumeAfterPushToTalk().catch(() => null)
+      isRestoringVolumeForQuit = false
+    }
+  })().finally(() => {
+    quitCleanupComplete = true
+    quitCleanupPromise = null
+  })
+
+  return quitCleanupPromise
+}
+
+app.on('before-quit', (event) => {
+  isQuitting = true
+  if (quitCleanupComplete) {
     return
   }
 
+  event.preventDefault()
+  void performQuitCleanup().finally(() => {
+    app.quit()
+  })
 })
 
 app.whenReady().then(async () => {
   installPermissionHandlers()
   await bootstrap()
+  await setupLinuxProductIntegration().catch((error) => {
+    console.error('[dictray] Linux product setup failed:', error?.message || error)
+  })
   await initGnomePanelBridge().catch(() => {})
+  await initLinuxNativeUiBridge().catch(() => {})
   await createTray()
   await ensureVoiceWindow()
   await maybeShowOnboarding()

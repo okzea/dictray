@@ -45,6 +45,10 @@ async function main() {
   log(`Syncing extension into ${targetDir}`)
   await cp(sourceDir, targetDir, { recursive: true, force: true })
 
+  const schemaDir = path.join(targetDir, 'schemas')
+  log(`Compiling schemas in ${schemaDir}`)
+  await run('glib-compile-schemas', [schemaDir])
+
   log(`Disabling ${uuid}`)
   await run('gnome-extensions', ['disable', uuid]).catch(() => {})
 

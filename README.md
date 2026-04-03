@@ -48,6 +48,12 @@ Build Windows distributables:
 pnpm dist:win
 ```
 
+Build Linux distributables:
+
+```bash
+pnpm dist:linux
+```
+
 Build the Windows helpers:
 
 ```powershell
@@ -191,6 +197,7 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 - Existing `local-http` / `http` STT configs are treated as `local` during config loading so older setups keep working after the Docker removal.
 - Direct local STT currently expects a working local Python environment with `faster-whisper` installed. When `stt.local.device = auto`, it will choose CUDA automatically if it is available and otherwise fall back to CPU.
 - `pnpm bundle:runtime` will try to auto-create a private bundled Python runtime and install `faster-whisper` into it. If you already have a private runtime you want to reuse, point `DICTATION_TRAY_BUNDLED_PYTHON_DIR` or `DICTATION_TRAY_BUNDLED_PYTHON` at it instead. Use `DICTATION_TRAY_BUNDLED_PYTHON_BOOTSTRAP` to choose the bootstrap interpreter, and `DICTATION_TRAY_BUNDLED_STT_MODEL_DIR` to stage a local model cache into the bundle.
+- Packaged builds that include a bundled STT runtime automatically prefer `stt.provider = local` unless you explicitly override `DICTATION_TRAY_STT_PROVIDER`.
 - STT now sends a background keep-warm ping every `900000` ms by default (`15` minutes). Set `stt.keepWarmIntervalMs` to change it, or `0` to disable it.
 - This repo does not include TTS at all.
 - STT device/model changes can be changed live from the tray or GNOME panel when the active STT provider supports runtime preferences.
@@ -198,6 +205,8 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 - Rewrite model selection is currently available for the optional Ollama provider only.
 - If focused-window paste fails, the final text is copied to the clipboard as a fallback.
 - GNOME (Linux) can show DicTray in the top bar using the companion extension under `gnome-panel-extension/`.
+- On GNOME Linux, DicTray now defaults to the native capture backend, uses the Shell extension for the fixed dictation overlay, and opens microphone setup / Quick Start as native GTK utilities.
+- Packaged Linux builds are now pure Node bundles under `dist/DicTray-linux-x64/`, install a product-managed GNOME extension payload and autostart entry on first launch, and let the extension launch DicTray if the app is not already running.
   1) Copy it to `~/.local/share/gnome-shell/extensions/dictray-gnome-panel@okzea`
   2) `gnome-extensions enable dictray-gnome-panel@okzea`
   3) Log out / log in on Wayland (or `Alt+F2`, `r`, Enter on X11)

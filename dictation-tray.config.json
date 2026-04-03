@@ -3,9 +3,14 @@
     "stateDir": "./local/state"
   },
   "stt": {
-    "provider": "http",
+    "provider": "local",
     "enabled": true,
     "timeoutMs": 120000,
+    "local": {
+      "model": "small.en",
+      "device": "auto",
+      "computeType": "auto"
+    },
     "http": {
       "baseUrl": "http://127.0.0.1:4593",
       "path": "/transcribe",

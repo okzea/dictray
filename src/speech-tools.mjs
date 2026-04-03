@@ -69,6 +69,77 @@ function expandHome(value) {
   return text
 }
 
+function splitEnvPath(value) {
+  return String(value || '')
+    .split(path.delimiter)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+}
+
+function dedupePaths(entries) {
+  const seen = new Set()
+  const result = []
+  for (const entry of entries) {
+    const normalized = String(entry || '').trim()
+    if (!normalized || seen.has(normalized)) {
+      continue
+    }
+    seen.add(normalized)
+    result.push(normalized)
+  }
+  return result
+}
+
+async function pathExists(filePath) {
+  try {
+    await access(filePath)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function resolveCudaLibraryDirs(env = process.env) {
+  if (process.platform !== 'linux') {
+    return []
+  }
+
+  const candidates = dedupePaths([
+    ...splitEnvPath(env.DICTATION_TRAY_STT_LD_LIBRARY_PATH),
+    ...splitEnvPath(env.DICTATION_TRAY_CUDA_LIB_DIR),
+    '/usr/local/lib/ollama/cuda_v12',
+    '/usr/local/cuda/lib64',
+    '/usr/local/cuda-12/lib64',
+    '/usr/local/cuda-12.8/lib64',
+    '/opt/cuda/lib64'
+  ])
+
+  const resolved = []
+  for (const directory of candidates) {
+    const hasCuda12Runtime = await pathExists(path.join(directory, 'libcublas.so.12'))
+      || await pathExists(path.join(directory, 'libcublasLt.so.12'))
+      || await pathExists(path.join(directory, 'libcudart.so.12'))
+    if (hasCuda12Runtime) {
+      resolved.push(directory)
+    }
+  }
+  return resolved
+}
+
+async function buildSpeechChildEnv(baseEnv = process.env) {
+  const env = { ...baseEnv }
+  const extraLibDirs = await resolveCudaLibraryDirs(env)
+  if (!extraLibDirs.length) {
+    return env
+  }
+
+  env.LD_LIBRARY_PATH = dedupePaths([
+    ...extraLibDirs,
+    ...splitEnvPath(env.LD_LIBRARY_PATH)
+  ]).join(path.delimiter)
+  return env
+}
+
 function escapeShellArg(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`
 }
@@ -220,11 +291,13 @@ class LocalSttWorkerClient {
       const pythonBin = expandHome(this.sttConfig?.pythonBin)
       const workerScript = expandHome(this.workerScriptPath())
       await access(workerScript)
+      const childEnv = await buildSpeechChildEnv(process.env)
 
       this.stderrLines = []
       const child = spawn(pythonBin, [workerScript], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: false
+        windowsHide: false,
+        env: childEnv
       })
 
       child.on('error', (error) => {
@@ -470,14 +543,15 @@ class LocalSttDaemonClient {
       const port = await reserveLocalPort()
       const baseUrl = `http://127.0.0.1:${port}`
       const ffmpegBin = expandHome(this.sttConfig?.ffmpegBin)
+      const childEnv = await buildSpeechChildEnv({
+        ...process.env,
+        STT_FFMPEG_BIN: ffmpegBin || process.env.STT_FFMPEG_BIN || 'ffmpeg'
+      })
       this.stderrLines = []
       const child = spawn(pythonBin, [daemonScript, '--host', '127.0.0.1', '--port', String(port)], {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: false,
-        env: {
-          ...process.env,
-          STT_FFMPEG_BIN: ffmpegBin || process.env.STT_FFMPEG_BIN || 'ffmpeg'
-        }
+        env: childEnv
       })
 
       child.on('error', (error) => {
@@ -562,7 +636,8 @@ class LocalSttDaemonClient {
           'x-stt-model': String(payload?.model || '').trim() || 'base.en',
           'x-stt-model-dir': String(payload?.modelDir || '').trim(),
           'x-stt-device': String(payload?.device || '').trim() || 'auto',
-          'x-stt-compute-type': String(payload?.computeType || '').trim() || 'auto'
+          'x-stt-compute-type': String(payload?.computeType || '').trim() || 'auto',
+          'x-stt-initial-prompt': String(payload?.initialPrompt || '').trim()
         },
         signal: options?.signal || null,
         body: audioBuffer
@@ -809,7 +884,8 @@ export class SpeechTools {
             model: String(stt.model || '').trim() || 'base.en',
             modelDir: String(stt.modelDir || '').trim(),
             device: String(stt.device || '').trim() || 'auto',
-            computeType: String(stt.computeType || '').trim() || 'auto'
+            computeType: String(stt.computeType || '').trim() || 'auto',
+            initialPrompt: String(stt.initialPrompt || '').trim()
           }, 120000)
           if (!payload?.ok) {
             return {
@@ -1191,7 +1267,8 @@ export class SpeechTools {
         model: String(stt.model || '').trim() || 'base.en',
         modelDir: String(stt.modelDir || '').trim(),
         device: String(stt.device || '').trim() || 'auto',
-        computeType: String(stt.computeType || '').trim() || 'auto'
+        computeType: String(stt.computeType || '').trim() || 'auto',
+        initialPrompt: String(stt.initialPrompt || '').trim()
       }, {
         signal: options?.signal || null,
         timeoutMs: 120000

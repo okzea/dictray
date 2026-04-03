@@ -5,7 +5,17 @@
     <key name="dictray-toggle" type="as">
       <default>['&lt;Control&gt;space']</default>
       <summary>Toggle dictation</summary>
-      <description>Keyboard shortcut to start/stop dictation</description>
+      <description>Keyboard shortcut to start or stop dictation</description>
+    </key>
+    <key name="dictray-toggle-submit" type="as">
+      <default>['&lt;Alt&gt;&lt;Shift&gt;space']</default>
+      <summary>Toggle dictation and submit with Enter</summary>
+      <description>Keyboard shortcut to start or stop dictation and press Enter after insertion</description>
+    </key>
+    <key name="dictray-cancel" type="as">
+      <default>['Escape']</default>
+      <summary>Cancel active dictation</summary>
+      <description>Keyboard shortcut to cancel an active dictation turn without submitting text</description>
     </key>
   </schema>
 </schemalist>

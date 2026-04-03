@@ -221,7 +221,7 @@ export class LinuxUiAutomationBridge {
       await delay(80)
 
       if (this.sessionType === 'wayland') {
-        // Electron's clipboard.writeText doesn't work on Wayland without input
+        // Clipboard handoff on Wayland needs an active provider process
         // serial (causes "No serial found for selection"). Use wl-copy instead.
         // wl-copy must stay alive to serve clipboard content on Wayland, so spawn
         // it detached. It exits automatically when another app takes the clipboard.

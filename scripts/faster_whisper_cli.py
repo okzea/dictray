@@ -47,6 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", default="", help="Optional faster-whisper download/cache directory.")
     parser.add_argument("--device", default="auto", help="auto, cpu, or cuda")
     parser.add_argument("--compute-type", default="auto", help="auto, int8, float16, float32, etc.")
+    parser.add_argument("--initial-prompt", default="", help="Optional faster-whisper initial prompt for vocabulary biasing.")
     return parser.parse_args()
 
 
@@ -108,29 +109,31 @@ def main() -> int:
 
     model = whisper_model_class(args.model, **model_kwargs)
     def transcribe_once(vad_filter: bool) -> tuple[str, str]:
+        transcribe_kwargs = {
+            "beam_size": 1,
+            "best_of": 1,
+            "temperature": 0.0,
+            "vad_filter": vad_filter,
+            "condition_on_previous_text": False,
+        }
+        normalized_prompt = str(args.initial_prompt or "").strip()
+        if normalized_prompt:
+            transcribe_kwargs["initial_prompt"] = normalized_prompt
         segments, info = model.transcribe(
             args.input_path,
-            beam_size=1,
-            best_of=1,
-            temperature=0.0,
-            vad_filter=vad_filter,
-            condition_on_previous_text=False,
+            **transcribe_kwargs,
         )
         segment_list = list(segments)
         transcript = " ".join(segment.text.strip() for segment in segment_list if segment.text.strip()).strip()
         language = (getattr(info, "language", None) or "en").strip() or "en"
         return transcript, language
 
-    transcript, language = transcribe_once(True)
-    used_vad_fallback = False
-    if not transcript:
-        transcript, language = transcribe_once(False)
-        used_vad_fallback = True
+    transcript, language = transcribe_once(False)
     print_json({
         **payload,
         "transcript": transcript,
         "language": language,
-        "usedVadFallback": used_vad_fallback,
+        "usedVadFallback": False,
     })
     return 0
 

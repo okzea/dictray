@@ -1,4 +1,4 @@
-import { access, mkdir } from 'node:fs/promises'
+import { mkdir } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -11,10 +11,6 @@ const rootDir = path.resolve(__dirname, '..')
 
 function log(message) {
   console.log(`[dictray-start] ${message}`)
-}
-
-function runtimeHelperRoot() {
-  return path.join(rootDir, '.runtime-helpers', 'dev')
 }
 
 function run(command, args, options = {}) {
@@ -55,50 +51,6 @@ async function warmSttRuntime(sttProvider) {
   }
 
   log(`STT warmup skipped or failed${result?.reason ? `: ${result.reason}` : '.'}${result?.error ? ` ${result.error}` : ''}`)
-}
-
-function electronBinaryPath() {
-  return process.platform === 'win32'
-    ? path.join(rootDir, 'node_modules', 'electron', 'dist', 'electron.exe')
-    : path.join(rootDir, 'node_modules', '.bin', 'electron')
-}
-
-function electronCliPath() {
-  return path.join(rootDir, 'node_modules', 'electron', 'cli.js')
-}
-
-async function ensureElectronRuntime(childEnv) {
-  const electronBin = electronBinaryPath()
-  try {
-    await access(electronBin)
-    return electronBin
-  } catch {
-    // Fall through to bootstrap the missing Electron dist payload.
-  }
-
-  const installScript = path.join(rootDir, 'node_modules', 'electron', 'install.js')
-  await access(installScript)
-
-  log('Electron runtime is missing. Installing Electron dist payload.')
-  try {
-    await run(process.execPath, [installScript], {
-      env: {
-        ...childEnv,
-        electron_config_cache: path.join(rootDir, '.electron-cache')
-      }
-    })
-  } catch (error) {
-    throw new Error(
-      [
-        'Electron runtime installation failed.',
-        String(error?.message || error),
-        'If pnpm keeps blocking Electron postinstall, run "pnpm approve-builds" and allow electron, then reinstall.'
-      ].join(' ')
-    )
-  }
-
-  await access(electronBin)
-  return electronBin
 }
 
 function sleep(ms) {
@@ -149,7 +101,6 @@ async function ensureDockerStt(childEnv, healthUrl) {
     return true
   }
 
-  // Remove any stale container to avoid port conflicts
   log('Ensuring no stale STT container is blocking the port.')
   await run('docker', ['rm', '-f', 'dictray-speech-stt'], { env: childEnv, stdio: 'ignore' }).catch(() => {})
 
@@ -176,25 +127,16 @@ async function ensureManagedHttpStt(childEnv, healthUrl) {
 }
 
 async function requestExistingTrayExit(childEnv) {
-  const electronCli = electronCliPath()
-  await access(electronCli)
-
   log('Checking for an already running tray instance.')
-  await run(process.execPath, [electronCli, 'tray/main.mjs', '--dictray-exit-existing'], {
+  await run(process.execPath, ['tray/main.mjs', '--dictray-exit-existing'], {
     env: {
       ...childEnv,
-      ELECTRON_ENABLE_LOGGING: '1'
-    }
-  })
+      DICTATION_TRAY_LINUX_HEADLESS: '1'
+    },
+    stdio: 'ignore'
+  }).catch(() => {})
 
   await sleep(900)
-}
-
-async function buildDotnetHelper(projectPath, outputDir, childEnv) {
-  await mkdir(outputDir, { recursive: true })
-  await run('dotnet', ['build', projectPath, '-c', 'Release', `-p:OutDir=${outputDir}`], {
-    env: childEnv
-  })
 }
 
 function usesDefaultLocalSttBootstrapPath(config) {
@@ -237,13 +179,18 @@ async function prepareStartupSttRuntime(config, childEnv) {
 }
 
 async function main() {
+  if (process.platform !== 'linux') {
+    throw new Error('This branch now supports Linux only.')
+  }
+
   const dotnetHome = path.join(rootDir, '.dotnet-cli')
   await mkdir(dotnetHome, { recursive: true })
 
   const childEnv = {
     ...process.env,
     DOTNET_CLI_HOME: dotnetHome,
-    DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1'
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1',
+    DICTATION_TRAY_LINUX_HEADLESS: '1'
   }
 
   let config = await loadConfig()
@@ -267,41 +214,16 @@ async function main() {
     ...config.stt,
     rootDir: config.rootDir
   }, config.memory.stateDir)
-  await ensureElectronRuntime(childEnv)
+
   await requestExistingTrayExit(childEnv)
-
-  const electronEnv = {
-    ...childEnv,
-    ELECTRON_ENABLE_LOGGING: '1',
-    DICTATION_TRAY_BUNDLED_RUNTIME_DIR: childEnv.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || ''
-  }
-
-  if (process.platform === 'win32') {
-    const helperRoot = runtimeHelperRoot()
-    const hotkeyHelperDir = path.join(helperRoot, 'windows-hotkey-hook')
-    const uiAutomationHelperDir = path.join(helperRoot, 'windows-ui-automation')
-    const volumeHelperDir = path.join(helperRoot, 'windows-system-volume')
-
-    log('Building Windows hotkey helper.')
-    await buildDotnetHelper('scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj', hotkeyHelperDir, childEnv)
-
-    log('Building Windows UI automation helper.')
-    await buildDotnetHelper('scripts/windows-ui-automation/WindowsUiAutomation.csproj', uiAutomationHelperDir, childEnv)
-
-    log('Building Windows system volume helper.')
-    await buildDotnetHelper('scripts/windows-system-volume/WindowsSystemVolume.csproj', volumeHelperDir, childEnv)
-
-    electronEnv.DICTATION_TRAY_HOTKEY_HELPER = path.join(hotkeyHelperDir, 'WindowsHotkeyHook.exe')
-    electronEnv.DICTATION_TRAY_UI_AUTOMATION_HELPER = path.join(uiAutomationHelperDir, 'WindowsUiAutomation.exe')
-    electronEnv.DICTATION_TRAY_VOLUME_HELPER = path.join(volumeHelperDir, 'WindowsSystemVolume.exe')
-  }
-
   await warmSttRuntime(sttProvider)
 
-  const electronCli = electronCliPath()
   log('Launching tray.')
-  await run(process.execPath, [electronCli, 'tray/main.mjs'], {
-    env: electronEnv
+  await run(process.execPath, ['tray/main.mjs'], {
+    env: {
+      ...childEnv,
+      DICTATION_TRAY_BUNDLED_RUNTIME_DIR: childEnv.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || ''
+    }
   })
 }
 

@@ -91,6 +91,10 @@ def normalize_compute_type(requested: str, device: str) -> str:
     return value
 
 
+def allow_cpu_fallback(requested_device: str) -> bool:
+    return (requested_device or "auto").strip().lower() in {"", "auto"}
+
+
 def cuda_runtime_unavailable(message: str) -> bool:
     return bool(message) and (
         "cublas" in message.lower()
@@ -267,7 +271,8 @@ def load_model(model_name: str, model_dir: str, requested_device: str, requested
     selected_device = normalize_device(requested_device)
     selected_compute_type = normalize_compute_type(requested_compute_type, selected_device)
     attempts = [(selected_device, selected_compute_type)]
-    if selected_device != "cpu":
+    fallback_allowed = allow_cpu_fallback(requested_device)
+    if selected_device != "cpu" and fallback_allowed:
         attempts.append(("cpu", "int8"))
 
     last_error = None
@@ -295,7 +300,7 @@ def load_model(model_name: str, model_dir: str, requested_device: str, requested
             model = WhisperModel(model_name, **model_kwargs)
         except Exception as error:  # pragma: no cover - native runtime surface
             last_error = error
-            if attempt_device != "cpu" and cuda_runtime_unavailable(error_text(error)):
+            if fallback_allowed and attempt_device != "cpu" and cuda_runtime_unavailable(error_text(error)):
                 continue
             raise
 
@@ -329,14 +334,20 @@ def clear_vad_cache() -> None:
         pass
 
 
-def run_transcribe(model, input_path: str, vad_filter: bool):
+def run_transcribe(model, input_path: str, vad_filter: bool, initial_prompt: str = ""):
+    transcribe_kwargs = {
+        "beam_size": 1,
+        "best_of": 1,
+        "temperature": 0.0,
+        "vad_filter": vad_filter,
+        "condition_on_previous_text": False,
+    }
+    normalized_prompt = str(initial_prompt or "").strip()
+    if normalized_prompt:
+        transcribe_kwargs["initial_prompt"] = normalized_prompt
     segments, info = model.transcribe(
         input_path,
-        beam_size=1,
-        best_of=1,
-        temperature=0.0,
-        vad_filter=vad_filter,
-        condition_on_previous_text=False,
+        **transcribe_kwargs,
     )
     # Fully consume the generator to release internal ctranslate2 resources.
     # Lazy iteration can leave the model in a busy state, blocking subsequent calls.
@@ -348,33 +359,29 @@ def run_transcribe(model, input_path: str, vad_filter: bool):
     return transcript, language
 
 
-def perform_transcribe(model, input_path: str):
-    transcript, language = run_transcribe(model, input_path, True)
-    if transcript:
-        # Evict the cached Silero VAD ONNX session so the next transcription
-        # gets a fresh InferenceSession (avoids Windows hang).
-        clear_vad_cache()
-        gc.collect()
-        return transcript, language
-
-    transcript, language = run_transcribe(model, input_path, False)
-    # Evict the cached Silero VAD ONNX session so the next transcription
-    # gets a fresh InferenceSession (avoids Windows hang).
+def perform_transcribe(model, input_path: str, initial_prompt: str = ""):
+    # Press-to-talk dictation is sensitive to clipped starts and ends. Running
+    # faster-whisper with VAD enabled as the primary pass can return a non-empty
+    # transcript while still trimming quiet edge words, so prefer the full-audio
+    # pass here. The VAD cache is still cleared to keep Windows runtime behavior
+    # stable even when the model internals touch the VAD module.
+    transcript, language = run_transcribe(model, input_path, False, initial_prompt)
     clear_vad_cache()
     gc.collect()
     return transcript, language
 
 
-def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str, input_path: str):
+def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str, input_path: str, initial_prompt: str = ""):
     model, runtime = load_model(model_name, model_dir, requested_device, requested_compute_type)
+    fallback_allowed = allow_cpu_fallback(requested_device)
     try:
-        transcript, language = perform_transcribe(model, input_path)
+        transcript, language = perform_transcribe(model, input_path, initial_prompt)
         return runtime, transcript, language
     except Exception as error:
-        if runtime.get("device") != "cpu" and cuda_runtime_unavailable(error_text(error)):
+        if fallback_allowed and runtime.get("device") != "cpu" and cuda_runtime_unavailable(error_text(error)):
             discard_runtime(runtime)
             fallback_model, fallback_runtime = load_model(model_name, model_dir, "cpu", "int8")
-            transcript, language = perform_transcribe(fallback_model, input_path)
+            transcript, language = perform_transcribe(fallback_model, input_path, initial_prompt)
             return fallback_runtime, transcript, language
         raise
 
@@ -419,6 +426,7 @@ def warm_runtime(command: dict) -> dict:
                 str(command.get("device") or "auto").strip() or "auto",
                 str(command.get("computeType") or "auto").strip() or "auto",
                 temp_path,
+                str(command.get("initialPrompt") or "").strip(),
             )
         set_active_runtime(runtime)
         return {
@@ -456,6 +464,7 @@ def transcribe_audio(command: dict, audio_bytes: bytes, content_type: str) -> di
                 str(command.get("device") or "auto").strip() or "auto",
                 str(command.get("computeType") or "auto").strip() or "auto",
                 str(wav_path),
+                str(command.get("initialPrompt") or "").strip(),
             )
             transcribe_ms = round((time.perf_counter() - transcribe_started) * 1000)
 
@@ -526,6 +535,7 @@ class Handler(BaseHTTPRequestHandler):
                     "modelDir": self.headers.get("X-Stt-Model-Dir", ""),
                     "device": self.headers.get("X-Stt-Device", "auto"),
                     "computeType": self.headers.get("X-Stt-Compute-Type", "auto"),
+                    "initialPrompt": self.headers.get("X-Stt-Initial-Prompt", ""),
                 }
                 result = transcribe_audio(payload, raw_body, self.headers.get("Content-Type", "application/octet-stream"))
                 self.send_json(200, result)

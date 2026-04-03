@@ -1,10 +1,14 @@
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
+import { normalizeCaptureBackendId } from './capture-protocol.mjs'
 import { projectRoot, resolveBundledSttConfig } from './runtime-paths.mjs'
 
 const DEFAULTS = {
   memory: {
     stateDir: './local/state'
+  },
+  capture: {
+    backend: 'native'
   },
   stt: {
     enabled: true,
@@ -171,9 +175,11 @@ export async function loadConfig(configPathArg) {
   const parsedSpeech = parsed?.speech || {}
   const parsedLegacyStt = parsedSpeech?.stt || {}
   const parsedStt = parsed?.stt || {}
+  const parsedCapture = parsed?.capture || {}
   const parsedRewrite = parsed?.rewrite || {}
   const bundledStt = resolveBundledSttConfig()
   const envSttProvider = String(process.env.DICTATION_TRAY_STT_PROVIDER || '').trim()
+  const envCaptureBackend = String(process.env.DICTATION_TRAY_CAPTURE_BACKEND || '').trim()
 
   const sttProvider = normalizeSttProviderId(envSttProvider || parsedStt?.provider || parsedLegacyStt?.provider || DEFAULTS.stt.provider)
   const parsedLocalPythonBin = parsedStt?.local?.pythonBin ?? parsedLegacyStt?.local?.pythonBin
@@ -228,6 +234,9 @@ export async function loadConfig(configPathArg) {
     rootDir,
     memory: {
       stateDir: path.resolve(process.env.DICTATION_TRAY_STATE_DIR || parsed?.memory?.stateDir || DEFAULTS.memory.stateDir)
+    },
+    capture: {
+      backend: normalizeCaptureBackendId(envCaptureBackend || parsedCapture?.backend || DEFAULTS.capture.backend)
     },
     stt,
     rewrite,
