@@ -677,21 +677,65 @@ async function snapshotCaptureSegments(state) {
   }
 }
 
-async function buildRecordingBuffer(snapshot, startByteOffset, endByteOffset) {
-  const startByte = Math.max(0, Math.min(Number(startByteOffset) || 0, snapshot.totalBytes))
-  const endByte = Math.max(startByte, Math.min(Number(endByteOffset) || 0, snapshot.totalBytes))
-  if (endByte <= startByte) {
+function resolveSnapshotPosition(snapshot, byteOffset) {
+  const targetByte = Math.max(0, Math.min(Number(byteOffset) || 0, snapshot.totalBytes))
+  if (!snapshot?.segments?.length) {
+    return {
+      targetByte,
+      segmentIndex: null,
+      segmentByteOffset: 0
+    }
+  }
+
+  for (const segment of snapshot.segments) {
+    if (targetByte < segment.endByte) {
+      return {
+        targetByte,
+        segmentIndex: segment.index,
+        segmentByteOffset: Math.max(0, targetByte - segment.startByte)
+      }
+    }
+  }
+
+  const lastSegment = snapshot.segments[snapshot.segments.length - 1]
+  return {
+    targetByte,
+    segmentIndex: lastSegment.index,
+    segmentByteOffset: lastSegment.size
+  }
+}
+
+async function buildRecordingBuffer(snapshot, startMarker, endByteOffset) {
+  const endByte = Math.max(0, Math.min(Number(endByteOffset) || 0, snapshot.totalBytes))
+  if (!Number.isFinite(endByte) || endByte <= 0 || !snapshot?.segments?.length) {
+    return Buffer.alloc(0)
+  }
+
+  let startSegmentIndex = Number(startMarker?.segmentIndex)
+  let startSegmentByteOffset = Math.max(0, Number(startMarker?.segmentByteOffset) || 0)
+  if (!Number.isFinite(startSegmentIndex)) {
+    const fallback = resolveSnapshotPosition(snapshot, startMarker?.byteOffset)
+    startSegmentIndex = Number(fallback.segmentIndex)
+    startSegmentByteOffset = fallback.segmentByteOffset
+  }
+
+  if (!Number.isFinite(startSegmentIndex)) {
     return Buffer.alloc(0)
   }
 
   const parts = []
   for (const segment of snapshot.segments) {
-    if (segment.endByte <= startByte || segment.startByte >= endByte) {
+    if (segment.index < startSegmentIndex) {
       continue
+    }
+    if (segment.startByte >= endByte) {
+      break
     }
 
     const fileBuffer = await readFile(segment.path)
-    const segmentStart = Math.max(0, startByte - segment.startByte)
+    const segmentStart = segment.index === startSegmentIndex
+      ? Math.min(segment.size, startSegmentByteOffset)
+      : 0
     const segmentEnd = Math.min(segment.size, endByte - segment.startByte)
     if (segmentEnd > segmentStart) {
       parts.push(fileBuffer.subarray(segmentStart, segmentEnd))
@@ -730,14 +774,14 @@ async function finalizeRecording(state) {
     }
     const snapshot = await snapshotCaptureSegments(service)
     const endByteOffset = snapshot.totalBytes
-    const pcmBuffer = await buildRecordingBuffer(snapshot, state.startByteOffset, endByteOffset)
+    const pcmBuffer = await buildRecordingBuffer(snapshot, state.startMarker, endByteOffset)
     if (state?.cancelled) {
       return
     }
     const audioBuffer = buildWaveFromPcm(pcmBuffer)
     const recordingMs = Math.max(
       Math.max(0, nowMs() - state.startedAt),
-      bytesToMs(Math.max(0, endByteOffset - state.startByteOffset))
+      bytesToMs(Math.max(0, pcmBuffer.length))
     )
     if (state?.cancelled) {
       return
@@ -822,10 +866,14 @@ async function startRecording() {
   const service = await ensureCaptureServiceStarted()
   const snapshot = await snapshotCaptureSegments(service)
   const preRollBytes = msToBytes(CAPTURE_START_PRE_ROLL_MS)
+  const startMarker = resolveSnapshotPosition(
+    snapshot,
+    Math.max(0, snapshot.totalBytes - preRollBytes)
+  )
 
   recordingState = {
     startedAt: nowMs(),
-    startByteOffset: Math.max(0, snapshot.totalBytes - preRollBytes),
+    startMarker,
     pendingStopTimer: null,
     stopping: false,
     finalizePromise: null,

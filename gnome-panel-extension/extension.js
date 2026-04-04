@@ -3,6 +3,7 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Meta from 'gi://Meta';
+import Pango from 'gi://Pango';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
 
@@ -311,15 +312,24 @@ class DicTrayOverlay {
 
     this._chip = new St.BoxLayout({
       reactive: false,
-      can_focus: false
+      can_focus: false,
+      x_expand: false
     });
     this._dot = new St.Widget({reactive: false, can_focus: false});
     this._dot.set_pivot_point(0.5, 0.5);
     this._chipLabel = new St.Label({text: 'Listening', y_align: Clutter.ActorAlign.CENTER});
+    this._chipLabel.clutter_text.set({
+      ellipsize: Pango.EllipsizeMode.NONE,
+      single_line_mode: true,
+    });
     this._chip.add_child(this._dot);
     this._chip.add_child(this._chipLabel);
 
     this._meta = new St.Label({text: 'DicTray', x_expand: true, y_align: Clutter.ActorAlign.CENTER});
+    this._meta.clutter_text.set({
+      ellipsize: Pango.EllipsizeMode.END,
+      single_line_mode: true,
+    });
     this._headline = new St.Label({text: 'Ready'});
     this._headline.clutter_text.line_wrap = true;
     this._subline = new St.Label({text: 'Press the shortcut to start dictation.'});
