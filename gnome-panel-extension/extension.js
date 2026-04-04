@@ -829,7 +829,7 @@ class DicTrayIndicator extends PanelMenu.Button {
     this._statusDot.style = dictating
       ? 'margin-right: 4px; color: #7ee787;'
       : 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray (' + String(next.hotkey || 'shortcut').trim() + ')';
+    this._title.text = ' DicTray';
     this._overlay.update(next);
     this._syncMenu(next.menu);
     _activeExtension?._syncCancelKeybinding();
