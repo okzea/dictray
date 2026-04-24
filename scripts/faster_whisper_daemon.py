@@ -265,6 +265,51 @@ def discard_runtime(runtime: dict) -> None:
         set_active_runtime(None)
 
 
+def clear_model_cache(retain_key=None) -> None:
+    keys = list(MODEL_CACHE.keys())
+    for key in keys:
+        if retain_key is not None and key == retain_key:
+            continue
+        MODEL_CACHE.pop(key, None)
+    gc.collect()
+
+
+def resolve_runtime_command(command: dict) -> dict:
+    snapshot = runtime_snapshot() or {}
+    command = command if isinstance(command, dict) else {}
+
+    requested_device = str(command.get("device") or "").strip()
+    requested_compute_type = str(command.get("computeType") or "").strip()
+
+    if not requested_compute_type and requested_device:
+      requested_compute_type = "auto"
+    elif not requested_compute_type:
+      requested_compute_type = str(snapshot.get("computeType") or "auto").strip() or "auto"
+
+    return {
+        "model": str(command.get("model") or snapshot.get("model") or "base.en").strip() or "base.en",
+        "modelDir": str(command.get("modelDir") or snapshot.get("modelDir") or "").strip(),
+        "device": requested_device or str(snapshot.get("device") or "auto").strip() or "auto",
+        "computeType": requested_compute_type,
+        "initialPrompt": str(command.get("initialPrompt") or "").strip(),
+    }
+
+
+def resolved_runtime_cache_key(command: dict):
+    resolved = resolve_runtime_command(command)
+    selected_device = normalize_device(str(resolved.get("device") or "auto").strip() or "auto")
+    selected_compute_type = normalize_compute_type(
+        str(resolved.get("computeType") or "auto").strip() or "auto",
+        selected_device,
+    )
+    return cache_key(
+        str(resolved.get("model") or "base.en").strip() or "base.en",
+        str(resolved.get("modelDir") or "").strip(),
+        selected_device,
+        selected_compute_type,
+    )
+
+
 def load_model(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str):
     ensure_whisper_imported()
 
@@ -412,8 +457,9 @@ def runtime_payload(*, ok: bool = True, error: str = "") -> dict[str, str | bool
 
 
 def warm_runtime(command: dict) -> dict:
-    model_name = str(command.get("model") or "base.en").strip() or "base.en"
-    model_dir = str(command.get("modelDir") or "").strip()
+    resolved = resolve_runtime_command(command)
+    model_name = str(resolved.get("model") or "base.en").strip() or "base.en"
+    model_dir = str(resolved.get("modelDir") or "").strip()
     temp_path = ""
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
@@ -423,10 +469,10 @@ def warm_runtime(command: dict) -> dict:
             runtime, _transcript, _language = transcribe_with_runtime(
                 model_name,
                 model_dir,
-                str(command.get("device") or "auto").strip() or "auto",
-                str(command.get("computeType") or "auto").strip() or "auto",
+                str(resolved.get("device") or "auto").strip() or "auto",
+                str(resolved.get("computeType") or "auto").strip() or "auto",
                 temp_path,
-                str(command.get("initialPrompt") or "").strip(),
+                str(resolved.get("initialPrompt") or "").strip(),
             )
         set_active_runtime(runtime)
         return {
@@ -561,6 +607,12 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/runtime":
                 command = read_json_bytes(raw_body)
+                current = runtime_snapshot()
+                next_key = resolved_runtime_cache_key(command)
+                current_key = runtime_cache_key(current) if current else None
+                if current_key != next_key:
+                    clear_model_cache()
+                    set_active_runtime(None)
                 # Apply the requested runtime settings by warming with the new config
                 payload = warm_runtime(command)
                 payload["availableDevices"] = ["cpu", "cuda"] if cuda_device_count() > 0 else ["cpu"]

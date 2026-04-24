@@ -1,7 +1,37 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(find /home/okzea/gh/dictray/scripts/windows-* -type f)",
+      "Bash(wc:*)",
+      "Bash(node --check src/linux-ui-automation.mjs)",
+      "Bash(node --check src/linux-system-volume.mjs)",
+      "Bash(node --check src/ui-automation.mjs)",
+      "Bash(node --check src/system-volume.mjs)",
+      "Bash(node --check src/runtime-paths.mjs)",
+      "Bash(node --check src/config.mjs)",
+      "Bash(node --check src/ollama-client.mjs)",
+      "Bash(node --check src/rewrite-provider.mjs)",
+      "Bash(node --check src/speech-lexicon.mjs)",
+      "Bash(node --check src/speech-tools.mjs)",
+      "Bash(echo \"Session type: $XDG_SESSION_TYPE\")",
+      "Bash(echo \"Wayland: $WAYLAND_DISPLAY\")",
+      "Bash(echo \"Display: $DISPLAY\")",
+      "Bash(command -v python3)",
+      "Bash(command -v xdotool)",
+      "Bash(command -v ydotool)",
+      "Bash(command -v wtype)",
+      "Bash(command -v wpctl)",
+      "Bash(find . -name docker-compose*)",
+      "Bash(command -v nvidia-ctk)",
+      "Bash(rpm -q nvidia-container-toolkit)",
+      "Bash(docker info:*)",
+      "Bash(glib-compile-schemas:*)",
+      "Bash(node:*)",
+      "Bash(python3 -m json.tool)",
+      "Bash(/usr/bin/python -c \"import ctranslate2; print\\(''''CUDA:'''', ctranslate2.get_cuda_device_count\\(\\)\\)\")",
+      "Bash(pip list:*)",
+      "Bash(pip3 list:*)"
     ]
   }
 }

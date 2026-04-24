@@ -4,6 +4,9 @@ local/
 .runtime-helpers/
 .tmp/
 build/
+dist/
+.codex
+.omx/
 docker/stt/cache/*
 !docker/stt/cache/.gitkeep
 scripts/**/bin/
