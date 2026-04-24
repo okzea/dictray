@@ -140,6 +140,21 @@ async function buildSpeechChildEnv(baseEnv = process.env) {
   return env
 }
 
+function pythonSpawnInvocation(pythonBin, args = []) {
+  const command = expandHome(pythonBin)
+  const commandArgs = args.map((arg) => String(arg))
+  if (process.platform === 'darwin' && process.arch === 'arm64') {
+    return {
+      command: '/usr/bin/arch',
+      args: ['-arm64', command, ...commandArgs]
+    }
+  }
+  return {
+    command,
+    args: commandArgs
+  }
+}
+
 function escapeShellArg(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`
 }
@@ -292,9 +307,10 @@ class LocalSttWorkerClient {
       const workerScript = expandHome(this.workerScriptPath())
       await access(workerScript)
       const childEnv = await buildSpeechChildEnv(process.env)
+      const invocation = pythonSpawnInvocation(pythonBin, [workerScript])
 
       this.stderrLines = []
-      const child = spawn(pythonBin, [workerScript], {
+      const child = spawn(invocation.command, invocation.args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: false,
         env: childEnv
@@ -547,8 +563,9 @@ class LocalSttDaemonClient {
         ...process.env,
         STT_FFMPEG_BIN: ffmpegBin || process.env.STT_FFMPEG_BIN || 'ffmpeg'
       })
+      const invocation = pythonSpawnInvocation(pythonBin, [daemonScript, '--host', '127.0.0.1', '--port', String(port)])
       this.stderrLines = []
-      const child = spawn(pythonBin, [daemonScript, '--host', '127.0.0.1', '--port', String(port)], {
+      const child = spawn(invocation.command, invocation.args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: false,
         env: childEnv

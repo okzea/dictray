@@ -129,10 +129,12 @@ async function ensureManagedHttpStt(childEnv, healthUrl) {
 async function requestExistingTrayExit(childEnv) {
   log('Checking for an already running tray instance.')
   await run(process.execPath, ['tray/main.mjs', '--dictray-exit-existing'], {
-    env: {
-      ...childEnv,
-      DICTATION_TRAY_LINUX_HEADLESS: '1'
-    },
+    env: process.platform === 'linux'
+      ? {
+          ...childEnv,
+          DICTATION_TRAY_LINUX_HEADLESS: '1'
+        }
+      : childEnv,
     stdio: 'ignore'
   }).catch(() => {})
 
@@ -179,8 +181,8 @@ async function prepareStartupSttRuntime(config, childEnv) {
 }
 
 async function main() {
-  if (process.platform !== 'linux') {
-    throw new Error('This branch now supports Linux only.')
+  if (!['linux', 'darwin'].includes(process.platform)) {
+    throw new Error('This branch supports Linux and macOS.')
   }
 
   const dotnetHome = path.join(rootDir, '.dotnet-cli')
@@ -190,7 +192,7 @@ async function main() {
     ...process.env,
     DOTNET_CLI_HOME: dotnetHome,
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1',
-    DICTATION_TRAY_LINUX_HEADLESS: '1'
+    ...(process.platform === 'linux' ? { DICTATION_TRAY_LINUX_HEADLESS: '1' } : {})
   }
 
   let config = await loadConfig()

@@ -76,6 +76,18 @@ const LINUX_INPUT_SOURCE_COMMAND_PATH = path.join(LINUX_NATIVE_UI_DIR, 'input-so
 const LINUX_ONBOARDING_STATE_PATH = path.join(LINUX_NATIVE_UI_DIR, 'onboarding-state.json')
 const LINUX_ONBOARDING_COMMAND_PATH = path.join(LINUX_NATIVE_UI_DIR, 'onboarding-command.json')
 const LINUX_NATIVE_UI_POLL_INTERVAL_MS = 220
+const MACOS_MENU_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'DicTray', 'menu')
+const MACOS_MENU_STATE_PATH = path.join(MACOS_MENU_DIR, 'status.json')
+const MACOS_MENU_COMMAND_PATH = path.join(MACOS_MENU_DIR, 'command.json')
+const MACOS_MENU_HELPER = path.join(__dirname, '..', 'scripts', 'macos-menu-bar')
+const MACOS_ONBOARDING_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'DicTray', 'onboarding')
+const MACOS_ONBOARDING_STATE_PATH = path.join(MACOS_ONBOARDING_DIR, 'status.json')
+const MACOS_ONBOARDING_COMMAND_PATH = path.join(MACOS_ONBOARDING_DIR, 'command.json')
+const MACOS_ONBOARDING_HELPER = path.join(__dirname, '..', 'scripts', 'macos-onboarding')
+const MACOS_OVERLAY_DIR = path.join(os.homedir(), 'Library', 'Application Support', 'DicTray', 'overlay')
+const MACOS_OVERLAY_STATE_PATH = path.join(MACOS_OVERLAY_DIR, 'status.json')
+const MACOS_OVERLAY_HELPER = path.join(__dirname, '..', 'scripts', 'macos-voice-overlay')
+const MACOS_MENU_POLL_INTERVAL_MS = 500
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -110,8 +122,10 @@ const PROMPT_HOTKEY_PRESETS = [
   { value: 'CommandOrControl+Alt+Shift+O', label: 'Ctrl+Alt+Shift+O' }
 ]
 const HOTKEY_BRIDGE = String(process.env.DICTATION_TRAY_HOTKEY_HELPER || '').trim()
-  || resolveBundledHelperExecutable('windows-hotkey-hook', 'WindowsHotkeyHook.exe')
-  || path.join(__dirname, '..', 'scripts', 'windows-hotkey-hook', 'bin', 'Release', 'net10.0-windows', 'WindowsHotkeyHook.exe')
+  || (process.platform === 'darwin'
+    ? path.join(__dirname, '..', 'scripts', 'macos-hotkey-hook')
+    : resolveBundledHelperExecutable('windows-hotkey-hook', 'WindowsHotkeyHook.exe')
+      || path.join(__dirname, '..', 'scripts', 'windows-hotkey-hook', 'bin', 'Release', 'net10.0-windows', 'WindowsHotkeyHook.exe'))
 const ALLOWED_PERMISSIONS = new Set(['media', 'microphone'])
 const FORCE_ONBOARDING = /^(1|true|yes)$/i.test(String(process.env.DICTATION_TRAY_FORCE_ONBOARDING || '').trim())
 const STT_DEVICE_CPU = 'cpu'
@@ -191,6 +205,19 @@ let linuxNativeUiCommandWatcher = null
 let linuxNativeUiCommandProcessing = false
 let linuxOnboardingUiPending = false
 let linuxOnboardingUiError = ''
+let macosMenuProcess = null
+let macosMenuPollTimer = null
+let macosMenuCommandWatcher = null
+let macosMenuCommandProcessing = false
+let macosMenuBridgeEnabled = false
+let macosOnboardingProcess = null
+let macosOnboardingCommandWatcher = null
+let macosOnboardingCommandProcessing = false
+let macosOnboardingUiPending = false
+let macosOnboardingUiError = ''
+let macosOverlayProcess = null
+let macosOverlayEnabled = false
+let macosOverlayLastPayload = ''
 let trayHotkey = DEFAULT_HOTKEY
 let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
@@ -279,7 +306,8 @@ let onboardingState = {
 }
 
 const singleInstance = app.requestSingleInstanceLock()
-if (!singleInstance || REQUEST_EXIT_EXISTING_INSTANCE) {
+const shouldExitEarly = !singleInstance || REQUEST_EXIT_EXISTING_INSTANCE
+if (shouldExitEarly) {
   app.quit()
 }
 
@@ -429,7 +457,8 @@ function isActiveDictationPhase(value) {
   return GNOME_PANEL_ACTIVE_PHASES.has(String(value || 'idle').trim())
 }
 
-function buildGnomePanelMenu() {
+function buildGnomePanelMenu(options = {}) {
+  const useDuckingSlider = Boolean(options?.duckingSlider)
   const greetingMenuLabel = greetingLabel()
   const dailyCharacterLabel = `Keys Saved Today: ${formatCount(currentDailyCharacterCount())}`
   const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
@@ -533,7 +562,7 @@ function buildGnomePanelMenu() {
   const selectedInputDevice = selectedInputSource()
   const inputSourceMenu = [
     {
-      label: linuxNativeUtilityWindowsEnabled() ? 'Open Microphone Setup' : 'Open Live Preview',
+      label: inputSourcePrimaryActionLabel(),
       command: {
         action: 'open_input_preview'
       }
@@ -632,15 +661,27 @@ function buildGnomePanelMenu() {
         enabled: false
       }]
 
-  const duckingLevelMenu = DUCKING_LEVEL_OPTIONS.map((value) => ({
-    label: duckingLevelMenuLabel(value),
-    type: 'radio',
-    checked: duckingLevel === value,
-    command: {
-      action: 'set_ducking_level',
-      value
-    }
-  }))
+  const duckingLevelMenu = useDuckingSlider
+    ? [{
+        label: 'Ducking Level',
+        type: 'slider',
+        value: duckingLevel,
+        min: DUCKING_LEVEL_OPTIONS[0],
+        max: DUCKING_LEVEL_OPTIONS[DUCKING_LEVEL_OPTIONS.length - 1],
+        step: 0.1,
+        command: {
+          action: 'set_ducking_level'
+        }
+      }]
+    : DUCKING_LEVEL_OPTIONS.map((value) => ({
+        label: duckingLevelMenuLabel(value),
+        type: 'radio',
+        checked: duckingLevel === value,
+        command: {
+          action: 'set_ducking_level',
+          value
+        }
+      }))
 
   return [
     { label: greetingMenuLabel, enabled: false },
@@ -651,38 +692,6 @@ function buildGnomePanelMenu() {
       submenu: historyMenu
     },
     { type: 'separator' },
-    {
-      label: voiceState.phase === 'listening'
-        ? 'Stop Dictation'
-        : voiceState.phase === 'pending_insert'
-          ? 'Cancel Pending Insert'
-          : 'Start Dictation',
-      command: {
-        action: 'toggle'
-      }
-    },
-    {
-      label: 'Improve Text',
-      type: 'checkbox',
-      checked: rewriteEnabled,
-      command: {
-        action: 'set_rewrite_enabled',
-        value: !rewriteEnabled
-      }
-    },
-    {
-      label: 'Send Enter After Insert',
-      type: 'checkbox',
-      checked: pressEnterAfterInsert,
-      command: {
-        action: 'set_press_enter_after_insert',
-        value: !pressEnterAfterInsert
-      }
-    },
-    {
-      label: 'Text Improvement Provider',
-      submenu: rewriteProviderMenu
-    },
     {
       label: 'Output Ducking',
       submenu: [
@@ -703,18 +712,7 @@ function buildGnomePanelMenu() {
         ...duckingLevelMenu
       ]
     },
-    {
-      label: 'Text Improvement Model',
-      submenu: modelMenu
-    },
-    {
-      label: 'Text Improvement Thinking',
-      submenu: rewriteThinkMenu
-    },
-    {
-      label: 'Text Improvement Temperature',
-      submenu: rewriteTemperatureMenu
-    },
+    { type: 'separator' },
     {
       label: 'Input Source',
       submenu: inputSourceMenu
@@ -731,6 +729,35 @@ function buildGnomePanelMenu() {
       label: 'Speech to Text Template',
       submenu: sttPromptTemplateMenu
     },
+    { type: 'separator' },
+    {
+      label: 'Improve Text',
+      type: 'checkbox',
+      checked: rewriteEnabled,
+      command: {
+        action: 'set_rewrite_enabled',
+        value: !rewriteEnabled
+      }
+    },
+    ...(rewriteEnabled
+      ? [{
+          label: 'Text Improvement Provider',
+          submenu: rewriteProviderMenu
+        },
+        {
+          label: 'Text Improvement Model',
+          submenu: modelMenu
+        },
+        {
+          label: 'Text Improvement Thinking',
+          submenu: rewriteThinkMenu
+        },
+        {
+          label: 'Text Improvement Temperature',
+          submenu: rewriteTemperatureMenu
+        }]
+      : []),
+    { type: 'separator' },
     {
       label: 'Dictation Shortcut',
       submenu: hotkeyManagedByEnv()
@@ -794,7 +821,7 @@ function buildGnomePanelPayload() {
     error: compactText(voiceState?.error || '', 180),
     nativeOverlay: gnomeNativeOverlayActive(),
     inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
-    menu: buildGnomePanelMenu()
+    menu: buildGnomePanelMenu({ duckingSlider: true })
   }
 }
 
@@ -836,43 +863,7 @@ function scheduleGnomePanelStateSync(delayMs = 0) {
 
 let gnomePanelCommandProcessing = false
 
-async function processGnomePanelCommand() {
-  if (!gnomePanelBridgeEnabled || gnomePanelCommandProcessing) {
-    return
-  }
-  gnomePanelCommandProcessing = true
-  try {
-    await processGnomePanelCommandInner()
-  } finally {
-    gnomePanelCommandProcessing = false
-  }
-}
-
-async function processGnomePanelCommandInner() {
-  let rawCommand = ''
-  try {
-    rawCommand = await readFile(GNOME_PANEL_COMMAND_PATH, 'utf8')
-  } catch (error) {
-    if (error?.code !== 'ENOENT') {
-      console.error('[dictray] Failed to read GNOME panel command file:', error?.message || error)
-    }
-    return
-  }
-  if (!String(rawCommand || '').trim()) {
-    await unlink(GNOME_PANEL_COMMAND_PATH).catch(() => {})
-    return
-  }
-
-  // Delete before processing to avoid re-reading the same command
-  await unlink(GNOME_PANEL_COMMAND_PATH).catch(() => {})
-
-  let command = {}
-  try {
-    command = JSON.parse(String(rawCommand || '').trim())
-  } catch {
-    return
-  }
-
+async function handleExternalMenuCommand(command = {}) {
   const action = String(command?.action || '').trim()
 
   switch (action) {
@@ -966,6 +957,46 @@ async function processGnomePanelCommandInner() {
   }
 }
 
+async function processGnomePanelCommand() {
+  if (!gnomePanelBridgeEnabled || gnomePanelCommandProcessing) {
+    return
+  }
+  gnomePanelCommandProcessing = true
+  try {
+    await processGnomePanelCommandInner()
+  } finally {
+    gnomePanelCommandProcessing = false
+  }
+}
+
+async function processGnomePanelCommandInner() {
+  let rawCommand = ''
+  try {
+    rawCommand = await readFile(GNOME_PANEL_COMMAND_PATH, 'utf8')
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      console.error('[dictray] Failed to read GNOME panel command file:', error?.message || error)
+    }
+    return
+  }
+  if (!String(rawCommand || '').trim()) {
+    await unlink(GNOME_PANEL_COMMAND_PATH).catch(() => {})
+    return
+  }
+
+  // Delete before processing to avoid re-reading the same command
+  await unlink(GNOME_PANEL_COMMAND_PATH).catch(() => {})
+
+  let command = {}
+  try {
+    command = JSON.parse(String(rawCommand || '').trim())
+  } catch {
+    return
+  }
+
+  await handleExternalMenuCommand(command)
+}
+
 async function initGnomePanelBridge() {
   if (process.platform !== 'linux' || !isGnomeSession()) {
     return false
@@ -1019,6 +1050,199 @@ function stopGnomePanelBridge() {
 
   try {
     writeFileSync(GNOME_PANEL_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+}
+
+function buildMacosMenuPayload() {
+  const payload = buildGnomePanelPayload()
+  return {
+    ...payload,
+    platform: 'darwin',
+    menu: buildGnomePanelMenu({ duckingSlider: true })
+  }
+}
+
+async function syncMacosMenuState() {
+  if (!macosMenuBridgeEnabled) {
+    return
+  }
+  try {
+    await writeFile(MACOS_MENU_STATE_PATH, JSON.stringify(buildMacosMenuPayload()), { encoding: 'utf8' })
+  } catch (error) {
+    console.error('[dictray] Failed to sync macOS menu state:', error?.message || error)
+  }
+}
+
+async function processMacosMenuCommand() {
+  if (!macosMenuBridgeEnabled || macosMenuCommandProcessing) {
+    return
+  }
+  macosMenuCommandProcessing = true
+  try {
+    let rawCommand = ''
+    try {
+      rawCommand = await readFile(MACOS_MENU_COMMAND_PATH, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        console.error('[dictray] Failed to read macOS menu command file:', error?.message || error)
+      }
+      return
+    }
+    await unlink(MACOS_MENU_COMMAND_PATH).catch(() => {})
+    if (!String(rawCommand || '').trim()) {
+      return
+    }
+
+    let command = {}
+    try {
+      command = JSON.parse(String(rawCommand || '').trim())
+    } catch {
+      return
+    }
+    await handleExternalMenuCommand(command)
+  } finally {
+    macosMenuCommandProcessing = false
+  }
+}
+
+async function initMacosMenuBarBridge() {
+  if (process.platform !== 'darwin') {
+    return false
+  }
+
+  try {
+    await mkdir(MACOS_MENU_DIR, { recursive: true })
+    await mkdir(MACOS_ONBOARDING_DIR, { recursive: true })
+  } catch (error) {
+    console.error('[dictray] Failed to prepare macOS menu state directory:', error?.message || error)
+    return false
+  }
+
+  macosMenuBridgeEnabled = true
+  await syncMacosMenuState()
+  await syncMacosOnboardingState().catch(() => null)
+
+  if (!macosMenuProcess || macosMenuProcess.killed) {
+    try {
+      macosMenuProcess = spawn(MACOS_MENU_HELPER, [MACOS_MENU_STATE_PATH, MACOS_MENU_COMMAND_PATH], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        windowsHide: true
+      })
+      const stderr = readline.createInterface({ input: macosMenuProcess.stderr })
+      stderr.on('line', (line) => {
+        const message = String(line || '').trim()
+        if (message) {
+          console.error(`[dictray] macOS menu bar: ${message}`)
+        }
+      })
+      const helper = macosMenuProcess
+      helper.on('exit', (code) => {
+        if (macosMenuProcess === helper) {
+          macosMenuProcess = null
+        }
+        if (!isQuitting) {
+          console.error(`[dictray] macOS menu bar helper exited with code ${code ?? 0}.`)
+        }
+      })
+      helper.on('error', (error) => {
+        console.error('[dictray] Failed to start macOS menu bar helper:', error?.message || error)
+      })
+    } catch (error) {
+      console.error('[dictray] Failed to launch macOS menu bar helper:', error?.message || error)
+    }
+  }
+
+  if (!macosMenuPollTimer) {
+    macosMenuPollTimer = setInterval(() => {
+      void processMacosMenuCommand().catch(() => {})
+      void processMacosOnboardingCommand().catch(() => {})
+    }, MACOS_MENU_POLL_INTERVAL_MS)
+  }
+
+  if (!macosMenuCommandWatcher) {
+    try {
+      macosMenuCommandWatcher = fsWatch(MACOS_MENU_DIR, { persistent: false }, (_eventType, filename) => {
+        if (filename === path.basename(MACOS_MENU_COMMAND_PATH)) {
+          void processMacosMenuCommand().catch(() => {})
+        }
+      })
+      macosMenuCommandWatcher.on('error', () => {})
+    } catch {
+      macosMenuCommandWatcher = null
+    }
+  }
+
+  if (!macosOnboardingCommandWatcher) {
+    try {
+      macosOnboardingCommandWatcher = fsWatch(MACOS_ONBOARDING_DIR, { persistent: false }, (_eventType, filename) => {
+        if (filename === path.basename(MACOS_ONBOARDING_COMMAND_PATH)) {
+          void processMacosOnboardingCommand().catch(() => {})
+        }
+      })
+      macosOnboardingCommandWatcher.on('error', () => {})
+    } catch {
+      macosOnboardingCommandWatcher = null
+    }
+  }
+
+  return true
+}
+
+function stopMacosMenuBarBridge() {
+  if (macosMenuPollTimer) {
+    clearInterval(macosMenuPollTimer)
+    macosMenuPollTimer = null
+  }
+  if (macosMenuCommandWatcher) {
+    macosMenuCommandWatcher.close()
+    macosMenuCommandWatcher = null
+  }
+  if (macosOnboardingCommandWatcher) {
+    macosOnboardingCommandWatcher.close()
+    macosOnboardingCommandWatcher = null
+  }
+  if (macosMenuProcess && !macosMenuProcess.killed) {
+    try {
+      macosMenuProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  macosMenuProcess = null
+  if (macosOnboardingProcess && !macosOnboardingProcess.killed) {
+    try {
+      macosOnboardingProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  macosOnboardingProcess = null
+  if (macosOverlayProcess && !macosOverlayProcess.killed) {
+    try {
+      macosOverlayProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  macosOverlayProcess = null
+  macosOverlayEnabled = false
+  macosOverlayLastPayload = ''
+  macosMenuBridgeEnabled = false
+
+  try {
+    writeFileSync(MACOS_MENU_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+  try {
+    writeFileSync(MACOS_ONBOARDING_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+  try {
+    writeFileSync(MACOS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
   } catch {
     // best-effort — the process is exiting
   }
@@ -1173,7 +1397,7 @@ function normalizePromptHotkey(value) {
 
 function formatHotkey(value) {
   return String(value || DEFAULT_HOTKEY)
-    .replace(/CommandOrControl/g, process.platform === 'darwin' ? 'CmdOrCtrl' : 'Ctrl')
+    .replace(/CommandOrControl/g, 'Ctrl')
 }
 
 function normalizeRewriteThink(value) {
@@ -1275,6 +1499,13 @@ function inputSourceMenuLabel() {
 
   const activeLabel = compactText(inputDeviceState.activeLabel || '', 40)
   return activeLabel ? `System Default (${activeLabel})` : 'System Default'
+}
+
+function inputSourcePrimaryActionLabel() {
+  if (process.platform === 'darwin') {
+    return 'Refresh Microphones'
+  }
+  return linuxNativeUtilityWindowsEnabled() ? 'Open Microphone Setup' : 'Open Live Preview'
 }
 
 function normalizeSttDevicePreference(value) {
@@ -1900,6 +2131,7 @@ async function refreshVoiceOverlayFocusedBounds() {
         if (voiceWindow && !voiceWindow.isDestroyed() && voiceOverlayVisible()) {
           voiceWindow.setBounds(computeVoiceOverlayBounds(), false)
         }
+        void syncMacosOverlayState({ force: true })
       }
     } finally {
       voiceOverlayFocusedBoundsRefresh = null
@@ -1916,6 +2148,7 @@ function syncVoiceInputLevel(level = 0) {
   if (gnomeNativeOverlayActive()) {
     scheduleGnomePanelStateSync(GNOME_PANEL_LEVEL_SYNC_MS)
   }
+  void syncMacosOverlayState()
 
   if (!voiceWindow || voiceWindow.isDestroyed() || voiceWindow.webContents.isDestroyed()) {
     return
@@ -1927,6 +2160,13 @@ function syncVoiceInputLevel(level = 0) {
 }
 
 function syncVoiceOverlay() {
+  if (process.platform === 'darwin') {
+    clearVoiceOverlayHideTimer()
+    void refreshVoiceOverlayFocusedBounds()
+    void syncMacosOverlayState({ force: true })
+    return
+  }
+
   if (!voiceWindow || voiceWindow.isDestroyed()) {
     return
   }
@@ -1998,6 +2238,17 @@ function buildLinuxOnboardingState() {
   }
 }
 
+function buildMacosOnboardingState() {
+  return {
+    ...onboardingStatePayload(),
+    platform: 'darwin',
+    ui: {
+      pending: macosOnboardingUiPending,
+      error: macosOnboardingUiError
+    }
+  }
+}
+
 async function syncLinuxInputSourceState() {
   if (!linuxNativeUtilityWindowsEnabled()) {
     return
@@ -2010,6 +2261,89 @@ async function syncLinuxOnboardingState() {
     return
   }
   await writeJsonFile(LINUX_ONBOARDING_STATE_PATH, buildLinuxOnboardingState())
+}
+
+async function syncMacosOnboardingState() {
+  if (process.platform !== 'darwin') {
+    return
+  }
+  await writeJsonFile(MACOS_ONBOARDING_STATE_PATH, buildMacosOnboardingState())
+}
+
+function buildMacosOverlayPayload() {
+  const payload = buildVoiceOverlayPayload()
+  return {
+    ...payload,
+    platform: 'darwin',
+    inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
+    bounds: computeVoiceOverlayBounds(),
+    updatedAt: Date.now()
+  }
+}
+
+async function syncMacosOverlayState({ force = false } = {}) {
+  if (process.platform !== 'darwin' || !macosOverlayEnabled) {
+    return
+  }
+  const payload = buildMacosOverlayPayload()
+  const serialized = JSON.stringify(payload)
+  if (!force && serialized === macosOverlayLastPayload) {
+    return
+  }
+  macosOverlayLastPayload = serialized
+  try {
+    await writeFile(MACOS_OVERLAY_STATE_PATH, serialized, { encoding: 'utf8' })
+  } catch (error) {
+    console.error('[dictray] Failed to sync macOS overlay state:', error?.message || error)
+  }
+}
+
+async function initMacosVoiceOverlayBridge() {
+  if (process.platform !== 'darwin') {
+    return false
+  }
+  try {
+    await mkdir(MACOS_OVERLAY_DIR, { recursive: true })
+  } catch (error) {
+    console.error('[dictray] Failed to prepare macOS overlay state directory:', error?.message || error)
+    return false
+  }
+
+  macosOverlayEnabled = true
+  await syncMacosOverlayState({ force: true })
+  if (macosOverlayProcess && !macosOverlayProcess.killed) {
+    return true
+  }
+
+  try {
+    macosOverlayProcess = spawn(MACOS_OVERLAY_HELPER, [MACOS_OVERLAY_STATE_PATH], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true
+    })
+    const stderr = readline.createInterface({ input: macosOverlayProcess.stderr })
+    stderr.on('line', (line) => {
+      const message = String(line || '').trim()
+      if (message) {
+        console.error(`[dictray] macOS overlay: ${message}`)
+      }
+    })
+    const helper = macosOverlayProcess
+    helper.on('exit', (code) => {
+      if (macosOverlayProcess === helper) {
+        macosOverlayProcess = null
+      }
+      if (!isQuitting && code && code !== 0) {
+        console.error(`[dictray] macOS overlay helper exited with code ${code}.`)
+      }
+    })
+    helper.on('error', (error) => {
+      console.error('[dictray] Failed to start macOS overlay helper:', error?.message || error)
+    })
+  } catch (error) {
+    console.error('[dictray] Failed to launch macOS overlay helper:', error?.message || error)
+  }
+
+  return true
 }
 
 async function launchLinuxNativeInputSourceWindow() {
@@ -2025,6 +2359,40 @@ async function launchLinuxNativeOnboardingWindow() {
   await launchLinuxNativeUi('onboarding.mjs', {
     statePath: LINUX_ONBOARDING_STATE_PATH,
     commandPath: LINUX_ONBOARDING_COMMAND_PATH
+  })
+}
+
+async function launchMacosNativeOnboardingWindow() {
+  await mkdir(MACOS_ONBOARDING_DIR, { recursive: true })
+  await syncMacosOnboardingState()
+  if (macosOnboardingProcess && !macosOnboardingProcess.killed) {
+    return
+  }
+
+  macosOnboardingProcess = spawn(MACOS_ONBOARDING_HELPER, [MACOS_ONBOARDING_STATE_PATH, MACOS_ONBOARDING_COMMAND_PATH], {
+    stdio: ['ignore', 'ignore', 'pipe'],
+    windowsHide: true
+  })
+
+  const stderr = readline.createInterface({ input: macosOnboardingProcess.stderr })
+  stderr.on('line', (line) => {
+    const message = String(line || '').trim()
+    if (message) {
+      console.error(`[dictray] macOS Quick Start: ${message}`)
+    }
+  })
+
+  const helper = macosOnboardingProcess
+  helper.on('exit', (code) => {
+    if (macosOnboardingProcess === helper) {
+      macosOnboardingProcess = null
+    }
+    if (!isQuitting && code && code !== 0) {
+      console.error(`[dictray] macOS Quick Start helper exited with code ${code}.`)
+    }
+  })
+  helper.on('error', (error) => {
+    console.error('[dictray] Failed to start macOS Quick Start helper:', error?.message || error)
   })
 }
 
@@ -2059,6 +2427,43 @@ async function handleLinuxNativeOnboardingCommand(command = {}) {
     }
     default:
       return
+  }
+}
+
+async function handleMacosNativeOnboardingCommand(command = {}) {
+  switch (String(command?.action || '').trim()) {
+    case 'complete_onboarding': {
+      macosOnboardingUiPending = true
+      macosOnboardingUiError = ''
+      await syncMacosOnboardingState().catch(() => null)
+      try {
+        await completeOnboarding(command?.payload || {})
+      } catch (error) {
+        macosOnboardingUiError = compactText(error?.message || error || 'Failed to finish Quick Start.', 160)
+      } finally {
+        macosOnboardingUiPending = false
+        await syncMacosOnboardingState().catch(() => null)
+      }
+      return
+    }
+    default:
+      return
+  }
+}
+
+async function processMacosOnboardingCommand() {
+  if (process.platform !== 'darwin' || macosOnboardingCommandProcessing) {
+    return
+  }
+  macosOnboardingCommandProcessing = true
+  try {
+    const command = await readJsonFile(MACOS_ONBOARDING_COMMAND_PATH, null)
+    if (command && typeof command === 'object') {
+      await unlink(MACOS_ONBOARDING_COMMAND_PATH).catch(() => null)
+      await handleMacosNativeOnboardingCommand(command)
+    }
+  } finally {
+    macosOnboardingCommandProcessing = false
   }
 }
 
@@ -2597,6 +3002,11 @@ async function ensureVoiceWindow() {
   await syncCaptureBackendConfig({ refresh: true }).catch((error) => {
     console.error('[dictray] Failed to initialize native capture backend:', error?.message || error)
   })
+  if (process.platform === 'darwin') {
+    await initMacosVoiceOverlayBridge().catch((error) => {
+      console.error('[dictray] macOS overlay setup failed:', error?.message || error)
+    })
+  }
   return null
 }
 
@@ -2605,6 +3015,12 @@ async function ensureInputSourceWindow() {
 }
 
 async function openInputSourceWindow() {
+  if (process.platform === 'darwin') {
+    await refreshInputSources()
+    showNotification(APP_NAME, 'Microphone list refreshed from macOS audio devices.')
+    return null
+  }
+
   if (!linuxNativeUtilityWindowsEnabled()) {
     showNotification(APP_NAME, 'Microphone setup now requires the native GNOME utility window.')
     return null
@@ -2629,6 +3045,16 @@ async function openOnboardingWindow({ markSeen = false } = {}) {
     onboardingState.seenAt = new Date().toISOString()
     await saveOnboardingState().catch(() => null)
     rebuildMenu()
+  }
+
+  if (process.platform === 'darwin') {
+    try {
+      await launchMacosNativeOnboardingWindow()
+    } catch (error) {
+      console.error('[dictray] Failed to open native macOS Quick Start window:', error?.message || error)
+      showNotification(APP_NAME, compactText(error?.message || error || 'Failed to open Quick Start.', 180))
+    }
+    return null
   }
 
   if (!linuxNativeUtilityWindowsEnabled()) {
@@ -2741,7 +3167,9 @@ async function completeOnboarding(input = {}) {
   await refreshRuntimeState(false)
   rebuildMenu()
   linuxOnboardingUiError = ''
+  macosOnboardingUiError = ''
   await syncLinuxOnboardingState().catch(() => null)
+  await syncMacosOnboardingState().catch(() => null)
   return onboardingStatePayload()
 }
 
@@ -2758,6 +3186,7 @@ function updateVoiceState(patch = {}) {
   rebuildMenu()
   syncVoiceOverlay()
   scheduleGnomePanelStateSync()
+  void syncMacosMenuState()
 }
 
 function clearVoiceState(error = '') {
@@ -2984,7 +3413,7 @@ function rebuildMenu() {
   const selectedInputDevice = selectedInputSource()
   const inputSourceMenu = [
     {
-      label: linuxNativeUtilityWindowsEnabled() ? 'Open Microphone Setup' : 'Open Live Preview',
+      label: inputSourcePrimaryActionLabel(),
       click: () => {
         void openInputSourceWindow()
       }
@@ -3097,36 +3526,6 @@ function rebuildMenu() {
     },
     { type: 'separator' },
     {
-      label: voiceState.phase === 'listening'
-        ? 'Stop Dictation'
-        : voiceState.phase === 'pending_insert'
-          ? 'Cancel Pending Insert'
-          : 'Start Dictation',
-      click: () => {
-        void toggleDictationCapture()
-      }
-    },
-    {
-      label: 'Improve Text',
-      type: 'checkbox',
-      checked: rewriteEnabled,
-      click: (item) => {
-        void updateRewriteEnabled(Boolean(item.checked))
-      }
-    },
-    {
-      label: 'Send Enter After Insert',
-      type: 'checkbox',
-      checked: pressEnterAfterInsert,
-      click: (item) => {
-        void updatePressEnterAfterInsert(Boolean(item.checked))
-      }
-    },
-    {
-      label: 'Text Improvement Provider',
-      submenu: rewriteProviderMenu
-    },
-    {
       label: 'Output Ducking',
       submenu: [
         {
@@ -3145,18 +3544,7 @@ function rebuildMenu() {
         ...duckingLevelMenu
       ]
     },
-    {
-      label: 'Text Improvement Model',
-      submenu: modelMenu
-    },
-    {
-      label: 'Text Improvement Thinking',
-      submenu: rewriteThinkMenu
-    },
-    {
-      label: 'Text Improvement Temperature',
-      submenu: rewriteTemperatureMenu
-    },
+    { type: 'separator' },
     {
       label: 'Input Source',
       submenu: inputSourceMenu
@@ -3173,6 +3561,34 @@ function rebuildMenu() {
       label: 'Speech to Text Template',
       submenu: sttPromptTemplateMenu
     },
+    { type: 'separator' },
+    {
+      label: 'Improve Text',
+      type: 'checkbox',
+      checked: rewriteEnabled,
+      click: (item) => {
+        void updateRewriteEnabled(Boolean(item.checked))
+      }
+    },
+    ...(rewriteEnabled
+      ? [{
+          label: 'Text Improvement Provider',
+          submenu: rewriteProviderMenu
+        },
+        {
+          label: 'Text Improvement Model',
+          submenu: modelMenu
+        },
+        {
+          label: 'Text Improvement Thinking',
+          submenu: rewriteThinkMenu
+        },
+        {
+          label: 'Text Improvement Temperature',
+          submenu: rewriteTemperatureMenu
+        }]
+      : []),
+    { type: 'separator' },
     {
       label: 'Dictation Shortcut',
       submenu: hotkeyManagedByEnv()
@@ -3218,6 +3634,8 @@ function rebuildMenu() {
   tray.setContextMenu(menu)
   tray.setToolTip(`${APP_NAME} - ${phaseLabel().replace('State: ', '')}`)
   void syncGnomePanelState()
+  void syncMacosMenuState()
+  void syncMacosOnboardingState()
 }
 
 async function listRewriteModels() {
@@ -3322,7 +3740,7 @@ async function waitForPendingSttWarmup(signal = null) {
 }
 
 async function duckSystemVolumeForPushToTalk(force = false) {
-  if (!['win32', 'linux'].includes(process.platform) || !systemVolume || !duckingEnabled) {
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled) {
     return
   }
   if (volumeDuckState && !force) {
@@ -3362,7 +3780,7 @@ async function duckSystemVolumeForPushToTalk(force = false) {
 }
 
 async function restoreSystemVolumeAfterPushToTalk() {
-  if (!['win32', 'linux'].includes(process.platform) || !systemVolume || !volumeDuckState) {
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !volumeDuckState) {
     return
   }
 
@@ -3532,12 +3950,14 @@ async function refreshRuntimeState(notify = false) {
 
 async function updateRewriteEnabled(value) {
   if (Boolean(value) && rewriteProviderId() === 'none') {
-    rewriteEnabled = false
-    await saveTraySettings()
-    rebuildMenu()
-    showNotification(APP_NAME, 'Choose Text Improvement Provider > Ollama before turning on Improve Text.')
-    await refreshRuntimeState(false)
-    return
+    runtimeConfig.rewrite.provider = 'ollama'
+    rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
+    await writeSharedRewritePreferences({
+      provider: runtimeConfig.rewrite.provider,
+      think: currentRewriteThink,
+      model: currentRewriteModel,
+      temperature: currentRewriteTemperature
+    })
   }
 
   rewriteEnabled = Boolean(value)
@@ -4839,7 +5259,10 @@ function scheduleHotkeyBridgeRestart() {
 
 function startHotkeyBridge() {
   stopHotkeyBridge()
-  const bridge = spawn(HOTKEY_BRIDGE, [trayHotkey], {
+  const bridgeArgs = process.platform === 'darwin'
+    ? [trayHotkey, promptTrayHotkey]
+    : [trayHotkey]
+  const bridge = spawn(HOTKEY_BRIDGE, bridgeArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
   })
@@ -4856,6 +5279,16 @@ function startHotkeyBridge() {
       return
     }
     if (event === 'up') {
+      void stopDictationCapture()
+      return
+    }
+    if (event === 'prompt-down') {
+      void startDictationCapture({
+        pressEnterAfterInsert: true
+      })
+      return
+    }
+    if (event === 'prompt-up') {
       void stopDictationCapture()
     }
   })
@@ -4878,7 +5311,7 @@ function startHotkeyBridge() {
     console.error('[dictray] Failed to start hotkey bridge:', error)
     stopHotkeyBridge()
     registerPressOnlyHotkey()
-    showNotification(APP_NAME, 'Hold-to-talk bridge failed. Falling back to press-to-toggle.')
+    showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge failed. Falling back to press-to-toggle.`)
   })
 
   bridge.on('exit', (code) => {
@@ -4895,7 +5328,7 @@ function startHotkeyBridge() {
       return
     }
     registerPressOnlyHotkey()
-    showNotification(APP_NAME, 'Hold-to-talk bridge stopped. Falling back to press-to-toggle.')
+    showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge stopped. Falling back to press-to-toggle.`)
   })
 
   registerPromptShortcut()
@@ -4908,14 +5341,15 @@ async function registerHotkey() {
   }
 
   globalShortcut.unregisterAll()
-  if (process.platform === 'win32') {
+  if (process.platform === 'win32' || process.platform === 'darwin') {
     try {
       await access(HOTKEY_BRIDGE)
       startHotkeyBridge()
       return
     } catch {
-      console.error(`[dictray] Missing Windows hotkey helper: ${HOTKEY_BRIDGE}`)
-      showNotification(APP_NAME, 'Windows hotkey helper was not built. Falling back to press-to-toggle.')
+      const platformLabel = process.platform === 'darwin' ? 'macOS' : 'Windows'
+      console.error(`[dictray] Missing ${platformLabel} hotkey helper: ${HOTKEY_BRIDGE}`)
+      showNotification(APP_NAME, `${platformLabel} hotkey helper is missing. Falling back to press-to-toggle.`)
     }
   }
 
@@ -5290,6 +5724,7 @@ async function performQuitCleanup() {
   }
   stopGnomePanelBridge()
   stopLinuxNativeUiBridge()
+  stopMacosMenuBarBridge()
   clearSttKeepWarmTimer()
   stopHotkeyBridge()
   globalShortcut.unregisterAll()
@@ -5327,33 +5762,38 @@ app.on('before-quit', (event) => {
   })
 })
 
-app.whenReady().then(async () => {
-  installPermissionHandlers()
-  await bootstrap()
-  await setupLinuxProductIntegration().catch((error) => {
-    console.error('[dictray] Linux product setup failed:', error?.message || error)
-  })
-  await initGnomePanelBridge().catch(() => {})
-  await initLinuxNativeUiBridge().catch(() => {})
-  await createTray()
-  await ensureVoiceWindow()
-  await maybeShowOnboarding()
-  await scheduleSttWarmup({ notifyReady: true }).catch(() => null)
-  await refreshRuntimeState(false)
-  await registerHotkey()
+if (!shouldExitEarly) {
+  app.whenReady().then(async () => {
+    installPermissionHandlers()
+    await bootstrap()
+    await setupLinuxProductIntegration().catch((error) => {
+      console.error('[dictray] Linux product setup failed:', error?.message || error)
+    })
+    await initGnomePanelBridge().catch(() => {})
+    await initLinuxNativeUiBridge().catch(() => {})
+    await initMacosMenuBarBridge().catch((error) => {
+      console.error('[dictray] macOS menu bar setup failed:', error?.message || error)
+    })
+    await createTray()
+    await ensureVoiceWindow()
+    await maybeShowOnboarding()
+    await scheduleSttWarmup({ notifyReady: true }).catch(() => null)
+    await refreshRuntimeState(false)
+    await registerHotkey()
 
-  refreshTimer = setInterval(() => {
-    if (shouldSkipBackgroundRuntimeRefresh()) {
-      return
+    refreshTimer = setInterval(() => {
+      if (shouldSkipBackgroundRuntimeRefresh()) {
+        return
+      }
+      void refreshRuntimeState(false)
+    }, 15000)
+    startSttKeepWarmTimer()
+
+    if (rewriteEnabled) {
+      void warmSelectedModel().catch(() => {})
     }
-    void refreshRuntimeState(false)
-  }, 15000)
-  startSttKeepWarmTimer()
-
-  if (rewriteEnabled) {
-    void warmSelectedModel().catch(() => {})
-  }
-}).catch((error) => {
-  console.error('[dictray] Failed to start:', error)
-  app.quit()
-})
+  }).catch((error) => {
+    console.error('[dictray] Failed to start:', error)
+    app.quit()
+  })
+}

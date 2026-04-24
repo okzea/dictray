@@ -20,12 +20,14 @@ function spawnWithExit(command, args, env) {
   })
 }
 
-if (process.platform !== 'linux') {
-  console.error('[dictray] This branch now supports Linux only.')
+if (!['linux', 'darwin'].includes(process.platform)) {
+  console.error('[dictray] This branch supports Linux and macOS.')
   process.exit(1)
 }
 
-spawnWithExit(process.execPath, ['tray/main.mjs', ...process.argv.slice(2)], {
-  ...process.env,
-  DICTATION_TRAY_LINUX_HEADLESS: '1'
-})
+spawnWithExit(process.execPath, ['tray/main.mjs', ...process.argv.slice(2)], process.platform === 'linux'
+  ? {
+      ...process.env,
+      DICTATION_TRAY_LINUX_HEADLESS: '1'
+    }
+  : process.env)

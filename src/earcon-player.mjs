@@ -34,19 +34,28 @@ const EARCON_DEFINITIONS = {
 
 const PLAYER_CANDIDATES = [
   {
+    command: 'afplay',
+    platforms: ['darwin'],
+    args: (filePath) => [filePath]
+  },
+  {
     command: 'paplay',
+    platforms: ['linux'],
     args: (filePath) => ['--client-name=DicTray', filePath]
   },
   {
     command: 'pw-play',
+    platforms: ['linux'],
     args: (filePath) => [filePath]
   },
   {
     command: 'aplay',
+    platforms: ['linux'],
     args: (filePath) => ['-q', filePath]
   },
   {
     command: 'canberra-gtk-play',
+    platforms: ['linux'],
     args: (filePath) => ['-f', filePath]
   }
 ]
@@ -185,13 +194,16 @@ export function createEarconPlayer({ logger = null } = {}) {
     if (resolvedPlayer !== undefined) {
       return resolvedPlayer
     }
-    resolvedPlayer = PLAYER_CANDIDATES.find((candidate) => commandAvailable(candidate.command)) || null
+    resolvedPlayer = PLAYER_CANDIDATES.find((candidate) => {
+      return (!Array.isArray(candidate.platforms) || candidate.platforms.includes(process.platform))
+        && commandAvailable(candidate.command)
+    }) || null
     return resolvedPlayer
   }
 
   async function play(kind) {
     const normalizedKind = normalizeKind(kind)
-    if (!normalizedKind || process.platform !== 'linux') {
+    if (!normalizedKind || !['linux', 'darwin'].includes(process.platform)) {
       return { ok: false, skipped: true, reason: 'unsupported' }
     }
 

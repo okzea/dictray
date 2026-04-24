@@ -20,7 +20,10 @@ import {
 } from './capture-protocol.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DEFAULT_NATIVE_CAPTURE_HELPER = path.join(__dirname, 'native-capture-helper.mjs')
+const DEFAULT_NATIVE_CAPTURE_HELPER = path.join(
+  __dirname,
+  process.platform === 'darwin' ? 'macos-native-capture-helper.mjs' : 'native-capture-helper.mjs'
+)
 const NATIVE_CAPTURE_HELPER = String(process.env.DICTATION_TRAY_NATIVE_CAPTURE_HELPER || '').trim() || DEFAULT_NATIVE_CAPTURE_HELPER
 
 function errorMessage(error, fallback = 'Native capture helper failed.') {

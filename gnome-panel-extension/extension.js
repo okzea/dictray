@@ -11,6 +11,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 const EXTENSION_ID = 'dictray-gnome-panel@okzea';
 const PANEL_DIR = GLib.get_user_config_dir() + '/dictray/gnome-panel';
@@ -53,6 +54,31 @@ function compactText(value, limit = 72) {
 
 function clampUnitInterval(value) {
   return Math.max(0, Math.min(1, Number(value) || 0));
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, Number(value) || 0));
+}
+
+function normalizeSliderValue(value, min, max, step) {
+  const clamped = clampNumber(value, min, max);
+  const normalizedStep = Math.max(0.001, Number(step) || 0.1);
+  const steps = Math.round((clamped - min) / normalizedStep);
+  return clampNumber(min + (steps * normalizedStep), min, max);
+}
+
+function sliderUnitFromValue(value, min, max) {
+  if (max <= min)
+    return 0;
+  return clampUnitInterval((value - min) / (max - min));
+}
+
+function sliderValueFromUnit(unit, min, max, step) {
+  return normalizeSliderValue(min + (clampUnitInterval(unit) * (max - min)), min, max, step);
+}
+
+function sliderPercentLabel(value) {
+  return `${Math.round(clampUnitInterval(value) * 100)}%`;
 }
 
 function normalizeHotkeyToken(value) {
@@ -879,6 +905,9 @@ class DicTrayIndicator extends PanelMenu.Button {
     if (!item || item.type === 'separator')
       return new PopupMenu.PopupSeparatorMenuItem();
 
+    if (item.type === 'slider')
+      return this._createSliderMenuItem(item);
+
     if (Array.isArray(item.submenu)) {
       const submenu = new PopupMenu.PopupSubMenuMenuItem(String(item.label || '').trim() || 'Untitled');
       submenu.setSensitive(item.enabled !== false);
@@ -900,6 +929,73 @@ class DicTrayIndicator extends PanelMenu.Button {
         writeCommand(String(item.command.action || ''), item.command.value);
       });
     }
+
+    return menuItem;
+  }
+
+  _createSliderMenuItem(item) {
+    const min = Number.isFinite(Number(item.min)) ? Number(item.min) : 0;
+    const max = Number.isFinite(Number(item.max)) ? Number(item.max) : 1;
+    const step = Math.max(0.001, Number(item.step) || 0.1);
+    const value = normalizeSliderValue(item.value, min, max, step);
+    const menuItem = new PopupMenu.PopupBaseMenuItem({
+      activate: false,
+      can_focus: true,
+      reactive: item.enabled !== false,
+    });
+    menuItem.setSensitive(item.enabled !== false);
+
+    const wrapper = new St.BoxLayout({
+      vertical: true,
+      x_expand: true,
+    });
+    wrapper.style = 'min-width: 240px; padding: 2px 0;';
+
+    const header = new St.BoxLayout({
+      x_expand: true,
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    const title = new St.Label({
+      text: String(item.label || '').trim() || 'Level',
+      x_expand: true,
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    const valueLabel = new St.Label({
+      text: sliderPercentLabel(value),
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    valueLabel.style = 'font-feature-settings: "tnum"; color: #9aa0a6; margin-left: 12px;';
+    header.add_child(title);
+    header.add_child(valueLabel);
+
+    const slider = new Slider.Slider(sliderUnitFromValue(value, min, max));
+    slider.x_expand = true;
+    slider.reactive = item.enabled !== false;
+    wrapper.add_child(header);
+    wrapper.add_child(slider);
+    menuItem.add_child(wrapper);
+
+    let adjusting = false;
+    let lastWritten = value;
+    slider.connect('notify::value', () => {
+      if (adjusting)
+        return;
+
+      const nextValue = sliderValueFromUnit(slider.value, min, max, step);
+      valueLabel.text = sliderPercentLabel(nextValue);
+      const nextUnit = sliderUnitFromValue(nextValue, min, max);
+      if (Math.abs(nextUnit - slider.value) > 0.001) {
+        adjusting = true;
+        slider.value = nextUnit;
+        adjusting = false;
+      }
+
+      if (!item.command || item.enabled === false || Math.abs(nextValue - lastWritten) < 0.001)
+        return;
+
+      lastWritten = nextValue;
+      writeCommand(String(item.command.action || ''), nextValue);
+    });
 
     return menuItem;
   }
