@@ -1276,6 +1276,10 @@ export class SpeechTools {
 
   async transcribeViaLocal(audioBuffer, contentType, started, options = {}) {
     const stt = this.config.stt.local
+    const configuredTimeoutMs = Number(options?.timeoutMs ?? this.config?.stt?.timeoutMs)
+    const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
+      ? configuredTimeoutMs
+      : 120000
     try {
       const transcribeStarted = performance.now()
       const payload = await this.localSttDaemon().transcribe(audioBuffer, contentType, {
@@ -1286,7 +1290,7 @@ export class SpeechTools {
         initialPrompt: String(stt.initialPrompt || '').trim()
       }, {
         signal: options?.signal || null,
-        timeoutMs: 120000
+        timeoutMs
       })
 
       if (!payload?.ok) {
