@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import { existsSync, mkdirSync, readFileSync, readlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
@@ -144,6 +144,60 @@ function isLinuxHeadlessLockOwner(pid) {
   })
 }
 
+function readProcessOutput(command, args = []) {
+  try {
+    const result = spawnSync(command, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true
+    })
+    return result.status === 0 ? String(result.stdout || '').trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+function readMacosProcessCwd(pid) {
+  const output = readProcessOutput('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'])
+  const line = output.split('\n').find((entry) => entry.startsWith('n'))
+  return line ? line.slice(1).trim() : ''
+}
+
+function isDictrayMainScriptArg(value, cwd = '') {
+  const normalized = String(value || '').replace(/\\/g, '/')
+  if (normalized !== 'tray/main.mjs' && !normalized.endsWith('/tray/main.mjs')) {
+    return false
+  }
+  const expectedMain = path.join(projectRoot(), 'tray', 'main.mjs')
+  const resolved = path.isAbsolute(value)
+    ? path.resolve(value)
+    : cwd
+      ? path.resolve(cwd, value)
+      : ''
+  return resolved === expectedMain
+}
+
+function isMacosHeadlessLockOwner(pid) {
+  if (pid === process.pid) {
+    return true
+  }
+  if (process.platform !== 'darwin') {
+    return false
+  }
+
+  const command = readProcessOutput('ps', ['-p', String(pid), '-o', 'comm='])
+  if (path.basename(command).toLowerCase().includes('dictray')) {
+    return true
+  }
+
+  const args = readProcessOutput('ps', ['-p', String(pid), '-o', 'args='])
+  if (!args) {
+    return false
+  }
+  const cwd = readMacosProcessCwd(pid)
+  return args.split(/\s+/).some((part) => isDictrayMainScriptArg(part, cwd))
+}
+
 function acquireLinuxHeadlessLock({ requestExit = false } = {}) {
   const lockPath = linuxHeadlessLockPath()
   const existingPid = readLockedPid()
@@ -206,11 +260,13 @@ function readLockPid(lockPath) {
   }
 }
 
-function acquirePidLock(lockPath, { requestExit = false } = {}) {
+function acquirePidLock(lockPath, { requestExit = false, isLockOwner = () => false } = {}) {
   const existingPid = readLockPid(lockPath)
+  const existingPidRunning = isPidRunning(existingPid)
+  const existingLockOwner = existingPidRunning && isLockOwner(existingPid)
 
   if (requestExit) {
-    if (isPidRunning(existingPid)) {
+    if (existingLockOwner) {
       try {
         process.kill(existingPid, 'SIGTERM')
       } catch {
@@ -220,7 +276,7 @@ function acquirePidLock(lockPath, { requestExit = false } = {}) {
     return false
   }
 
-  if (isPidRunning(existingPid)) {
+  if (existingLockOwner) {
     return false
   }
 
@@ -465,7 +521,8 @@ function createMacosHeadlessApp() {
     setAppUserModelId() {},
     requestSingleInstanceLock() {
       return acquirePidLock(lockPath, {
-        requestExit: process.argv.includes('--dictray-exit-existing')
+        requestExit: process.argv.includes('--dictray-exit-existing'),
+        isLockOwner: isMacosHeadlessLockOwner
       })
     },
     whenReady() {
