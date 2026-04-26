@@ -4797,8 +4797,8 @@ async function insertText(text, windowContext, options = {}) {
     })
     const helperMs = Math.round(performance.now() - helperStartedAt)
     const actionDetail = result?.timings?.action || null
-    const clipboardPreserveSuccess = actionDetail?.clipboardPreserveSuccess
-    const clipboardPreserveError = actionDetail?.clipboardPreserveError
+    const clipboardPreserveSuccess = actionDetail?.clipboardPreserveSuccess ?? actionDetail?.clipboardRestoreSuccess
+    const clipboardPreserveError = actionDetail?.clipboardPreserveError ?? actionDetail?.clipboardRestoreError
     if (clipboardPreserveSuccess === false) {
       helperNote = `Paste attempted, but preserving the final text on the clipboard may have failed: ${String(clipboardPreserveError || 'Clipboard busy/unavailable').trim()}`
     }
@@ -4903,7 +4903,7 @@ function logDictationTiming(payload) {
       lines.push(`  ${formatTimingLine('focus', helperDetail.action?.focus || helperDetail.action?.focusWindow || 0, 40, 90).slice(2)}`)
       lines.push(`  ${formatTimingLine('clipboard set', helperDetail.action?.clipboardSet || 0, 30, 70).slice(2)}`)
       lines.push(`  ${formatTimingLine('paste', helperDetail.action?.paste || 0, 80, 140).slice(2)}`)
-      lines.push(`  ${formatTimingLine('clipboard preserve', helperDetail.action?.clipboardPreserve || 0, 50, 100).slice(2)}`)
+      lines.push(`  ${formatTimingLine('clipboard preserve', helperDetail.action?.clipboardPreserve ?? helperDetail.action?.clipboardRestore ?? 0, 50, 100).slice(2)}`)
     }
   }
 
