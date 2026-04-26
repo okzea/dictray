@@ -289,10 +289,10 @@ export class LinuxUiAutomationBridge {
         // serial (causes "No serial found for selection"). Use wl-copy instead.
         // wl-copy must stay alive to serve clipboard content on Wayland, so spawn
         // it detached. It exits automatically when another app takes the clipboard.
-        await spawnClipboardProvider('wl-copy', ['--', text], {
-          stdio: 'ignore',
+        await spawnClipboardProvider('wl-copy', [], {
+          stdio: ['pipe', 'ignore', 'ignore'],
           detached: true
-        })
+        }, text)
         await delay(50)
         await pasteWayland()
       } else {
