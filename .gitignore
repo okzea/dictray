@@ -11,6 +11,8 @@ docker/stt/cache/*
 !docker/stt/cache/.gitkeep
 scripts/**/bin/
 scripts/**/obj/
+__pycache__/
+*.py[cod]
 
 # Generated packages and logs
 *.app/

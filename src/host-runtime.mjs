@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { projectRoot } from './runtime-paths.mjs'
@@ -90,12 +90,68 @@ function readLockedPid() {
   }
 }
 
+function readLinuxProcessCommand(pid) {
+  try {
+    return String(readFileSync(`/proc/${pid}/cmdline`, 'utf8') || '')
+      .split('\0')
+      .map((part) => part.trim())
+      .filter(Boolean)
+  } catch {
+    return []
+  }
+}
+
+function readLinuxProcessCwd(pid) {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`)
+  } catch {
+    return ''
+  }
+}
+
+function isLinuxHeadlessLockOwner(pid) {
+  if (pid === process.pid) {
+    return true
+  }
+  if (process.platform !== 'linux') {
+    return false
+  }
+
+  const command = readLinuxProcessCommand(pid)
+  if (!command.length) {
+    return false
+  }
+
+  const executableName = path.basename(command[0]).toLowerCase()
+  if (executableName.includes('dictray')) {
+    return true
+  }
+
+  const rootDir = projectRoot()
+  const expectedMain = path.join(rootDir, 'tray', 'main.mjs')
+  const cwd = readLinuxProcessCwd(pid)
+  return command.some((part) => {
+    const normalized = String(part || '').replace(/\\/g, '/')
+    if (normalized !== 'tray/main.mjs' && !normalized.endsWith('/tray/main.mjs')) {
+      return false
+    }
+    const resolved = path.isAbsolute(part)
+      ? path.resolve(part)
+      : cwd
+        ? path.resolve(cwd, part)
+        : ''
+    return resolved === expectedMain
+  })
+}
+
 function acquireLinuxHeadlessLock({ requestExit = false } = {}) {
   const lockPath = linuxHeadlessLockPath()
   const existingPid = readLockedPid()
+  const existingPidRunning = isPidRunning(existingPid)
+  const existingLockOwner = existingPidRunning && isLinuxHeadlessLockOwner(existingPid)
 
   if (requestExit) {
-    if (isPidRunning(existingPid)) {
+    if (existingLockOwner) {
       try {
         process.kill(existingPid, 'SIGTERM')
       } catch {
@@ -105,7 +161,7 @@ function acquireLinuxHeadlessLock({ requestExit = false } = {}) {
     return false
   }
 
-  if (isPidRunning(existingPid)) {
+  if (existingLockOwner) {
     return false
   }
 
