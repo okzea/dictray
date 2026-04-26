@@ -143,12 +143,6 @@ async function buildSpeechChildEnv(baseEnv = process.env) {
 function pythonSpawnInvocation(pythonBin, args = []) {
   const command = expandHome(pythonBin)
   const commandArgs = args.map((arg) => String(arg))
-  if (process.platform === 'darwin' && process.arch === 'arm64') {
-    return {
-      command: '/usr/bin/arch',
-      args: ['-arm64', command, ...commandArgs]
-    }
-  }
   return {
     command,
     args: commandArgs

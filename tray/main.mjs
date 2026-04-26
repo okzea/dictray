@@ -701,6 +701,12 @@ function buildGnomePanelMenu(options = {}) {
     { label: greetingMenuLabel, enabled: false },
     { label: dailyTimeSavedLabel, enabled: false },
     {
+      label: isActiveDictationPhase(voiceState?.phase) ? 'Stop Dictation' : 'Start Dictation',
+      command: {
+        action: 'toggle'
+      }
+    },
+    {
       label: 'History',
       submenu: historyMenu
     },
