@@ -2413,6 +2413,9 @@ async function launchMacosNativeOnboardingWindow() {
     }
   })
   helper.on('error', (error) => {
+    if (macosOnboardingProcess === helper) {
+      macosOnboardingProcess = null
+    }
     console.error('[dictray] Failed to start macOS Quick Start helper:', error?.message || error)
   })
 }
