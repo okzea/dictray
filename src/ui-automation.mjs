@@ -8,6 +8,7 @@ import { LinuxUiAutomationBridge } from './linux-ui-automation.mjs'
 import { MacosUiAutomationBridge } from './macos-ui-automation.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const UI_AUTOMATION_REQUEST_TIMEOUT_MS = 15000
 const UI_AUTOMATION_HELPER = String(process.env.DICTATION_TRAY_UI_AUTOMATION_HELPER || '').trim()
   || resolveBundledHelperExecutable('windows-ui-automation', 'WindowsUiAutomation.exe')
   || path.join(
@@ -244,10 +245,23 @@ export class UiAutomationBridge {
   }
 
   failPending(error) {
-    for (const pending of this.pending.values()) {
+    for (const [id, pending] of Array.from(this.pending.entries())) {
+      this.clearPending(id, pending)
       pending.reject(error)
     }
-    this.pending.clear()
+  }
+
+  clearPending(id, pending = this.pending.get(id)) {
+    this.pending.delete(id)
+    if (!pending) {
+      return
+    }
+    if (pending.timer) {
+      clearTimeout(pending.timer)
+    }
+    if (pending.abortListener && pending.signal) {
+      pending.signal.removeEventListener('abort', pending.abortListener)
+    }
   }
 
   handleWorkerLine(line) {
@@ -267,10 +281,7 @@ export class UiAutomationBridge {
     if (!pending) {
       return
     }
-    this.pending.delete(id)
-    if (pending.abortListener && pending.signal) {
-      pending.signal.removeEventListener('abort', pending.abortListener)
-    }
+    this.clearPending(id, pending)
 
     const payload = response?.payload || {}
     if (response?.ok === false || payload?.ok === false) {
@@ -284,6 +295,9 @@ export class UiAutomationBridge {
     const signal = options?.signal || null
     const child = await this.ensureWorker()
     const id = `uia-${++this.nextRequestId}`
+    const requestTimeoutMs = Number(options?.timeoutMs) > 0
+      ? Number(options.timeoutMs)
+      : UI_AUTOMATION_REQUEST_TIMEOUT_MS
 
     return new Promise((resolve, reject) => {
       let abortListener = null
@@ -293,17 +307,23 @@ export class UiAutomationBridge {
           return
         }
         abortListener = () => {
-          this.pending.delete(id)
+          this.clearPending(id)
           reject(signal.reason instanceof Error ? signal.reason : createAbortError())
         }
         signal.addEventListener('abort', abortListener, { once: true })
       }
 
+      const timer = setTimeout(() => {
+        this.clearPending(id)
+        reject(new Error(`Timed out waiting for Windows UI automation ${String(command || 'health')} response.`))
+      }, requestTimeoutMs)
+
       this.pending.set(id, {
         resolve,
         reject,
         signal,
-        abortListener
+        abortListener,
+        timer
       })
 
       try {
@@ -313,10 +333,7 @@ export class UiAutomationBridge {
           payload: payload && Object.keys(payload).length ? payload : undefined
         })}\n`)
       } catch (error) {
-        this.pending.delete(id)
-        if (abortListener && signal) {
-          signal.removeEventListener('abort', abortListener)
-        }
+        this.clearPending(id)
         reject(error)
       }
     })
