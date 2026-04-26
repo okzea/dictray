@@ -3212,10 +3212,7 @@ async function completeOnboarding(input = {}) {
     selectedPromptContext: sttPromptContext
   }
   applySttPromptTemplateToConfig(sttPreferences.selectedTemplate || defaultSttPromptTemplate())
-  speech = createSttProvider({
-    ...runtimeConfig.stt,
-    rootDir: runtimeConfig.rootDir
-  }, stateDir)
+  await replaceSpeechProvider(runtimeConfig.stt)
   sttReadyForDictation = false
 
   if (!hotkeyManagedByEnv()) {
@@ -5703,6 +5700,21 @@ function applyStatePaths(config) {
   diagnosticsLogPath = path.join(stateDir, 'dictation-tray-debug.log')
 }
 
+async function replaceSpeechProvider(sttConfig) {
+  const previousSpeech = speech
+  if (previousSpeech) {
+    await previousSpeech.dispose().catch((error) => {
+      void appendDiagnosticsLog('stt-provider-dispose-error', {
+        error: String(error?.message || error || 'Failed to dispose STT provider.')
+      })
+    })
+  }
+  speech = createSttProvider({
+    ...sttConfig,
+    rootDir: runtimeConfig.rootDir
+  }, stateDir)
+}
+
 async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = {}) {
   runtimeConfig = nextConfig
   applyStatePaths(runtimeConfig)
@@ -5732,10 +5744,7 @@ async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = 
     await loadTraySettings()
   }
 
-  speech = createSttProvider({
-    ...runtimeConfig.stt,
-    rootDir: runtimeConfig.rootDir
-  }, stateDir)
+  await replaceSpeechProvider(runtimeConfig.stt)
   await applySharedSpeechPreferencesOnStartup().catch(() => null)
   rewriteProvider = createRewriteProvider(runtimeConfig.rewrite)
   await ensureCaptureBackend()

@@ -93,6 +93,17 @@ function resolvePathLike(rootDir, value) {
   return text
 }
 
+function resolveStateDir(rootDir, value) {
+  const text = String(value || '').trim()
+  if (!text) {
+    return path.resolve(rootDir, DEFAULTS.memory.stateDir)
+  }
+  if (path.isAbsolute(text)) {
+    return text
+  }
+  return path.resolve(rootDir, text)
+}
+
 function preferBundledPython(value) {
   const normalized = String(value || '').trim().toLowerCase()
   return !normalized || normalized === 'python' || normalized === 'python3'
@@ -183,6 +194,7 @@ export async function loadConfig(configPathArg) {
   const envSttProvider = String(process.env.DICTATION_TRAY_STT_PROVIDER || '').trim()
   const envCaptureBackend = String(process.env.DICTATION_TRAY_CAPTURE_BACKEND || '').trim()
   const envFfmpegBin = String(process.env.DICTATION_TRAY_FFMPEG_BIN || process.env.STT_FFMPEG_BIN || '').trim()
+  const envStateDir = String(process.env.DICTATION_TRAY_STATE_DIR || '').trim()
 
   const sttProvider = normalizeSttProviderId(envSttProvider || parsedStt?.provider || parsedLegacyStt?.provider || DEFAULTS.stt.provider)
   const parsedLocalPythonBin = parsedStt?.local?.pythonBin ?? parsedLegacyStt?.local?.pythonBin
@@ -236,7 +248,9 @@ export async function loadConfig(configPathArg) {
     configPath,
     rootDir,
     memory: {
-      stateDir: path.resolve(process.env.DICTATION_TRAY_STATE_DIR || parsed?.memory?.stateDir || DEFAULTS.memory.stateDir)
+      stateDir: envStateDir
+        ? path.resolve(envStateDir)
+        : resolveStateDir(rootDir, parsed?.memory?.stateDir || DEFAULTS.memory.stateDir)
     },
     capture: {
       backend: normalizeCaptureBackendId(envCaptureBackend || parsedCapture?.backend || DEFAULTS.capture.backend)
