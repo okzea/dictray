@@ -2,6 +2,7 @@ export const STT_PROMPT_TEMPLATE_OFF = 'off'
 export const STT_PROMPT_TEMPLATE_CODER_WEB = 'coder-web'
 
 const DEFAULT_STT_PROMPT_TEMPLATE = STT_PROMPT_TEMPLATE_CODER_WEB
+const STT_PROMPT_CONTEXT_LIMIT = 1200
 
 const BUILTIN_STT_PROMPT_TEMPLATES = [
   {
@@ -53,4 +54,31 @@ export function sttPromptTemplateMenuLabel(value) {
 
 export function sttPromptTextForTemplate(value) {
   return templateById(value)?.prompt || ''
+}
+
+export function normalizeSttPromptContext(value) {
+  const normalized = String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+    .join('\n')
+  return normalized.length > STT_PROMPT_CONTEXT_LIMIT
+    ? normalized.slice(0, STT_PROMPT_CONTEXT_LIMIT).trim()
+    : normalized
+}
+
+export function sttPromptTextForPreferences(templateId, promptContext = '') {
+  const basePrompt = sttPromptTextForTemplate(templateId)
+  const context = normalizeSttPromptContext(promptContext)
+  if (!context) {
+    return basePrompt
+  }
+  return [
+    basePrompt,
+    [
+      'Additional speaker context and vocabulary:',
+      context
+    ].join('\n')
+  ].filter(Boolean).join('\n\n')
 }

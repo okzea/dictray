@@ -1,6 +1,12 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/dictray-logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/brand/dictray-logo-light.png">
+  <img alt="DicTray logo" src="assets/brand/dictray-logo-light.png" width="96">
+</picture>
+
 # DicTray
 
-DicTray is a standalone Windows tray app for fast local dictation.
+DicTray is a standalone tray/menu-bar app for fast local dictation on Linux and macOS, with Windows helper code still kept in the repo.
 
 It is meant to stay small:
 
@@ -15,18 +21,23 @@ It is meant to stay small:
 
 Install dependencies:
 
-```powershell
-cd C:\Users\okzea\Documents\dictray
+```bash
 pnpm install
+```
+
+macOS also needs `ffmpeg` for AVFoundation microphone capture:
+
+```bash
+brew install ffmpeg
 ```
 
 Do everything in one command:
 
-```powershell
+```bash
 pnpm start
 ```
 
-That flow builds the Windows helpers, auto-prepares the local Faster-Whisper runtime when needed, warms the direct local STT path, and then launches the tray.
+That flow auto-prepares the local Faster-Whisper runtime when needed, warms the direct local STT path, exits any existing DicTray instance, and launches the tray/menu-bar process.
 
 Prepare a bundle-ready private runtime:
 
@@ -36,23 +47,19 @@ pnpm bundle:runtime
 
 That stages a private STT runtime under `build/bundled-runtime/` and publishes the Windows helper executables there. When packaged resources or a local staged runtime are present, DicTray automatically prefers those bundled assets over the user's global `python`.
 
-Build an unpacked Windows app:
-
-```powershell
-pnpm pack:win
-```
-
-Build Windows distributables:
-
-```powershell
-pnpm dist:win
-```
-
 Build Linux distributables:
 
 ```bash
 pnpm dist:linux
 ```
+
+Build a macOS `.dmg` with bundled Node, ffmpeg, Swift helpers, and the local STT runtime:
+
+```bash
+pnpm dist:mac
+```
+
+The macOS builder copies `ffmpeg` and its non-system dylibs into `DicTray.app/Contents/Resources/runtime/ffmpeg`. It resolves `ffmpeg` from `DICTATION_TRAY_BUNDLE_FFMPEG`, `DICTATION_TRAY_CAPTURE_FFMPEG_BIN`, `STT_FFMPEG_BIN`, or `ffmpeg` on `PATH`.
 
 Build the Windows helpers:
 
@@ -64,14 +71,14 @@ dotnet build scripts\windows-system-volume\WindowsSystemVolume.csproj -c Release
 
 Run the tray:
 
-```powershell
-npm.cmd run tray
+```bash
+pnpm tray
 ```
 
 Run syntax checks:
 
-```powershell
-npm.cmd run check
+```bash
+pnpm check
 ```
 
 Regenerate the app icon assets from the SVG source:
@@ -79,6 +86,8 @@ Regenerate the app icon assets from the SVG source:
 ```powershell
 pnpm icon:export
 ```
+
+The brand mark variants live under `assets/brand/`: `dictray-logo-dark.*` is white for dark surfaces, `dictray-logo-light.*` is black for light surfaces, `dictray-logo-active.*` is green for active states, and `dictray-logo-template.png` is used where the OS handles menu-bar tinting.
 
 The Windows tray uses the generated `assets/app-icon.ico`.
 
@@ -164,9 +173,9 @@ If you want to take this further, keep adding aliases that sound like plain spok
 
 ## Config
 
-Default config path:
+Default config path in development:
 
-`C:\Users\okzea\Documents\dictray\dictation-tray.config.json`
+`./dictation-tray.config.json`
 
 You can override it with:
 
@@ -190,7 +199,7 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 
 - Default shortcut is `Ctrl+Space`.
 - Push-to-talk plays a short start chime when recording begins and an end chime when capture stops.
-- While push-to-talk is actively recording, Windows output volume can be ducked and then restored to the exact prior level when capture stops.
+- While push-to-talk is actively recording, output volume can be ducked and then restored to the exact prior level when capture stops.
 - Ducking defaults to enabled at `30%`, and you can change or disable it from the tray or via `dictation.duckingEnabled` / `dictation.duckingLevel` in config.
 - The default config uses `stt.provider = local` with `scripts/faster_whisper_cli.py`.
 - The default config keeps `rewrite.provider = none`, so DicTray does not depend on Ollama unless you explicitly turn on cleanup.
@@ -200,10 +209,12 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 - Packaged builds that include a bundled STT runtime automatically prefer `stt.provider = local` unless you explicitly override `DICTATION_TRAY_STT_PROVIDER`.
 - STT now sends a background keep-warm ping every `900000` ms by default (`15` minutes). Set `stt.keepWarmIntervalMs` to change it, or `0` to disable it.
 - This repo does not include TTS at all.
-- STT device/model changes can be changed live from the tray or GNOME panel when the active STT provider supports runtime preferences.
+- STT device/model changes can be changed live from the tray, macOS menu bar, or GNOME panel when the active STT provider supports runtime preferences.
 - For local STT, the tray reports the active device/model in the status line.
 - Rewrite model selection is currently available for the optional Ollama provider only.
 - If focused-window paste fails, the final text is copied to the clipboard as a fallback.
+- macOS uses small native Swift helpers for the menu bar, Quick Start window, floating voice overlay, and focused-app paste, plus `pbcopy` for clipboard staging and `ffmpeg -f avfoundation` for microphone capture. Packaged builds use a DicTray-branded accessibility helper for global hotkeys and paste automation.
+- On macOS, grant Accessibility permission when prompted so DicTray can control the focused app. If paste or the hotkey is blocked, open System Settings > Privacy & Security > Accessibility and enable DicTray. Grant Microphone permission to DicTray when macOS prompts for capture.
 - GNOME (Linux) can show DicTray in the top bar using the companion extension under `gnome-panel-extension/`.
 - On GNOME Linux, DicTray now defaults to the native capture backend, uses the Shell extension for the fixed dictation overlay, and opens microphone setup / Quick Start as native GTK utilities.
 - Packaged Linux builds are now pure Node bundles under `dist/DicTray-linux-x64/`, install a product-managed GNOME extension payload and autostart entry on first launch, and let the extension launch DicTray if the app is not already running.

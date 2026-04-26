@@ -180,6 +180,7 @@ export async function loadConfig(configPathArg) {
   const bundledStt = resolveBundledSttConfig()
   const envSttProvider = String(process.env.DICTATION_TRAY_STT_PROVIDER || '').trim()
   const envCaptureBackend = String(process.env.DICTATION_TRAY_CAPTURE_BACKEND || '').trim()
+  const envFfmpegBin = String(process.env.DICTATION_TRAY_FFMPEG_BIN || process.env.STT_FFMPEG_BIN || '').trim()
 
   const sttProvider = normalizeSttProviderId(envSttProvider || parsedStt?.provider || parsedLegacyStt?.provider || DEFAULTS.stt.provider)
   const parsedLocalPythonBin = parsedStt?.local?.pythonBin ?? parsedLegacyStt?.local?.pythonBin
@@ -203,7 +204,7 @@ export async function loadConfig(configPathArg) {
       pythonBin: bundledStt?.pythonBin && preferBundledPython(parsedLocalPythonBin)
         ? bundledStt.pythonBin
         : String(parsedLocalPythonBin || DEFAULTS.stt.local.pythonBin),
-      ffmpegBin: String(parsedStt?.local?.ffmpegBin || parsedLegacyStt?.local?.ffmpegBin || DEFAULTS.stt.local.ffmpegBin),
+      ffmpegBin: String(envFfmpegBin || parsedStt?.local?.ffmpegBin || parsedLegacyStt?.local?.ffmpegBin || DEFAULTS.stt.local.ffmpegBin),
       transcribeScript: bundledStt?.transcribeScript && preferBundledTranscribeScript(parsedLocalTranscribeScript, DEFAULTS.stt.local.transcribeScript)
         ? bundledStt.transcribeScript
         : resolvePathLike(rootDir, parsedLocalTranscribeScript || DEFAULTS.stt.local.transcribeScript),

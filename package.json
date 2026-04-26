@@ -11,6 +11,8 @@
     "bundle:runtime": "node scripts/prepare-bundled-runtime.mjs",
     "pack:linux": "node scripts/build-linux-package.mjs --dir",
     "dist:linux": "node scripts/build-linux-package.mjs --archive",
+    "pack:mac": "node scripts/build-macos-dmg.mjs --dir",
+    "dist:mac": "node scripts/build-macos-dmg.mjs --dmg",
     "icon:export": "node scripts/export-icon.mjs assets/app-icon.svg assets/app-icon.png assets/app-icon.ico",
     "gnome:reload": "node scripts/reload-gnome-extension.mjs",
     "start": "node scripts/start.mjs",
@@ -18,7 +20,7 @@
     "smoke:two-turns": "node scripts/smoke-two-turns.mjs",
     "tray": "node scripts/run-tray.mjs",
     "tray:dev": "node --watch scripts/run-tray.mjs",
-    "check": "node --check src/capture-bridge.mjs && node --check src/capture-protocol.mjs && node --check src/config.mjs && node --check src/earcon-player.mjs && node --check src/host-runtime.mjs && node --check src/linux-native-ui.mjs && node --check src/linux-product-integration.mjs && node --check src/native-capture-helper.mjs && node --check src/ollama-client.mjs && node --check src/rewrite-provider.mjs && node --check src/runtime-paths.mjs && node --check src/speech-lexicon.mjs && node --check src/speech-tools.mjs && node --check src/stt-provider.mjs && node --check src/system-volume.mjs && node --check src/ui-automation.mjs && node --check scripts/build-linux-package.mjs && node --check scripts/export-icon.mjs && node --check scripts/prepare-bundled-runtime.mjs && node --check scripts/reload-gnome-extension.mjs && node --check scripts/run-tray.mjs && node --check scripts/smoke-two-turns.mjs && node --check scripts/start.mjs && node --check scripts/start-onboarding.mjs && node --check scripts/stt-runtime-bootstrap.mjs && node --check tray/main.mjs && node --check gnome-panel-extension/extension.js && gjs -m linux-native-ui/input-source.mjs --self-test && gjs -m linux-native-ui/onboarding.mjs --self-test",
+    "check": "node scripts/check.mjs",
     "build:helpers": "dotnet build scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj -c Release && dotnet build scripts/windows-ui-automation/WindowsUiAutomation.csproj -c Release && dotnet build scripts/windows-system-volume/WindowsSystemVolume.csproj -c Release",
     "tray:linux-headless": "DICTATION_TRAY_LINUX_HEADLESS=1 node tray/main.mjs"
   }

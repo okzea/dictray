@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { resolveBundledHelperExecutable } from './runtime-paths.mjs'
 import { LinuxSystemVolumeBridge } from './linux-system-volume.mjs'
+import { MacosSystemVolumeBridge } from './macos-system-volume.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SYSTEM_VOLUME_HELPER = String(process.env.DICTATION_TRAY_VOLUME_HELPER || '').trim()
@@ -24,11 +25,15 @@ export class SystemVolumeBridge {
     this.helperAvailable = false
     this.warningShown = false
     this._linuxBridge = process.platform === 'linux' ? new LinuxSystemVolumeBridge() : null
+    this._macosBridge = process.platform === 'darwin' ? new MacosSystemVolumeBridge() : null
   }
 
   async checkHealth() {
     if (this._linuxBridge) {
       return this._linuxBridge.checkHealth()
+    }
+    if (this._macosBridge) {
+      return this._macosBridge.checkHealth()
     }
     if (process.platform !== 'win32') {
       return {
@@ -72,6 +77,9 @@ export class SystemVolumeBridge {
     if (this._linuxBridge) {
       return this._linuxBridge.getState()
     }
+    if (this._macosBridge) {
+      return this._macosBridge.getState()
+    }
     await this.requireHelper()
     return this.run('state')
   }
@@ -79,6 +87,9 @@ export class SystemVolumeBridge {
   async setState(input = {}) {
     if (this._linuxBridge) {
       return this._linuxBridge.setState(input)
+    }
+    if (this._macosBridge) {
+      return this._macosBridge.setState(input)
     }
     await this.requireHelper()
     return this.run('set', input)
@@ -108,6 +119,9 @@ export class SystemVolumeBridge {
 
   async requireHelper() {
     if (this._linuxBridge) {
+      return
+    }
+    if (this._macosBridge) {
       return
     }
     if (process.platform !== 'win32') {

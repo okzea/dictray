@@ -11,6 +11,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as Slider from 'resource:///org/gnome/shell/ui/slider.js';
 
 const EXTENSION_ID = 'dictray-gnome-panel@okzea';
 const PANEL_DIR = GLib.get_user_config_dir() + '/dictray/gnome-panel';
@@ -53,6 +54,31 @@ function compactText(value, limit = 72) {
 
 function clampUnitInterval(value) {
   return Math.max(0, Math.min(1, Number(value) || 0));
+}
+
+function clampNumber(value, min, max) {
+  return Math.max(min, Math.min(max, Number(value) || 0));
+}
+
+function normalizeSliderValue(value, min, max, step) {
+  const clamped = clampNumber(value, min, max);
+  const normalizedStep = Math.max(0.001, Number(step) || 0.1);
+  const steps = Math.round((clamped - min) / normalizedStep);
+  return clampNumber(min + (steps * normalizedStep), min, max);
+}
+
+function sliderUnitFromValue(value, min, max) {
+  if (max <= min)
+    return 0;
+  return clampUnitInterval((value - min) / (max - min));
+}
+
+function sliderValueFromUnit(unit, min, max, step) {
+  return normalizeSliderValue(min + (clampUnitInterval(unit) * (max - min)), min, max, step);
+}
+
+function sliderPercentLabel(value) {
+  return `${Math.round(clampUnitInterval(value) * 100)}%`;
 }
 
 function normalizeHotkeyToken(value) {
@@ -145,9 +171,9 @@ function buildOverlayCopy(state = {}) {
       };
     case 'processing':
       return {
-        chip: 'Processing',
+        chip: 'Listening',
         meta,
-        headline: 'Finishing capture',
+        headline: 'Release when you are done',
         subline: targetWindow || 'Current window'
       };
     case 'transcribing':
@@ -748,17 +774,20 @@ function writeFocusedWindowGeometry() {
 
 const DicTrayIndicator = GObject.registerClass(
 class DicTrayIndicator extends PanelMenu.Button {
-  constructor() {
+  constructor(extensionPath = '') {
     super(0.5, 'DicTray');
     this._state = null;
     this._menuSignature = '';
     this._overlay = new DicTrayOverlay();
+    this._logoReadyGicon = null;
+    this._logoActiveGicon = null;
 
     const box = new St.BoxLayout({
       x_expand: false,
       y_expand: false,
       y_align: Clutter.ActorAlign.CENTER,
     });
+    this._logo = this._createLogoIcon(extensionPath);
     this._statusDot = new St.Label({
       text: '○',
       y_align: Clutter.ActorAlign.CENTER,
@@ -769,7 +798,11 @@ class DicTrayIndicator extends PanelMenu.Button {
       style_class: 'dictray-panel-label',
     });
     this._statusDot.style = 'margin-right: 4px; color: #9aa0a6;';
-    box.add_child(this._statusDot);
+    if (this._logo) {
+      box.add_child(this._logo);
+    } else {
+      box.add_child(this._statusDot);
+    }
     box.add_child(this._title);
     this.add_child(box);
     this.menu._boxPointer?.setSourceAlignment?.(0.5);
@@ -786,6 +819,53 @@ class DicTrayIndicator extends PanelMenu.Button {
     });
 
     this._applyMissingState();
+  }
+
+  _createLogoIcon(extensionPath) {
+    const readyLogoPath = GLib.build_filenamev([
+      String(extensionPath || '').trim(),
+      'icons',
+      'dictray-logo-symbolic.png',
+    ]);
+    const activeLogoPath = GLib.build_filenamev([
+      String(extensionPath || '').trim(),
+      'icons',
+      'dictray-logo-active-symbolic.png',
+    ]);
+    if (!readyLogoPath || !GLib.file_test(readyLogoPath, GLib.FileTest.EXISTS))
+      return null;
+
+    this._logoReadyGicon = Gio.icon_new_for_string(readyLogoPath);
+    this._logoActiveGicon = GLib.file_test(activeLogoPath, GLib.FileTest.EXISTS)
+      ? Gio.icon_new_for_string(activeLogoPath)
+      : this._logoReadyGicon;
+
+    const icon = new St.Icon({
+      gicon: this._logoReadyGicon,
+      icon_size: 18,
+      y_align: Clutter.ActorAlign.CENTER,
+      style_class: 'system-status-icon',
+    });
+    icon.style = 'margin-right: 0; color: #e8eaed;';
+    return icon;
+  }
+
+  _applyIndicatorVisual(phase) {
+    const dictating = ACTIVE_PHASES.has(String(phase || '').trim());
+    if (this._logo) {
+      this._logo.gicon = dictating ? this._logoActiveGicon : this._logoReadyGicon;
+      this._logo.style = dictating
+        ? 'margin-right: 0; color: #7ee787;'
+        : 'margin-right: 0; color: #e8eaed;';
+      this._title.text = '';
+      return;
+    }
+
+    this._statusDot.text = dictating ? '●' : '○';
+    this._statusDot.style = dictating
+      ? 'margin-right: 4px; color: #7ee787;'
+      : 'margin-right: 4px; color: #9aa0a6;';
+    this._title.text = ' DicTray';
   }
 
   _processCommand() {
@@ -824,21 +904,14 @@ class DicTrayIndicator extends PanelMenu.Button {
     this._state = next;
     syncRuntimeKeybindings(next);
     const phase = String(next.phase || '').trim() || 'idle';
-    const dictating = ACTIVE_PHASES.has(phase);
-    this._statusDot.text = dictating ? '●' : '○';
-    this._statusDot.style = dictating
-      ? 'margin-right: 4px; color: #7ee787;'
-      : 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray';
+    this._applyIndicatorVisual(phase);
     this._overlay.update(next);
     this._syncMenu(next.menu);
     _activeExtension?._syncCancelKeybinding();
   }
 
   _applyMissingState() {
-    this._statusDot.text = '○';
-    this._statusDot.style = 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray';
+    this._applyIndicatorVisual('idle');
     this._state = null;
     this._overlay.hideNow();
     this._syncMenu([
@@ -852,9 +925,9 @@ class DicTrayIndicator extends PanelMenu.Button {
   }
 
   _applyQuitState() {
-    this._statusDot.text = '○';
-    this._statusDot.style = 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray (stopped)';
+    this._applyIndicatorVisual('idle');
+    if (!this._logo)
+      this._title.text = ' DicTray (stopped)';
     this._state = null;
     this._overlay.hideNow();
     this._syncMenu([
@@ -879,6 +952,9 @@ class DicTrayIndicator extends PanelMenu.Button {
     if (!item || item.type === 'separator')
       return new PopupMenu.PopupSeparatorMenuItem();
 
+    if (item.type === 'slider')
+      return this._createSliderMenuItem(item);
+
     if (Array.isArray(item.submenu)) {
       const submenu = new PopupMenu.PopupSubMenuMenuItem(String(item.label || '').trim() || 'Untitled');
       submenu.setSensitive(item.enabled !== false);
@@ -900,6 +976,73 @@ class DicTrayIndicator extends PanelMenu.Button {
         writeCommand(String(item.command.action || ''), item.command.value);
       });
     }
+
+    return menuItem;
+  }
+
+  _createSliderMenuItem(item) {
+    const min = Number.isFinite(Number(item.min)) ? Number(item.min) : 0;
+    const max = Number.isFinite(Number(item.max)) ? Number(item.max) : 1;
+    const step = Math.max(0.001, Number(item.step) || 0.1);
+    const value = normalizeSliderValue(item.value, min, max, step);
+    const menuItem = new PopupMenu.PopupBaseMenuItem({
+      activate: false,
+      can_focus: true,
+      reactive: item.enabled !== false,
+    });
+    menuItem.setSensitive(item.enabled !== false);
+
+    const wrapper = new St.BoxLayout({
+      vertical: true,
+      x_expand: true,
+    });
+    wrapper.style = 'min-width: 240px; padding: 2px 0;';
+
+    const header = new St.BoxLayout({
+      x_expand: true,
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    const title = new St.Label({
+      text: String(item.label || '').trim() || 'Level',
+      x_expand: true,
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    const valueLabel = new St.Label({
+      text: sliderPercentLabel(value),
+      y_align: Clutter.ActorAlign.CENTER,
+    });
+    valueLabel.style = 'font-feature-settings: "tnum"; color: #9aa0a6; margin-left: 12px;';
+    header.add_child(title);
+    header.add_child(valueLabel);
+
+    const slider = new Slider.Slider(sliderUnitFromValue(value, min, max));
+    slider.x_expand = true;
+    slider.reactive = item.enabled !== false;
+    wrapper.add_child(header);
+    wrapper.add_child(slider);
+    menuItem.add_child(wrapper);
+
+    let adjusting = false;
+    let lastWritten = value;
+    slider.connect('notify::value', () => {
+      if (adjusting)
+        return;
+
+      const nextValue = sliderValueFromUnit(slider.value, min, max, step);
+      valueLabel.text = sliderPercentLabel(nextValue);
+      const nextUnit = sliderUnitFromValue(nextValue, min, max);
+      if (Math.abs(nextUnit - slider.value) > 0.001) {
+        adjusting = true;
+        slider.value = nextUnit;
+        adjusting = false;
+      }
+
+      if (!item.command || item.enabled === false || Math.abs(nextValue - lastWritten) < 0.001)
+        return;
+
+      lastWritten = nextValue;
+      writeCommand(String(item.command.action || ''), nextValue);
+    });
 
     return menuItem;
   }
@@ -937,7 +1080,7 @@ export default class DicTrayExtension extends Extension {
     this._lastToggleMs = 0;
     this._settings = this.getSettings(KEYBINDING_SCHEMA_ID);
     _activeExtension = this;
-    this._indicator = new DicTrayIndicator();
+    this._indicator = new DicTrayIndicator(this.path || this.dir?.get_path?.() || '');
     Main.panel.addToStatusArea(EXTENSION_ID, this._indicator, 1, 'right');
 
     this._bindKeybindings();

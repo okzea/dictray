@@ -5,6 +5,7 @@ import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { resolveBundledHelperExecutable } from './runtime-paths.mjs'
 import { LinuxUiAutomationBridge } from './linux-ui-automation.mjs'
+import { MacosUiAutomationBridge } from './macos-ui-automation.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const UI_AUTOMATION_HELPER = String(process.env.DICTATION_TRAY_UI_AUTOMATION_HELPER || '').trim()
@@ -36,11 +37,15 @@ export class UiAutomationBridge {
     this.nextRequestId = 0
     this.startPromise = null
     this._linuxBridge = process.platform === 'linux' ? new LinuxUiAutomationBridge() : null
+    this._macosBridge = process.platform === 'darwin' ? new MacosUiAutomationBridge() : null
   }
 
   async checkHealth() {
     if (this._linuxBridge) {
       return this._linuxBridge.checkHealth()
+    }
+    if (this._macosBridge) {
+      return this._macosBridge.checkHealth()
     }
     if (process.platform !== 'win32') {
       return {
@@ -84,6 +89,9 @@ export class UiAutomationBridge {
     if (this._linuxBridge) {
       return this._linuxBridge.listWindows(input)
     }
+    if (this._macosBridge) {
+      return this._macosBridge.listWindows(input)
+    }
     await this.requireHelper()
     return this.run('list-windows', input)
   }
@@ -92,6 +100,9 @@ export class UiAutomationBridge {
     if (this._linuxBridge) {
       return this._linuxBridge.snapshot(input)
     }
+    if (this._macosBridge) {
+      return this._macosBridge.snapshot(input)
+    }
     await this.requireHelper()
     return this.run('snapshot', input)
   }
@@ -99,6 +110,9 @@ export class UiAutomationBridge {
   async action(input = {}, options = {}) {
     if (this._linuxBridge) {
       return this._linuxBridge.action(input, options)
+    }
+    if (this._macosBridge) {
+      return this._macosBridge.action(input, options)
     }
     await this.requireHelper()
     return this.run('action', input, options)
@@ -128,6 +142,9 @@ export class UiAutomationBridge {
 
   async requireHelper() {
     if (this._linuxBridge) {
+      return
+    }
+    if (this._macosBridge) {
       return
     }
     if (process.platform !== 'win32') {

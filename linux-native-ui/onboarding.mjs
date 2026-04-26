@@ -20,6 +20,28 @@ const FALLBACK_HOTKEY_PRESETS = [
   { value: 'CommandOrControl+Alt+F13', label: 'Ctrl+Alt+F13' },
   { value: 'CommandOrControl+Alt+O', label: 'Ctrl+Alt+O' }
 ]
+const LARGE_STUDY_AVERAGE_WPM = 52
+const TYPING_SCORE_BANDS = [
+  'Careful typer: under 30',
+  'Casual: 30-39',
+  'Office-ready: 40-51',
+  'Above average: 52-69',
+  'Fast: 70-89',
+  'Very fast: 90+'
+]
+
+function moduleFilePath() {
+  try {
+    const [filePath] = GLib.filename_from_uri(import.meta.url)
+    return String(filePath || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+const MODULE_PATH = moduleFilePath()
+const MODULE_DIR = MODULE_PATH ? GLib.path_get_dirname(MODULE_PATH) : ''
+const RESOURCE_ROOT = MODULE_DIR ? GLib.path_get_dirname(MODULE_DIR) : ''
 
 if (cli.selfTest) {
   print(JSON.stringify({ ok: true, script: 'onboarding' }))
@@ -84,6 +106,10 @@ if (cli.selfTest) {
     .status-label.success {
       color: #69e4ac;
     }
+    .summary-copy.success,
+    .field-hint.success {
+      color: #69e4ac;
+    }
     entry,
     textview,
     dropdown,
@@ -101,6 +127,9 @@ if (cli.selfTest) {
       border-radius: 18px;
       padding: 12px 14px;
     }
+    .brand-logo {
+      opacity: 0.96;
+    }
   `)
 
   let window = null
@@ -111,6 +140,7 @@ if (cli.selfTest) {
   let initialCompletedAt = ''
   let benchmarkStartedAt = 0
   let benchmarkElapsedMs = 0
+  let benchmarkTimerId = 0
   let latestPayload = {
     sampleText: '',
     state: {},
@@ -123,12 +153,96 @@ if (cli.selfTest) {
     hotkeyPresets: []
   }
 
+  function firstExistingPath(paths) {
+    return paths.find((filePath) => filePath && GLib.file_test(filePath, GLib.FileTest.EXISTS)) || ''
+  }
+
+  function brandLogoPath() {
+    return firstExistingPath([
+      GLib.build_filenamev([RESOURCE_ROOT, 'assets', 'brand', 'dictray-logo-dark.png']),
+      GLib.build_filenamev([RESOURCE_ROOT, 'runtime', 'linux-core', 'assets', 'brand', 'dictray-logo-dark.png'])
+    ])
+  }
+
+  function makeBrandLogo(size = 56) {
+    const logoPath = brandLogoPath()
+    if (!logoPath) {
+      return null
+    }
+
+    const image = Gtk.Image.new_from_file(logoPath)
+    image.set_pixel_size(size)
+    image.add_css_class('brand-logo')
+    return image
+  }
+
   function normalizeTypedText(value) {
-    return compactSpaces(value).toLowerCase()
+    return compactSpaces(value)
+      .replace(/[’‘ʼ]/g, "'")
+      .toLowerCase()
+  }
+
+  function typingScoreLabel(wpm) {
+    const value = Math.max(0, Number(wpm || 0) || 0)
+    if (value < 30) return 'Careful typer'
+    if (value < 40) return 'Casual'
+    if (value < LARGE_STUDY_AVERAGE_WPM) return 'Office-ready'
+    if (value < 70) return 'Above average'
+    if (value < 90) return 'Fast'
+    return 'Very fast'
+  }
+
+  function typingPlacementLine(wpm) {
+    const roundedWpm = Math.max(0, Math.round(Number(wpm || 0) || 0))
+    if (roundedWpm > LARGE_STUDY_AVERAGE_WPM) {
+      return `${roundedWpm} WPM (words per minute) • above the large-study average of ${LARGE_STUDY_AVERAGE_WPM}.`
+    }
+    if (roundedWpm === LARGE_STUDY_AVERAGE_WPM) {
+      return `${roundedWpm} WPM (words per minute) • matches the large-study average of ${LARGE_STUDY_AVERAGE_WPM}.`
+    }
+    return `${roundedWpm} WPM (words per minute) • below the large-study average of ${LARGE_STUDY_AVERAGE_WPM}.`
+  }
+
+  function typingScoreTooltip(score = '') {
+    return [
+      ...(score ? [`You are here: ${score}`, ''] : []),
+      'Typing ladder',
+      'WPM = words per minute',
+      '',
+      ...TYPING_SCORE_BANDS
+    ].join('\n')
+  }
+
+  function currentBenchmarkScore() {
+    if (!benchmarkElapsedMs) {
+      return ''
+    }
+    if (normalizeTypedText(typingBufferText()) !== normalizeTypedText(latestPayload.sampleText || '')) {
+      return ''
+    }
+    return typingScoreLabel(benchmarkStats(benchmarkElapsedMs).wordsPerMinute)
+  }
+
+  function showBenchmarkScoreHelp() {
+    const score = currentBenchmarkScore()
+    const tooltip = typingScoreTooltip(score)
+    widgets.benchmarkInfoButton.set_tooltip_text(tooltip)
+    widgets.benchmarkInfoPopoverLabel.set_label(tooltip)
+    widgets.benchmarkInfoPopover.popup()
   }
 
   function normalizeProfileName(value) {
     return compactSpaces(value).slice(0, 40)
+  }
+
+  function normalizeSttPromptContext(value) {
+    const normalized = String(value || '')
+      .replace(/\r\n?/g, '\n')
+      .split('\n')
+      .map((line) => compactSpaces(line))
+      .filter(Boolean)
+      .join('\n')
+    return normalized.length > 1200 ? normalized.slice(0, 1200).trim() : normalized
   }
 
   function normalizeSpeechEffort(value) {
@@ -195,6 +309,39 @@ if (cli.selfTest) {
     return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false)
   }
 
+  function sttContextText() {
+    const buffer = widgets.sttContextView.get_buffer()
+    return normalizeSttPromptContext(buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), false))
+  }
+
+  function formatBenchmarkSeconds(elapsedMs) {
+    return `${(Math.max(0, Number(elapsedMs || 0)) / 1000).toFixed(1)}s`
+  }
+
+  function activeBenchmarkElapsedMs() {
+    return benchmarkStartedAt ? Math.max(1, Date.now() - benchmarkStartedAt) : 0
+  }
+
+  function startBenchmarkTimer() {
+    if (benchmarkTimerId) {
+      return
+    }
+    benchmarkTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+      updateBenchmarkSummary()
+      return GLib.SOURCE_CONTINUE
+    })
+  }
+
+  function stopBenchmarkTimer() {
+    removeSource(benchmarkTimerId)
+    benchmarkTimerId = 0
+  }
+
+  function setBenchmarkState(state) {
+    widgets.benchmarkSummaryLabel.set_css_classes(state === 'complete' ? ['summary-copy', 'success'] : ['summary-copy'])
+    widgets.benchmarkHintLabel.set_css_classes(state === 'complete' ? ['field-hint', 'success'] : ['field-hint'])
+  }
+
   function benchmarkStats(elapsedMs) {
     const elapsed = Math.max(0, Math.floor(Number(elapsedMs || 0) || 0))
     const sampleText = compactSpaces(latestPayload.sampleText || '')
@@ -240,28 +387,58 @@ if (cli.selfTest) {
   function updateBenchmarkSummary() {
     const typed = normalizeTypedText(typingBufferText())
     const sample = normalizeTypedText(latestPayload.sampleText || '')
+    const rawTypedCount = Array.from(typingBufferText()).length
+    const sampleCount = Array.from(compactSpaces(latestPayload.sampleText || '')).length
+    widgets.resetBenchmarkButton.set_sensitive(Boolean(typed) || benchmarkElapsedMs > 0)
 
     if (!typed) {
-      widgets.benchmarkSummaryLabel.set_label('Type the sentence once. The timer starts on your first keystroke.')
-      widgets.benchmarkHintLabel.set_label('DicTray uses this to estimate how much keyboard time it saves you each day.')
+      widgets.benchmarkSummaryLabel.set_label('Ready. Read the phrase once first, then type it naturally.')
+      widgets.benchmarkHintLabel.set_label("Smart apostrophes are accepted, so both I'm and I’m will match.")
+      widgets.benchmarkInfoButton.set_tooltip_text(typingScoreTooltip())
+      setBenchmarkState('idle')
+      stopBenchmarkTimer()
+      benchmarkStartedAt = 0
+      benchmarkElapsedMs = 0
       return
-    }
-
-    if (!benchmarkStartedAt) {
-      benchmarkStartedAt = Date.now()
     }
 
     if (typed === sample) {
-      benchmarkElapsedMs = Math.max(0, Date.now() - benchmarkStartedAt)
+      if (!benchmarkStartedAt) {
+        benchmarkStartedAt = Date.now()
+      }
+      if (!benchmarkElapsedMs) {
+        benchmarkElapsedMs = activeBenchmarkElapsedMs()
+      }
+      stopBenchmarkTimer()
       const stats = benchmarkStats(benchmarkElapsedMs)
-      widgets.benchmarkSummaryLabel.set_label(`Typing pace captured: ${stats.charactersPerMinute} chars/min and ${stats.wordsPerMinute} words/min.`)
-      widgets.benchmarkHintLabel.set_label(`Benchmark duration: ${Math.max(1, Math.round(stats.elapsedMs / 1000))}s.`)
+      const score = typingScoreLabel(stats.wordsPerMinute)
+      widgets.benchmarkSummaryLabel.set_label(`You are here: ${score}`)
+      widgets.benchmarkHintLabel.set_label(`${typingPlacementLine(stats.wordsPerMinute)} Time: ${formatBenchmarkSeconds(stats.elapsedMs)}.`)
+      widgets.benchmarkInfoButton.set_tooltip_text(typingScoreTooltip(score))
+      setBenchmarkState('complete')
       return
+    }
+    if (!benchmarkStartedAt || benchmarkElapsedMs > 0) {
+      benchmarkStartedAt = Date.now()
+      benchmarkElapsedMs = 0
     }
 
     benchmarkElapsedMs = 0
-    widgets.benchmarkSummaryLabel.set_label('Keep going until the sample matches exactly once.')
-    widgets.benchmarkHintLabel.set_label('Upper/lowercase and extra spaces do not matter, but the words must match.')
+    startBenchmarkTimer()
+    setBenchmarkState('typing')
+    widgets.benchmarkSummaryLabel.set_label(`Typing: ${formatBenchmarkSeconds(activeBenchmarkElapsedMs())} • ${Math.min(rawTypedCount, sampleCount)}/${sampleCount} characters.`)
+    widgets.benchmarkHintLabel.set_label('Keep going until the typed text matches the phrase exactly once.')
+    widgets.benchmarkInfoButton.set_tooltip_text(typingScoreTooltip())
+  }
+
+  function resetBenchmark() {
+    stopBenchmarkTimer()
+    benchmarkStartedAt = 0
+    benchmarkElapsedMs = 0
+    const buffer = widgets.typingView.get_buffer()
+    buffer.set_text('', -1)
+    widgets.typingView.grab_focus()
+    updateBenchmarkSummary()
   }
 
   function updateHotkeyUi() {
@@ -281,6 +458,7 @@ if (cli.selfTest) {
       `Profile: ${name}`,
       `Text improvement: ${rewriteCleanup ? 'On' : 'Off'}`,
       `Speech effort: ${speechEffortLabel(selectedSpeechEffort())}`,
+      `Speech context: ${sttContextText() ? 'Added' : 'Empty'}`,
       `Push-to-talk: ${widgets.hotkeyPresets[widgets.hotkeyDropdown.get_selected()]?.label || 'Unknown'}`
     ]
     widgets.summaryLabel.set_label(summary.join('  |  '))
@@ -292,10 +470,12 @@ if (cli.selfTest) {
     const rewriteCleanup = Boolean(state?.choices?.rewriteCleanup)
     const speechEffort = normalizeSpeechEffort(state?.choices?.speechEffort || latestPayload.runtime?.speechEffort || 'mid') || 'mid'
     const pushToTalkHotkey = String(state?.choices?.pushToTalkHotkey || latestPayload.runtime?.hotkey || '').trim()
+    const sttPromptContext = normalizeSttPromptContext(state?.choices?.sttPromptContext || latestPayload.runtime?.sttPromptContext || '')
     const typingBenchmark = state?.typingBenchmark || {}
 
     widgets.nameEntry.set_text(profileName)
     widgets.rewriteSwitch.set_active(rewriteCleanup)
+    widgets.sttContextView.get_buffer().set_text(sttPromptContext, -1)
 
     for (const [value, button] of widgets.effortButtons.entries()) {
       button.set_active(value === speechEffort)
@@ -312,7 +492,11 @@ if (cli.selfTest) {
     benchmarkElapsedMs = Math.max(0, Number(typingBenchmark?.elapsedMs || 0) || 0)
     benchmarkStartedAt = benchmarkElapsedMs ? Date.now() - benchmarkElapsedMs : 0
 
-    widgets.sampleLabel.set_label(compactSpaces(latestPayload.sampleText || ''))
+    const sampleText = compactSpaces(latestPayload.sampleText || '')
+    widgets.sampleLabel.set_label(sampleText)
+    if (typeof widgets.typingView.set_placeholder_text === 'function') {
+      widgets.typingView.set_placeholder_text(sampleText)
+    }
     updateRuntimeSummary()
     updateHotkeyUi()
     updateBenchmarkSummary()
@@ -337,7 +521,8 @@ if (cli.selfTest) {
         choices: {
           rewriteCleanup: widgets.rewriteSwitch.get_active(),
           speechEffort: selectedSpeechEffort(),
-          pushToTalkHotkey: selectedHotkeyValue()
+          pushToTalkHotkey: selectedHotkeyValue(),
+          sttPromptContext: sttContextText()
         },
         typingBenchmark: benchmarkStats(benchmarkElapsedMs)
       }
@@ -444,8 +629,24 @@ if (cli.selfTest) {
     widgets.runtimeLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
     widgets.runtimeLabel.add_css_class('runtime-copy')
 
-    hero.append(eyebrow)
-    hero.append(headline)
+    const brandRow = new Gtk.Box({
+      orientation: Gtk.Orientation.HORIZONTAL,
+      spacing: 14
+    })
+    brandRow.set_valign(Gtk.Align.CENTER)
+    const brandText = new Gtk.Box({
+      orientation: Gtk.Orientation.VERTICAL,
+      spacing: 2
+    })
+    brandText.append(eyebrow)
+    brandText.append(headline)
+    const brandLogo = makeBrandLogo()
+    if (brandLogo) {
+      brandRow.append(brandLogo)
+    }
+    brandRow.append(brandText)
+
+    hero.append(brandRow)
     hero.append(subtitle)
     hero.append(widgets.runtimeLabel)
 
@@ -466,7 +667,7 @@ if (cli.selfTest) {
     profileTitle.add_css_class('section-title')
     const profileCopy = new Gtk.Label({ label: 'DicTray uses this in the tray greeting and in your daily savings summary.', xalign: 0, wrap: true })
     profileCopy.add_css_class('section-copy')
-    widgets.nameEntry = new Gtk.Entry({ placeholder_text: 'Denim' })
+    widgets.nameEntry = new Gtk.Entry({ placeholder_text: 'Avery' })
     widgets.nameEntry.connect('changed', () => {
       updateSummary()
     })
@@ -476,13 +677,13 @@ if (cli.selfTest) {
 
     const benchmarkCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12 })
     benchmarkCard.add_css_class('section-card')
-    const benchmarkTitle = new Gtk.Label({ label: 'Show me your typing pace', xalign: 0 })
+    const benchmarkTitle = new Gtk.Label({ label: 'Typing Pace', xalign: 0 })
     benchmarkTitle.add_css_class('section-title')
-    const benchmarkCopy = new Gtk.Label({ label: 'Type this sentence exactly once so DicTray can estimate how much keyboard time it saves you.', xalign: 0, wrap: true })
+    const benchmarkCopy = new Gtk.Label({ label: 'Read the phrase once, then type it naturally. DicTray uses the timing to estimate saved keyboard time.', xalign: 0, wrap: true })
     benchmarkCopy.add_css_class('section-copy')
     const sampleCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 })
     sampleCard.add_css_class('sample-card')
-    const sampleHint = new Gtk.Label({ label: 'Sample sentence', xalign: 0 })
+    const sampleHint = new Gtk.Label({ label: 'Type this exact phrase', xalign: 0 })
     sampleHint.add_css_class('sample-copy')
     widgets.sampleLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
     widgets.sampleLabel.add_css_class('sample-text')
@@ -490,6 +691,33 @@ if (cli.selfTest) {
     sampleCard.append(widgets.sampleLabel)
     widgets.benchmarkSummaryLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
     widgets.benchmarkSummaryLabel.add_css_class('summary-copy')
+    widgets.benchmarkSummaryLabel.set_hexpand(true)
+    widgets.benchmarkInfoButton = new Gtk.Button({ label: '?' })
+    widgets.benchmarkInfoButton.set_tooltip_text(typingScoreTooltip())
+    widgets.benchmarkInfoButton.connect('clicked', () => {
+      showBenchmarkScoreHelp()
+    })
+    widgets.benchmarkInfoPopover = new Gtk.Popover()
+    widgets.benchmarkInfoPopover.set_parent(widgets.benchmarkInfoButton)
+    widgets.benchmarkInfoPopoverLabel = new Gtk.Label({
+      label: typingScoreTooltip(),
+      xalign: 0,
+      wrap: true
+    })
+    widgets.benchmarkInfoPopoverLabel.set_margin_top(12)
+    widgets.benchmarkInfoPopoverLabel.set_margin_bottom(12)
+    widgets.benchmarkInfoPopoverLabel.set_margin_start(14)
+    widgets.benchmarkInfoPopoverLabel.set_margin_end(14)
+    widgets.benchmarkInfoPopover.set_child(widgets.benchmarkInfoPopoverLabel)
+    widgets.resetBenchmarkButton = new Gtk.Button({ label: 'Restart' })
+    widgets.resetBenchmarkButton.set_sensitive(false)
+    widgets.resetBenchmarkButton.connect('clicked', () => {
+      resetBenchmark()
+    })
+    const benchmarkStatusRow = new Gtk.Box({ orientation: Gtk.Orientation.HORIZONTAL, spacing: 12 })
+    benchmarkStatusRow.append(widgets.benchmarkSummaryLabel)
+    benchmarkStatusRow.append(widgets.benchmarkInfoButton)
+    benchmarkStatusRow.append(widgets.resetBenchmarkButton)
     widgets.typingView = new Gtk.TextView({ monospace: false, wrap_mode: Gtk.WrapMode.WORD_CHAR })
     widgets.typingView.get_buffer().connect('changed', () => {
       updateBenchmarkSummary()
@@ -501,7 +729,7 @@ if (cli.selfTest) {
     benchmarkCard.append(benchmarkTitle)
     benchmarkCard.append(benchmarkCopy)
     benchmarkCard.append(sampleCard)
-    benchmarkCard.append(widgets.benchmarkSummaryLabel)
+    benchmarkCard.append(benchmarkStatusRow)
     benchmarkCard.append(typingScroller)
     benchmarkCard.append(widgets.benchmarkHintLabel)
 
@@ -538,6 +766,26 @@ if (cli.selfTest) {
     )
     effortCard.add_css_class('section-card')
 
+    const contextCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
+    contextCard.add_css_class('section-card')
+    const contextTitle = new Gtk.Label({ label: 'Speech context', xalign: 0 })
+    contextTitle.add_css_class('section-title')
+    const contextCopy = new Gtk.Label({
+      label: 'Add names, company terms, product words, and corrections. Example: Avery writes for Northstar Labs; LumaNote is one word.',
+      xalign: 0,
+      wrap: true
+    })
+    contextCopy.add_css_class('section-copy')
+    widgets.sttContextView = new Gtk.TextView({ monospace: false, wrap_mode: Gtk.WrapMode.WORD_CHAR })
+    widgets.sttContextView.get_buffer().connect('changed', () => {
+      updateSummary()
+    })
+    const contextScroller = new Gtk.ScrolledWindow({ min_content_height: 110, hexpand: true })
+    contextScroller.set_child(widgets.sttContextView)
+    contextCard.append(contextTitle)
+    contextCard.append(contextCopy)
+    contextCard.append(contextScroller)
+
     widgets.hotkeyDropdown = Gtk.DropDown.new_from_strings(['Loading shortcuts…'])
     widgets.hotkeyDropdown.connect('notify::selected', () => {
       updateSummary()
@@ -567,6 +815,7 @@ if (cli.selfTest) {
     form.append(benchmarkCard)
     form.append(rewriteCard)
     form.append(effortCard)
+    form.append(contextCard)
     form.append(hotkeyCard)
     form.append(summaryCard)
     scroller.set_child(form)
@@ -607,6 +856,7 @@ if (cli.selfTest) {
 
     applicationWindow.connect('close-request', () => {
       removeSource(closeDelayId)
+      stopBenchmarkTimer()
       closeDelayId = 0
       return false
     })

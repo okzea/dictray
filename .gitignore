@@ -11,3 +11,17 @@ docker/stt/cache/*
 !docker/stt/cache/.gitkeep
 scripts/**/bin/
 scripts/**/obj/
+
+# Generated packages and logs
+*.app/
+*.dmg
+*.iso
+*.pkg
+*.tar.gz
+*.tgz
+*.zip
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
