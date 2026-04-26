@@ -53,7 +53,16 @@ function spawnDetached(command, args = [], options = {}) {
     env: options.env || process.env,
     windowsHide: true
   })
+  child.once('error', () => {})
   child.unref()
+  return child
+}
+
+function ignoreSpawnAndStdinErrors(child) {
+  child.once('error', () => {})
+  if (child.stdin) {
+    child.stdin.on('error', () => {})
+  }
   return child
 }
 
@@ -204,11 +213,11 @@ function copyTextToLinuxClipboard(text) {
   }
 
   try {
-    const xclip = spawn('xclip', ['-selection', 'clipboard'], {
+    const xclip = ignoreSpawnAndStdinErrors(spawn('xclip', ['-selection', 'clipboard'], {
       stdio: ['pipe', 'ignore', 'ignore'],
       detached: true,
       windowsHide: true
-    })
+    }))
     xclip.stdin.end(value)
     xclip.unref()
     return
@@ -217,11 +226,11 @@ function copyTextToLinuxClipboard(text) {
   }
 
   try {
-    const xsel = spawn('xsel', ['--clipboard', '--input'], {
+    const xsel = ignoreSpawnAndStdinErrors(spawn('xsel', ['--clipboard', '--input'], {
       stdio: ['pipe', 'ignore', 'ignore'],
       detached: true,
       windowsHide: true
-    })
+    }))
     xsel.stdin.end(value)
     xsel.unref()
   } catch {
@@ -236,11 +245,11 @@ function copyTextToMacosClipboard(text) {
   }
 
   try {
-    const child = spawn('pbcopy', [], {
+    const child = ignoreSpawnAndStdinErrors(spawn('pbcopy', [], {
       stdio: ['pipe', 'ignore', 'ignore'],
       detached: true,
       windowsHide: true
-    })
+    }))
     child.stdin.end(value)
     child.unref()
   } catch {

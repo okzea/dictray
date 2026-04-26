@@ -132,7 +132,15 @@ async function returnWayland() {
   const wtypeResult = await tryExec('wtype', ['-k', 'return'])
   if (wtypeResult.ok) return
 
-  await tryExec('xdotool', ['key', '--clearmodifiers', 'Return'])
+  const xdotoolResult = await tryExec('xdotool', ['key', '--clearmodifiers', 'Return'])
+  if (xdotoolResult.ok) return
+
+  throw new Error([
+    'Failed to send Return on Wayland with available backends:',
+    `ydotool: ${formatCommandFailure(ydotoolResult)}`,
+    `wtype: ${formatCommandFailure(wtypeResult)}`,
+    `xdotool: ${formatCommandFailure(xdotoolResult)}`
+  ].join(' '))
 }
 
 export class LinuxUiAutomationBridge {
