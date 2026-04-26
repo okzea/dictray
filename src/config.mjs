@@ -40,6 +40,7 @@ const DEFAULTS = {
       model: 'qwen3-coder:30b',
       timeoutMs: 45000,
       keepAlive: '30m',
+      temperature: 0.1,
       think: 'default'
     }
   },
@@ -162,6 +163,7 @@ function normalizeOllamaConfig(input = {}, fallback = DEFAULTS.rewrite.ollama) {
     model: String(input?.model || fallback.model).trim() || fallback.model,
     timeoutMs: clampTimeout(input?.timeoutMs ?? fallback.timeoutMs, fallback.timeoutMs),
     keepAlive: String(input?.keepAlive || fallback.keepAlive).trim() || fallback.keepAlive,
+    temperature: clampRatio(input?.temperature ?? fallback.temperature, fallback.temperature),
     think: String(input?.think || fallback.think).trim() || fallback.think
   }
 }
