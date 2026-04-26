@@ -58,12 +58,33 @@ function spawnDetached(command, args = [], options = {}) {
   return child
 }
 
+function shellQuote(value) {
+  return `'${String(value || '').replace(/'/g, `'\\''`)}'`
+}
+
+function commandAvailable(command) {
+  return readProcessOutput('sh', [
+    '-lc',
+    `command -v ${shellQuote(command)} >/dev/null 2>&1 && printf yes`
+  ]) === 'yes'
+}
+
 function ignoreSpawnAndStdinErrors(child) {
   child.once('error', () => {})
   if (child.stdin) {
     child.stdin.on('error', () => {})
   }
   return child
+}
+
+function writePidLock(lockPath) {
+  try {
+    mkdirSync(path.dirname(lockPath), { recursive: true })
+    writeFileSync(lockPath, `${process.pid}\n`, { encoding: 'utf8', flag: 'wx' })
+    return true
+  } catch {
+    return false
+  }
 }
 
 function isPidRunning(pid) {
@@ -227,13 +248,7 @@ function acquireLinuxHeadlessLock({ requestExit = false } = {}) {
     // ignore stale lock cleanup failures
   }
 
-  try {
-    mkdirSync(path.dirname(lockPath), { recursive: true })
-    writeFileSync(lockPath, `${process.pid}\n`, 'utf8')
-    return true
-  } catch {
-    return false
-  }
+  return writePidLock(lockPath)
 }
 
 function releaseLinuxHeadlessLock() {
@@ -288,13 +303,7 @@ function acquirePidLock(lockPath, { requestExit = false, isLockOwner = () => fal
     // ignore stale lock cleanup failures
   }
 
-  try {
-    mkdirSync(path.dirname(lockPath), { recursive: true })
-    writeFileSync(lockPath, `${process.pid}\n`, 'utf8')
-    return true
-  } catch {
-    return false
-  }
+  return writePidLock(lockPath)
 }
 
 function releasePidLock(lockPath) {
@@ -317,6 +326,9 @@ function copyTextToLinuxClipboard(text) {
 
   if (isWaylandSession()) {
     try {
+      if (!commandAvailable('wl-copy')) {
+        throw new Error('wl-copy is not available.')
+      }
       spawnDetached('wl-copy', ['--', value])
       return
     } catch {
