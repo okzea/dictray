@@ -1,5 +1,5 @@
 import { execFile, spawn } from 'node:child_process'
-import { readFile, writeFile } from 'node:fs/promises'
+import { readFile, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
@@ -68,9 +68,27 @@ async function spawnClipboardProvider(cmd, args, options, text = null) {
 }
 
 async function sendGnomeExtensionCommand(action) {
-  await writeFile(GNOME_PANEL_INPUT_PATH, JSON.stringify({ action, requestedAt: Date.now() }), 'utf8')
+  const command = { action, requestedAt: Date.now() }
+  try {
+    await writeFile(GNOME_PANEL_INPUT_PATH, JSON.stringify(command), 'utf8')
+  } catch {
+    return false
+  }
   // Give the extension time to poll and process the command (polls every 150ms)
-  await delay(200)
+  await delay(300)
+  try {
+    const pending = JSON.parse(await readFile(GNOME_PANEL_INPUT_PATH, 'utf8'))
+    if (pending?.action === command.action && pending?.requestedAt === command.requestedAt) {
+      await unlink(GNOME_PANEL_INPUT_PATH).catch(() => {})
+      return false
+    }
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return true
+    }
+    return false
+  }
+  return true
 }
 
 async function pasteX11(windowId = null) {
@@ -86,8 +104,10 @@ async function pasteWayland() {
   // virtual keyboard — the only reliable way to send keystrokes to native
   // Wayland windows on GNOME.
   if (isGnomeSession()) {
-    await sendGnomeExtensionCommand('send_ctrl_v')
-    return
+    const gnomeResult = await sendGnomeExtensionCommand('send_ctrl_v')
+    if (gnomeResult) {
+      return
+    }
   }
 
   // ydotool uses kernel uinput and works with any compositor
@@ -121,8 +141,10 @@ async function returnX11(windowId = null) {
 
 async function returnWayland() {
   if (isGnomeSession()) {
-    await sendGnomeExtensionCommand('send_return')
-    return
+    const gnomeResult = await sendGnomeExtensionCommand('send_return')
+    if (gnomeResult) {
+      return
+    }
   }
 
   // KEY_ENTER=28
