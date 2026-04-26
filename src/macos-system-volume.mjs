@@ -46,8 +46,7 @@ export class MacosSystemVolumeBridge {
   async getState() {
     const stdout = await runAppleScript([
       'set volumeSettings to get volume settings',
-      'output volume of volumeSettings',
-      'output muted of volumeSettings'
+      'return (output volume of volumeSettings as text) & linefeed & (output muted of volumeSettings as text)'
     ])
     const [volumeLine = '0', mutedLine = 'false'] = stdout.split(/\r?\n/)
     return {
