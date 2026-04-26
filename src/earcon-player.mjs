@@ -1,33 +1,35 @@
 import { spawn, spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const SAMPLE_RATE = 44100
-const TARGET_PEAK = 0.82
+const TARGET_PEAK = 0.36
+const FFMPEG_BIN = String(process.env.DICTATION_TRAY_FFMPEG_BIN || process.env.STT_FFMPEG_BIN || 'ffmpeg').trim() || 'ffmpeg'
 const EARCON_CACHE_DIR = path.join(os.tmpdir(), 'dictray-earcons')
+const EARCON_ASSET_DIR = path.join(__dirname, '..', 'assets', 'earcons')
 const EARCON_DEFINITIONS = {
   listen: {
+    asset: 'listen.mp3',
     pulses: [
-      { wave: 'sine', fromHz: 720, toHz: 1280, startMs: 0, durationMs: 120, level: 0.76 },
-      { wave: 'triangle', fromHz: 1040, toHz: 1640, startMs: 30, durationMs: 110, level: 0.38 }
+      { wave: 'sine', fromHz: 520, toHz: 650, startMs: 0, durationMs: 110, level: 0.62 },
+      { wave: 'sine', fromHz: 650, toHz: 760, startMs: 46, durationMs: 120, level: 0.28 }
     ]
   },
   cancel: {
     pulses: [
-      { wave: 'square', fromHz: 210, toHz: 168, startMs: 0, durationMs: 50, level: 0.42 },
-      { wave: 'square', fromHz: 198, toHz: 158, startMs: 70, durationMs: 50, level: 0.42 },
-      { wave: 'square', fromHz: 186, toHz: 148, startMs: 140, durationMs: 50, level: 0.42 },
-      { wave: 'triangle', fromHz: 320, toHz: 220, startMs: 10, durationMs: 60, level: 0.30 },
-      { wave: 'triangle', fromHz: 308, toHz: 212, startMs: 80, durationMs: 60, level: 0.30 },
-      { wave: 'triangle', fromHz: 296, toHz: 204, startMs: 150, durationMs: 60, level: 0.30 }
+      { wave: 'sine', fromHz: 360, toHz: 300, startMs: 0, durationMs: 115, level: 0.50 },
+      { wave: 'sine', fromHz: 300, toHz: 240, startMs: 68, durationMs: 120, level: 0.38 }
     ]
   },
   submit: {
+    asset: 'submit.mp3',
     pulses: [
-      { wave: 'sine', fromHz: 500, toHz: 1120, startMs: 0, durationMs: 240, level: 0.68 },
-      { wave: 'triangle', fromHz: 720, toHz: 1560, startMs: 45, durationMs: 220, level: 0.42 },
-      { wave: 'square', fromHz: 1120, toHz: 2240, startMs: 95, durationMs: 180, level: 0.17 }
+      { wave: 'sine', fromHz: 640, toHz: 520, startMs: 0, durationMs: 130, level: 0.54 },
+      { wave: 'sine', fromHz: 520, toHz: 390, startMs: 62, durationMs: 150, level: 0.34 }
     ]
   }
 }
@@ -130,6 +132,39 @@ function encodeWav(samples, sampleRate = SAMPLE_RATE) {
   return buffer
 }
 
+function convertAudioToWav(inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(FFMPEG_BIN, [
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-y',
+      '-i',
+      inputPath,
+      '-ar',
+      String(SAMPLE_RATE),
+      '-ac',
+      '2',
+      outputPath
+    ], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true
+    })
+    let stderr = ''
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '')
+    })
+    child.on('error', reject)
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve()
+        return
+      }
+      reject(new Error(stderr.trim() || `ffmpeg exited with code ${code ?? 1}`))
+    })
+  })
+}
+
 function renderEarcon(kind) {
   const definition = EARCON_DEFINITIONS[kind]
   if (!definition) {
@@ -182,6 +217,23 @@ export function createEarconPlayer({ logger = null } = {}) {
   async function ensureEarconFile(kind) {
     if (cachedFiles.has(kind)) {
       return cachedFiles.get(kind)
+    }
+    const definition = EARCON_DEFINITIONS[kind]
+    const assetPath = definition?.asset ? path.join(EARCON_ASSET_DIR, definition.asset) : ''
+    if (assetPath && existsSync(assetPath)) {
+      if (process.platform === 'darwin') {
+        cachedFiles.set(kind, assetPath)
+        return assetPath
+      }
+      await mkdir(EARCON_CACHE_DIR, { recursive: true })
+      const convertedPath = path.join(EARCON_CACHE_DIR, `${kind}-asset.wav`)
+      try {
+        await convertAudioToWav(assetPath, convertedPath)
+        cachedFiles.set(kind, convertedPath)
+        return convertedPath
+      } catch (error) {
+        log(`[dictray] Failed to convert earcon asset ${path.basename(assetPath)}: ${String(error?.message || error)}`)
+      }
     }
     await mkdir(EARCON_CACHE_DIR, { recursive: true })
     const filePath = path.join(EARCON_CACHE_DIR, `${kind}.wav`)
@@ -242,7 +294,20 @@ export function createEarconPlayer({ logger = null } = {}) {
     }
   }
 
+  async function prepare(kinds = Object.keys(EARCON_DEFINITIONS)) {
+    resolvePlayer()
+    const normalizedKinds = [...new Set(kinds.map(normalizeKind).filter(Boolean))]
+    for (const kind of normalizedKinds) {
+      await ensureEarconFile(kind)
+    }
+    return {
+      ok: true,
+      kinds: normalizedKinds
+    }
+  }
+
   return {
+    prepare,
     play
   }
 }

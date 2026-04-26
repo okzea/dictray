@@ -312,13 +312,37 @@ async function waitForRecorderStartup(state) {
   }
 }
 
+async function selectedDeviceForRecording() {
+  if (!availableDevices.length || (preferredInputDeviceId && !availableDevices.some((device) => device.deviceId === preferredInputDeviceId))) {
+    await refreshAudioDevices()
+  }
+  return currentSelectedDevice()
+}
+
+async function verifyRecorderStartup(state) {
+  try {
+    await waitForRecorderStartup(state)
+  } catch (error) {
+    if (recordingState !== state || state.stopping || state.cancelled || shuttingDown) {
+      return
+    }
+    recordingState = null
+    state.cancelled = true
+    await stopRecorderProcess(state).catch(() => {})
+    await removeRecordingFiles(state)
+    reportInputLevel(0)
+    reportRecordingState('idle')
+    reportError(compact(error?.message || error || 'macOS audio capture stopped immediately.'))
+    void syncInputDevices().catch(() => {})
+  }
+}
+
 async function startRecording() {
   if (recordingState) {
     return
   }
 
-  await refreshAudioDevices()
-  const selectedDevice = currentSelectedDevice()
+  const selectedDevice = await selectedDeviceForRecording()
   if (!selectedDevice?.deviceId) {
     throw new Error('No macOS audio input is available for native capture.')
   }
@@ -380,19 +404,10 @@ async function startRecording() {
   })
 
   recordingState = state
-  try {
-    await waitForRecorderStartup(state)
-  } catch (error) {
-    recordingState = null
-    state.cancelled = true
-    await stopRecorderProcess(state).catch(() => {})
-    await removeRecordingFiles(state)
-    throw error
-  }
-
   reportRecordingState('listening')
   reportInputLevel(0)
   reportInputDevices()
+  void verifyRecorderStartup(state)
 }
 
 async function stopRecorderProcess(state) {

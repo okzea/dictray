@@ -667,6 +667,10 @@ class LocalSttDaemonClient {
       }
       return result.payload || {}
     } catch (error) {
+      if (isAbortError(error) && options?.signal?.aborted) {
+        this.restart()
+        throw error
+      }
       if (retry && this.shouldRestartAfterError(error)) {
         this.restart()
         return await this.transcribe(audioBuffer, contentType, payload, options, false)

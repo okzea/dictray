@@ -1,4 +1,5 @@
-import { access, cp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { access, cp, lstat, mkdir, readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -11,6 +12,8 @@ const IS_WIN = process.platform === 'win32'
 const VENV_BIN_DIR = IS_WIN ? 'Scripts' : 'bin'
 const VENV_PYTHON_NAME = IS_WIN ? 'python.exe' : 'python3'
 const VENV_PYTHON_REL = path.join(VENV_BIN_DIR, VENV_PYTHON_NAME)
+const STANDALONE_PYTHON_RELEASE = '20260414'
+const STANDALONE_PYTHON_VERSION = '3.10.20'
 
 function createLogger(logger) {
   if (typeof logger === 'function') {
@@ -36,6 +39,11 @@ function dedupe(values) {
     result.push(normalized)
   }
   return result
+}
+
+function isPathInside(parent, child) {
+  const relative = path.relative(parent, child)
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
 }
 
 function run(command, args, options = {}) {
@@ -96,6 +104,114 @@ async function pathExists(filePath) {
   }
 }
 
+async function findExternalSymlinks(rootDir) {
+  const badLinks = []
+  const root = path.resolve(rootDir)
+
+  async function visit(entryPath) {
+    const stats = await lstat(entryPath)
+    if (stats.isSymbolicLink()) {
+      const target = await readlink(entryPath)
+      const resolvedTarget = path.resolve(path.dirname(entryPath), target)
+      if (path.isAbsolute(target) || !isPathInside(root, resolvedTarget)) {
+        badLinks.push({
+          link: entryPath,
+          target
+        })
+      }
+      return
+    }
+
+    if (!stats.isDirectory()) {
+      return
+    }
+
+    const entries = await readdir(entryPath)
+    await Promise.all(entries.map((entry) => visit(path.join(entryPath, entry))))
+  }
+
+  if (await pathExists(root)) {
+    await visit(root)
+  }
+  return badLinks
+}
+
+async function assertPortableRuntime(rootDir) {
+  const badLinks = await findExternalSymlinks(rootDir)
+  if (badLinks.length > 0) {
+    const summary = badLinks
+      .slice(0, 4)
+      .map((item) => `${path.relative(rootDir, item.link)} -> ${item.target}`)
+      .join('; ')
+    const error = new Error(`Bundled Python runtime contains non-portable symlinks: ${summary}`)
+    error.code = 'NON_PORTABLE_PYTHON_RUNTIME'
+    throw error
+  }
+}
+
+async function prunePythonBytecode(rootDir) {
+  async function visit(entryPath) {
+    const stats = await lstat(entryPath)
+    if (stats.isSymbolicLink()) {
+      return
+    }
+    if (stats.isDirectory()) {
+      if (path.basename(entryPath) === '__pycache__') {
+        await rm(entryPath, { recursive: true, force: true })
+        return
+      }
+      const entries = await readdir(entryPath)
+      await Promise.all(entries.map((entry) => visit(path.join(entryPath, entry))))
+      return
+    }
+    if (entryPath.endsWith('.pyc') || entryPath.endsWith('.pyo')) {
+      await rm(entryPath, { force: true })
+    }
+  }
+
+  if (await pathExists(rootDir)) {
+    await visit(rootDir)
+  }
+}
+
+async function rewritePythonEntrypointShebangs(pythonRoot) {
+  const binDir = path.join(pythonRoot, VENV_BIN_DIR)
+  if (!await pathExists(binDir)) {
+    return
+  }
+
+  const entries = await readdir(binDir)
+  await Promise.all(entries.map(async (entry) => {
+    const filePath = path.join(binDir, entry)
+    const stats = await lstat(filePath)
+    if (!stats.isFile()) {
+      return
+    }
+
+    let raw = ''
+    try {
+      raw = await readFile(filePath, 'utf8')
+    } catch {
+      return
+    }
+    if (!raw.startsWith('#!')) {
+      return
+    }
+    const firstNewline = raw.indexOf('\n')
+    const shebang = firstNewline === -1 ? raw : raw.slice(0, firstNewline)
+    if (!/python/i.test(shebang)) {
+      return
+    }
+    const body = firstNewline === -1 ? '' : raw.slice(firstNewline + 1)
+    await writeFile(filePath, `#!/usr/bin/env python3\n${body}`, 'utf8')
+  }))
+}
+
+async function sanitizePythonRuntime(rootDir) {
+  await rewritePythonEntrypointShebangs(rootDir)
+  await prunePythonBytecode(rootDir)
+}
+
 export async function ensureBundledSttRuntime(options = {}) {
   const rootDir = options.rootDir || DEFAULT_ROOT_DIR
   const outputRoot = options.outputRoot || path.join(rootDir, 'build', 'bundled-runtime')
@@ -107,6 +223,100 @@ export async function ensureBundledSttRuntime(options = {}) {
 
   function log(message) {
     logger(message)
+  }
+
+  function standalonePythonTriplet() {
+    if (process.platform !== 'darwin') {
+      return ''
+    }
+    if (process.arch === 'arm64') {
+      return 'aarch64-apple-darwin'
+    }
+    if (process.arch === 'x64') {
+      return 'x86_64-apple-darwin'
+    }
+    return ''
+  }
+
+  function standalonePythonUrl() {
+    const explicit = String(env.DICTATION_TRAY_STANDALONE_PYTHON_URL || '').trim()
+    if (explicit) {
+      return explicit
+    }
+    const triplet = standalonePythonTriplet()
+    if (!triplet) {
+      return ''
+    }
+    const version = String(env.DICTATION_TRAY_STANDALONE_PYTHON_VERSION || STANDALONE_PYTHON_VERSION).trim() || STANDALONE_PYTHON_VERSION
+    const release = String(env.DICTATION_TRAY_STANDALONE_PYTHON_RELEASE || STANDALONE_PYTHON_RELEASE).trim() || STANDALONE_PYTHON_RELEASE
+    return `https://github.com/astral-sh/python-build-standalone/releases/download/${release}/cpython-${version}+${release}-${triplet}-install_only.tar.gz`
+  }
+
+  async function downloadStandalonePythonArchive(url) {
+    const downloadsDir = path.join(rootDir, 'build', 'downloads')
+    await mkdir(downloadsDir, { recursive: true })
+    const archivePath = path.join(downloadsDir, path.basename(new URL(url).pathname))
+    if (await pathExists(archivePath)) {
+      return archivePath
+    }
+    log(`Downloading standalone Python runtime from ${url}.`)
+    await run('curl', ['-L', '--fail', '--show-error', '--output', archivePath, url], {
+      cwd: rootDir,
+      env
+    })
+    return archivePath
+  }
+
+  async function createStandalonePythonRuntime() {
+    const url = standalonePythonUrl()
+    if (!url) {
+      return null
+    }
+
+    const archivePath = await downloadStandalonePythonArchive(url)
+    const extractRoot = path.join(rootDir, 'build', '.standalone-python-extract')
+    await rm(extractRoot, { recursive: true, force: true })
+    await mkdir(extractRoot, { recursive: true })
+    log('Extracting standalone Python runtime.')
+    await run('tar', ['-xzf', archivePath, '-C', extractRoot], {
+      cwd: rootDir,
+      env
+    })
+
+    const installRootCandidates = [
+      path.join(extractRoot, 'python', 'install'),
+      path.join(extractRoot, 'python')
+    ]
+    const installRoot = installRootCandidates.find((candidate) => existsSync(path.join(candidate, VENV_PYTHON_REL))) || ''
+    if (!installRoot) {
+      throw new Error(`Standalone Python archive did not contain ${VENV_PYTHON_REL}.`)
+    }
+
+    await rm(autoPythonRoot, { recursive: true, force: true })
+    await cp(installRoot, autoPythonRoot, {
+      recursive: true,
+      force: true,
+      dereference: true
+    })
+    await rm(extractRoot, { recursive: true, force: true })
+    await assertPortableRuntime(autoPythonRoot)
+
+    const pythonExe = path.join(autoPythonRoot, VENV_PYTHON_REL)
+    log('Installing bundled STT Python dependencies.')
+    await run(pythonExe, ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], {
+      cwd: rootDir,
+      env
+    })
+    await run(pythonExe, ['-m', 'pip', 'install', '-r', requirementsPath], {
+      cwd: rootDir,
+      env
+    })
+
+    return {
+      sourceRoot: autoPythonRoot,
+      relativePythonBin: VENV_PYTHON_REL,
+      sourceType: 'standalone-python'
+    }
   }
 
   function pythonRuntimeCandidates() {
@@ -168,6 +378,7 @@ export async function ensureBundledSttRuntime(options = {}) {
   async function validatePythonRuntime(pythonRuntime) {
     const pythonExe = path.join(pythonRuntime.sourceRoot, pythonRuntime.relativePythonBin)
     log(`Validating bundled Python runtime at ${pythonExe}.`)
+    await assertPortableRuntime(pythonRuntime.sourceRoot)
     try {
       await runCapture(pythonExe, [
         '-c',
@@ -177,7 +388,10 @@ export async function ensureBundledSttRuntime(options = {}) {
         ].join('; ')
       ], {
         cwd: rootDir,
-        env
+        env: {
+          ...env,
+          PYTHONDONTWRITEBYTECODE: '1'
+        }
       })
     } catch {
       throw new Error(
@@ -219,6 +433,11 @@ export async function ensureBundledSttRuntime(options = {}) {
   }
 
   async function createAutoPythonRuntime() {
+    const standalonePython = await createStandalonePythonRuntime()
+    if (standalonePython) {
+      return standalonePython
+    }
+
     const bootstrapPython = await resolveBootstrapPython()
     log(`Creating bundled STT runtime from ${bootstrapPython}.`)
     await rm(autoPythonRoot, { recursive: true, force: true })
@@ -237,6 +456,8 @@ export async function ensureBundledSttRuntime(options = {}) {
       cwd: rootDir,
       env
     })
+    await sanitizePythonRuntime(autoPythonRoot)
+    await assertPortableRuntime(autoPythonRoot)
 
     return {
       sourceRoot: autoPythonRoot,
@@ -270,6 +491,9 @@ export async function ensureBundledSttRuntime(options = {}) {
         if (pythonRuntime.sourceType === 'repo-venv') {
           log('Repo .venv is missing faster-whisper. Building a dedicated bundled runtime instead.')
           pythonRuntime = await createAutoPythonRuntime()
+        } else if (error?.code === 'NON_PORTABLE_PYTHON_RUNTIME' && pythonRuntime.sourceType === 'generated-runtime') {
+          log('Existing generated STT runtime is not portable. Rebuilding it.')
+          pythonRuntime = await createAutoPythonRuntime()
         } else if (pythonRuntime.sourceType === 'generated-runtime') {
           log('Existing bundled STT runtime is incomplete. Repairing it in place.')
           await installBundledPythonDependencies(pythonRuntime)
@@ -285,6 +509,13 @@ export async function ensureBundledSttRuntime(options = {}) {
     await cp(pythonRuntime.sourceRoot, targetRoot, {
       recursive: true,
       force: true
+    })
+    await sanitizePythonRuntime(targetRoot)
+    await assertPortableRuntime(targetRoot)
+    await validatePythonRuntime({
+      sourceRoot: targetRoot,
+      relativePythonBin: pythonRuntime.relativePythonBin,
+      sourceType: 'staged-runtime'
     })
     return {
       targetRoot,
@@ -344,6 +575,11 @@ export async function ensureBundledSttRuntime(options = {}) {
       await access(pythonExe)
       await access(transcribeScript)
       await access(workerScript)
+      await validatePythonRuntime({
+        sourceRoot: pythonRoot,
+        relativePythonBin: VENV_PYTHON_REL,
+        sourceType: 'staged-runtime'
+      })
       log('Reusing existing staged STT runtime.')
       return {
         runtimeRoot: outputRoot,
@@ -354,7 +590,8 @@ export async function ensureBundledSttRuntime(options = {}) {
         daemonScript,
         modelDir: await pathExists(modelDir) ? modelDir : ''
       }
-    } catch {
+    } catch (error) {
+      log(`Ignoring existing staged STT runtime: ${error?.message || error}`)
       return null
     }
   }
@@ -368,13 +605,19 @@ export async function ensureBundledSttRuntime(options = {}) {
 
     try {
       await access(pythonExe)
+      await validatePythonRuntime({
+        sourceRoot: path.dirname(path.dirname(pythonExe)),
+        relativePythonBin: VENV_PYTHON_REL,
+        sourceType: 'staged-python-runtime'
+      })
       log('Reusing existing staged Python runtime.')
       return {
         runtimeRoot: outputRoot,
         pythonBin: pythonExe,
         modelDir: await pathExists(modelDir) ? modelDir : ''
       }
-    } catch {
+    } catch (error) {
+      log(`Ignoring existing staged Python runtime: ${error?.message || error}`)
       return null
     }
   }
@@ -399,6 +642,12 @@ export async function ensureBundledSttRuntime(options = {}) {
   const existingRuntime = await resolveExistingStagedRuntime()
   if (existingRuntime) {
     await repairBundledPythonRuntimeMetadata(existingRuntime.pythonBin)
+    await sanitizePythonRuntime(path.join(outputRoot, 'stt', 'python'))
+    await validatePythonRuntime({
+      sourceRoot: path.join(outputRoot, 'stt', 'python'),
+      relativePythonBin: VENV_PYTHON_REL,
+      sourceType: 'staged-runtime'
+    })
     const stagedScripts = await stageSttScripts()
     const manifestPath = await writeManifest({
       version: 1,
@@ -423,6 +672,12 @@ export async function ensureBundledSttRuntime(options = {}) {
   const existingPythonRuntime = await resolveExistingPythonRuntime()
   if (existingPythonRuntime) {
     await repairBundledPythonRuntimeMetadata(existingPythonRuntime.pythonBin)
+    await sanitizePythonRuntime(path.join(outputRoot, 'stt', 'python'))
+    await validatePythonRuntime({
+      sourceRoot: path.join(outputRoot, 'stt', 'python'),
+      relativePythonBin: VENV_PYTHON_REL,
+      sourceType: 'staged-python-runtime'
+    })
     const stagedScripts = await stageSttScripts()
     const modelDir = await stageModelDirectory()
     const resolvedModelDir = modelDir ? path.join(outputRoot, modelDir) : existingPythonRuntime.modelDir

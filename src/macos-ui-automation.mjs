@@ -5,8 +5,14 @@ import { fileURLToPath } from 'node:url'
 
 const execFileAsync = promisify(execFile)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const DEFAULT_MACOS_UI_HELPER = path.join(
+  __dirname,
+  '..',
+  'scripts',
+  process.env.DICTATION_TRAY_PACKAGED ? 'DicTray' : 'macos-hotkey-hook'
+)
 const MACOS_UI_HELPER = String(process.env.DICTATION_TRAY_MACOS_UI_HELPER || '').trim()
-  || path.join(__dirname, '..', 'scripts', 'macos-ui-automation')
+  || DEFAULT_MACOS_UI_HELPER
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -79,6 +85,27 @@ async function readClipboardText() {
   } catch {
     return ''
   }
+}
+
+function scheduleClipboardPreserve(text) {
+  const value = String(text || '')
+  const timer = setTimeout(() => {
+    void (async () => {
+      try {
+        const currentClipboard = await readClipboardText()
+        if (currentClipboard !== value) {
+          await writeClipboardText(value)
+        }
+      } catch {
+        try {
+          await writeClipboardText(value)
+        } catch {
+          // Clipboard preservation is best-effort and should never delay insertion.
+        }
+      }
+    })()
+  }, 120)
+  timer.unref?.()
 }
 
 async function focusTargetWindow(window = {}) {
@@ -203,29 +230,14 @@ export class MacosUiAutomationBridge {
     if (action === 'paste_text') {
       const text = String(input?.text || '')
       const startedAt = performance.now()
-      const previousClipboard = await readClipboardText()
       const targetProcess = compact(input?.window?.processName)
       const targetTitle = compact(input?.window?.titleContains || input?.window?.title)
       await writeClipboardText(text)
       const clipboardSet = Math.round(performance.now() - startedAt)
-      await delay(80)
       const pasteStartedAt = performance.now()
       const focusResult = await runUiHelper('paste', [targetProcess, targetTitle])
       const paste = Math.round(performance.now() - pasteStartedAt)
-      let clipboardRestore = 0
-      let clipboardRestoreSuccess = true
-      let clipboardRestoreError = ''
-      if (previousClipboard !== text) {
-        await delay(120)
-        const restoreStartedAt = performance.now()
-        try {
-          await writeClipboardText(previousClipboard)
-        } catch (error) {
-          clipboardRestoreSuccess = false
-          clipboardRestoreError = String(error?.message || error)
-        }
-        clipboardRestore = Math.round(performance.now() - restoreStartedAt)
-      }
+      scheduleClipboardPreserve(text)
       return {
         ok: true,
         window: null,
@@ -234,11 +246,14 @@ export class MacosUiAutomationBridge {
             focusWindow: focusResult.durationMs || 0,
             focusWindowSuccess: Boolean(focusResult.focused),
             focusWindowError: focusResult.error || '',
+            pasteShortcut: compact(focusResult.shortcut),
+            pasteShortcutSource: compact(focusResult.shortcutSource),
             clipboardSet,
             paste,
-            clipboardRestore,
-            clipboardRestoreSuccess,
-            clipboardRestoreError
+            clipboardPreserve: 0,
+            clipboardPreserveDeferred: true,
+            clipboardPreserveSuccess: true,
+            clipboardPreserveError: ''
           }
         }
       }

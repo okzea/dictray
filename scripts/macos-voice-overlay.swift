@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Foundation
 
 struct OverlayBounds: Decodable {
@@ -33,7 +34,7 @@ final class OverlayView: NSView {
   private func phaseTitle() -> String {
     switch (payload.phase ?? "idle").trimmingCharacters(in: .whitespacesAndNewlines) {
     case "processing":
-      return "Getting Ready"
+      return "Listening"
     case "listening":
       return "Listening"
     case "transcribing":
@@ -52,17 +53,26 @@ final class OverlayView: NSView {
   private func detailText() -> String {
     let error = (payload.error ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if !error.isEmpty {
-      return error
+      return compactDetail(error)
     }
     let note = (payload.note ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if !note.isEmpty {
-      return note
+      return compactDetail(note)
     }
     let target = (payload.targetWindow ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if !target.isEmpty {
-      return target
+      return compactDetail(target)
     }
     return "Hold the shortcut and speak."
+  }
+
+  private func compactDetail(_ value: String) -> String {
+    let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    let limit = 34
+    if text.count <= limit {
+      return text
+    }
+    return String(text.prefix(limit - 1)).trimmingCharacters(in: .whitespacesAndNewlines) + "…"
   }
 
   override func draw(_ dirtyRect: NSRect) {
@@ -104,25 +114,73 @@ final class OverlayView: NSView {
     ]
 
     NSString(string: phaseTitle()).draw(in: NSRect(x: 38, y: rect.height - 37, width: rect.width - 56, height: 20), withAttributes: titleAttributes)
-    NSString(string: detailText()).draw(in: NSRect(x: 18, y: 34, width: rect.width - 36, height: 34), withAttributes: detailAttributes)
+    NSString(string: detailText()).draw(in: NSRect(x: 18, y: 10, width: rect.width - 36, height: 26), withAttributes: detailAttributes)
+  }
+}
 
-    let level = max(0, min(1, payload.inputLevel ?? 0))
-    let track = NSBezierPath(roundedRect: NSRect(x: 18, y: 18, width: rect.width - 36, height: 6), xRadius: 3, yRadius: 3)
-    NSColor(calibratedWhite: 1, alpha: 0.12).setFill()
-    track.fill()
-    let fillWidth = max(8, (rect.width - 36) * CGFloat(level))
-    let fill = NSBezierPath(roundedRect: NSRect(x: 18, y: 18, width: fillWidth, height: 6), xRadius: 3, yRadius: 3)
-    accent.setFill()
-    fill.fill()
+final class EarconCuePlayer {
+  private var players: [String: AVAudioPlayer] = [:]
+  private var lastPlayedAt: [String: Date] = [:]
+
+  init() {
+    preload("listen")
+    preload("submit")
+  }
+
+  private func assetURL(named name: String) -> URL? {
+    let executablePath = (CommandLine.arguments.first ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    let executableURL = executablePath.isEmpty
+      ? (Bundle.main.executableURL ?? URL(fileURLWithPath: "macos-voice-overlay").standardizedFileURL)
+      : URL(fileURLWithPath: executablePath).standardizedFileURL
+    let appCoreURL = executableURL.deletingLastPathComponent().deletingLastPathComponent()
+    let url = appCoreURL
+      .appendingPathComponent("assets")
+      .appendingPathComponent("earcons")
+      .appendingPathComponent("\(name).mp3")
+    return FileManager.default.fileExists(atPath: url.path) ? url : nil
+  }
+
+  private func preload(_ name: String) {
+    guard let url = assetURL(named: name) else {
+      return
+    }
+
+    do {
+      let player = try AVAudioPlayer(contentsOf: url)
+      player.volume = 1.0
+      player.prepareToPlay()
+      players[name] = player
+    } catch {
+      fputs("[dictray] Failed to preload \(name) earcon: \(error.localizedDescription)\n", stderr)
+    }
+  }
+
+  func play(_ name: String) {
+    let now = Date()
+    if let previous = lastPlayedAt[name], now.timeIntervalSince(previous) < 0.12 {
+      return
+    }
+    guard let player = players[name] else {
+      return
+    }
+
+    lastPlayedAt[name] = now
+    player.stop()
+    player.currentTime = 0
+    player.prepareToPlay()
+    player.play()
   }
 }
 
 final class OverlayController: NSObject, NSApplicationDelegate {
   private let statePath: String
-  private let overlayView = OverlayView(frame: NSRect(x: 0, y: 0, width: 308, height: 104))
+  private let overlayView = OverlayView(frame: NSRect(x: 0, y: 0, width: 292, height: 78))
+  private let earconCuePlayer = EarconCuePlayer()
   private var window: NSPanel?
   private var timer: Timer?
   private var lastRenderedState = ""
+  private var lastCuePhase = "idle"
+  private var lastCueVisible = false
 
   init(statePath: String) {
     self.statePath = statePath
@@ -132,7 +190,7 @@ final class OverlayController: NSObject, NSApplicationDelegate {
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
     let panel = NSPanel(
-      contentRect: NSRect(x: 200, y: 200, width: 308, height: 104),
+      contentRect: NSRect(x: 200, y: 200, width: 292, height: 78),
       styleMask: [.borderless, .nonactivatingPanel],
       backing: .buffered,
       defer: false
@@ -157,8 +215,8 @@ final class OverlayController: NSObject, NSApplicationDelegate {
   }
 
   private func appKitFrame(from bounds: OverlayBounds?) -> NSRect {
-    let width = max(220, bounds?.width ?? 308)
-    let height = max(72, bounds?.height ?? 104)
+    let width = max(220, bounds?.width ?? 292)
+    let height = max(72, bounds?.height ?? 78)
     let topLeftX = bounds?.x ?? 200
     let topLeftY = bounds?.y ?? 200
     let screen = NSScreen.screens.first { screen in
@@ -170,6 +228,32 @@ final class OverlayController: NSObject, NSApplicationDelegate {
     let x = min(max(topLeftX, screenFrame.minX + 12), screenFrame.maxX - width - 12)
     let y = min(max(screenFrame.maxY - topLeftY - height, screenFrame.minY + 12), screenFrame.maxY - height - 12)
     return NSRect(x: x, y: y, width: width, height: height)
+  }
+
+  private func normalizedPhase(_ payload: OverlayPayload) -> String {
+    return (payload.phase ?? "idle").trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+
+  private func syncEarconCue(for payload: OverlayPayload) {
+    let visible = payload.visible == true
+    let phase = normalizedPhase(payload)
+    defer {
+      lastCueVisible = visible
+      lastCuePhase = phase
+    }
+
+    guard visible else {
+      return
+    }
+
+    if phase == "listening" && (!lastCueVisible || lastCuePhase != "listening") {
+      earconCuePlayer.play("listen")
+      return
+    }
+
+    if ["processing", "transcribing"].contains(phase) && lastCueVisible && lastCuePhase == "listening" {
+      earconCuePlayer.play("submit")
+    }
   }
 
   private func refresh() {
@@ -192,6 +276,7 @@ final class OverlayController: NSObject, NSApplicationDelegate {
 
     overlayView.payload = payload
     window?.setFrame(appKitFrame(from: payload.bounds), display: true)
+    syncEarconCue(for: payload)
     if payload.visible == true {
       window?.orderFrontRegardless()
     } else {

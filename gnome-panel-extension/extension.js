@@ -171,9 +171,9 @@ function buildOverlayCopy(state = {}) {
       };
     case 'processing':
       return {
-        chip: 'Processing',
+        chip: 'Listening',
         meta,
-        headline: 'Finishing capture',
+        headline: 'Release when you are done',
         subline: targetWindow || 'Current window'
       };
     case 'transcribing':
@@ -774,17 +774,20 @@ function writeFocusedWindowGeometry() {
 
 const DicTrayIndicator = GObject.registerClass(
 class DicTrayIndicator extends PanelMenu.Button {
-  constructor() {
+  constructor(extensionPath = '') {
     super(0.5, 'DicTray');
     this._state = null;
     this._menuSignature = '';
     this._overlay = new DicTrayOverlay();
+    this._logoReadyGicon = null;
+    this._logoActiveGicon = null;
 
     const box = new St.BoxLayout({
       x_expand: false,
       y_expand: false,
       y_align: Clutter.ActorAlign.CENTER,
     });
+    this._logo = this._createLogoIcon(extensionPath);
     this._statusDot = new St.Label({
       text: '○',
       y_align: Clutter.ActorAlign.CENTER,
@@ -795,7 +798,11 @@ class DicTrayIndicator extends PanelMenu.Button {
       style_class: 'dictray-panel-label',
     });
     this._statusDot.style = 'margin-right: 4px; color: #9aa0a6;';
-    box.add_child(this._statusDot);
+    if (this._logo) {
+      box.add_child(this._logo);
+    } else {
+      box.add_child(this._statusDot);
+    }
     box.add_child(this._title);
     this.add_child(box);
     this.menu._boxPointer?.setSourceAlignment?.(0.5);
@@ -812,6 +819,53 @@ class DicTrayIndicator extends PanelMenu.Button {
     });
 
     this._applyMissingState();
+  }
+
+  _createLogoIcon(extensionPath) {
+    const readyLogoPath = GLib.build_filenamev([
+      String(extensionPath || '').trim(),
+      'icons',
+      'dictray-logo-symbolic.png',
+    ]);
+    const activeLogoPath = GLib.build_filenamev([
+      String(extensionPath || '').trim(),
+      'icons',
+      'dictray-logo-active-symbolic.png',
+    ]);
+    if (!readyLogoPath || !GLib.file_test(readyLogoPath, GLib.FileTest.EXISTS))
+      return null;
+
+    this._logoReadyGicon = Gio.icon_new_for_string(readyLogoPath);
+    this._logoActiveGicon = GLib.file_test(activeLogoPath, GLib.FileTest.EXISTS)
+      ? Gio.icon_new_for_string(activeLogoPath)
+      : this._logoReadyGicon;
+
+    const icon = new St.Icon({
+      gicon: this._logoReadyGicon,
+      icon_size: 18,
+      y_align: Clutter.ActorAlign.CENTER,
+      style_class: 'system-status-icon',
+    });
+    icon.style = 'margin-right: 0; color: #e8eaed;';
+    return icon;
+  }
+
+  _applyIndicatorVisual(phase) {
+    const dictating = ACTIVE_PHASES.has(String(phase || '').trim());
+    if (this._logo) {
+      this._logo.gicon = dictating ? this._logoActiveGicon : this._logoReadyGicon;
+      this._logo.style = dictating
+        ? 'margin-right: 0; color: #7ee787;'
+        : 'margin-right: 0; color: #e8eaed;';
+      this._title.text = '';
+      return;
+    }
+
+    this._statusDot.text = dictating ? '●' : '○';
+    this._statusDot.style = dictating
+      ? 'margin-right: 4px; color: #7ee787;'
+      : 'margin-right: 4px; color: #9aa0a6;';
+    this._title.text = ' DicTray';
   }
 
   _processCommand() {
@@ -850,21 +904,14 @@ class DicTrayIndicator extends PanelMenu.Button {
     this._state = next;
     syncRuntimeKeybindings(next);
     const phase = String(next.phase || '').trim() || 'idle';
-    const dictating = ACTIVE_PHASES.has(phase);
-    this._statusDot.text = dictating ? '●' : '○';
-    this._statusDot.style = dictating
-      ? 'margin-right: 4px; color: #7ee787;'
-      : 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray';
+    this._applyIndicatorVisual(phase);
     this._overlay.update(next);
     this._syncMenu(next.menu);
     _activeExtension?._syncCancelKeybinding();
   }
 
   _applyMissingState() {
-    this._statusDot.text = '○';
-    this._statusDot.style = 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray';
+    this._applyIndicatorVisual('idle');
     this._state = null;
     this._overlay.hideNow();
     this._syncMenu([
@@ -878,9 +925,9 @@ class DicTrayIndicator extends PanelMenu.Button {
   }
 
   _applyQuitState() {
-    this._statusDot.text = '○';
-    this._statusDot.style = 'margin-right: 4px; color: #9aa0a6;';
-    this._title.text = ' DicTray (stopped)';
+    this._applyIndicatorVisual('idle');
+    if (!this._logo)
+      this._title.text = ' DicTray (stopped)';
     this._state = null;
     this._overlay.hideNow();
     this._syncMenu([
@@ -1033,7 +1080,7 @@ export default class DicTrayExtension extends Extension {
     this._lastToggleMs = 0;
     this._settings = this.getSettings(KEYBINDING_SCHEMA_ID);
     _activeExtension = this;
-    this._indicator = new DicTrayIndicator();
+    this._indicator = new DicTrayIndicator(this.path || this.dir?.get_path?.() || '');
     Main.panel.addToStatusArea(EXTENSION_ID, this._indicator, 1, 'right');
 
     this._bindKeybindings();

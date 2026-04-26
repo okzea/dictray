@@ -171,6 +171,39 @@ function plist(version) {
 `
 }
 
+function helperPlist({
+  executable,
+  identifier,
+  displayName = appName,
+  version = '0.1.0'
+}) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>${displayName}</string>
+  <key>CFBundleExecutable</key>
+  <string>${executable}</string>
+  <key>CFBundleIdentifier</key>
+  <string>${identifier}</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>${displayName}</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>${version}</string>
+  <key>CFBundleVersion</key>
+  <string>${version}</string>
+</dict>
+</plist>
+`
+}
+
 function launcherScript() {
   return `#!/usr/bin/env bash
 set -euo pipefail
@@ -188,6 +221,7 @@ export DICTATION_TRAY_BUNDLED_RUNTIME_DIR="$RUNTIME_DIR"
 export DICTATION_TRAY_FFMPEG_BIN="$FFMPEG_BIN"
 export DICTATION_TRAY_CAPTURE_FFMPEG_BIN="$FFMPEG_BIN"
 export STT_FFMPEG_BIN="$FFMPEG_BIN"
+export PYTHONDONTWRITEBYTECODE=1
 export PATH="$RUNTIME_DIR/ffmpeg/bin:$RUNTIME_DIR/node/bin:$PATH"
 
 exec "$NODE_BIN" "$APP_CORE/tray/main.mjs" "$@"
@@ -444,16 +478,23 @@ async function stageFfmpegRuntime(runtimeDir) {
   }, null, 2)}\n`, 'utf8')
 }
 
-async function compileSwiftHelpers(appCoreDir) {
+async function compileSwiftHelpers(appCoreDir, version) {
   if (!hasCommand('swiftc')) {
     throw new Error('macOS packaging needs swiftc from Xcode Command Line Tools.')
   }
 
   const scriptsDir = path.join(appCoreDir, 'scripts')
+  const helperPlistDir = path.join(buildRoot, 'helper-plists')
+  await mkdir(helperPlistDir, { recursive: true })
   const helpers = [
     {
       source: path.join(rootDir, 'scripts', 'macos-hotkey-hook.swift'),
-      output: path.join(scriptsDir, 'macos-hotkey-hook')
+      output: path.join(scriptsDir, 'DicTray'),
+      plist: {
+        executable: 'DicTray',
+        identifier: `${bundleIdentifier}.accessibility-helper`,
+        displayName: appName
+      }
     },
     {
       source: path.join(rootDir, 'scripts', 'macos-menu-bar.swift'),
@@ -475,7 +516,25 @@ async function compileSwiftHelpers(appCoreDir) {
 
   for (const helper of helpers) {
     log(`Compiling ${path.basename(helper.output)}.`)
-    await run('swiftc', [helper.source, '-O', '-o', helper.output])
+    const args = [helper.source, '-O', '-o', helper.output]
+    if (helper.plist) {
+      const plistPath = path.join(helperPlistDir, `${path.basename(helper.output)}.plist`)
+      await writeFile(plistPath, helperPlist({
+        ...helper.plist,
+        version
+      }), 'utf8')
+      args.push(
+        '-Xlinker',
+        '-sectcreate',
+        '-Xlinker',
+        '__TEXT',
+        '-Xlinker',
+        '__info_plist',
+        '-Xlinker',
+        plistPath
+      )
+    }
+    await run('swiftc', args)
     await chmod(helper.output, 0o755)
   }
 }
@@ -518,7 +577,7 @@ async function stageAppBundle(outputDir, version, args) {
 
   log('Copying app core.')
   await stageAppCore(appCoreDir)
-  await compileSwiftHelpers(appCoreDir)
+  await compileSwiftHelpers(appCoreDir, version)
   await stageNodeRuntime(runtimeDir)
   await stageFfmpegRuntime(runtimeDir)
   await stageSttRuntime(runtimeDir, args)
@@ -546,21 +605,31 @@ async function maybeCodesign(appPath) {
   }
 
   const executableCandidates = [
-    path.join(appPath, 'Contents', 'MacOS', 'dictray'),
-    path.join(appPath, 'Contents', 'Resources', 'runtime', 'node', 'bin', 'node'),
-    path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-hotkey-hook'),
-    path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-menu-bar'),
-    path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-onboarding'),
-    path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-voice-overlay'),
-    path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-ui-automation')
+    { path: path.join(appPath, 'Contents', 'MacOS', 'dictray') },
+    { path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'node', 'bin', 'node') },
+    {
+      path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'DicTray'),
+      identifier: `${bundleIdentifier}.accessibility-helper`
+    },
+    { path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-hotkey-hook') },
+    { path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-menu-bar') },
+    { path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-onboarding') },
+    { path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-voice-overlay') },
+    { path: path.join(appPath, 'Contents', 'Resources', 'runtime', 'app-core', 'scripts', 'macos-ui-automation') }
   ]
 
   log('Applying ad-hoc signatures to app executables.')
-  for (const candidate of executableCandidates) {
+  for (const entry of executableCandidates) {
+    const candidate = entry.path
     if (!await pathExists(candidate)) {
       continue
     }
-    await run('codesign', ['--force', '--sign', '-', candidate], { stdio: 'ignore' }).catch((error) => {
+    const args = ['--force', '--sign', '-']
+    if (entry.identifier) {
+      args.push('--identifier', entry.identifier)
+    }
+    args.push(candidate)
+    await run('codesign', args, { stdio: 'ignore' }).catch((error) => {
       log(`Ad-hoc codesign skipped for ${path.basename(candidate)}: ${error?.message || error}`)
     })
   }

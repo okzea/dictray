@@ -78,6 +78,8 @@ final class StatusMenuController: NSObject, NSApplicationDelegate {
   private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
   private var timer: Timer?
   private var lastRenderedState = ""
+  private var statusIcon: NSImage?
+  private var activeStatusIcon: NSImage?
 
   init(statePath: String, commandPath: String) {
     self.statePath = statePath
@@ -87,7 +89,14 @@ final class StatusMenuController: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory)
-    statusItem.button?.title = "DicTray"
+    statusIcon = loadStatusIcon(named: "dictray-logo-template.png", template: true, size: NSSize(width: 15, height: 15))
+    activeStatusIcon = makeActiveStatusIcon(
+      logo: loadStatusIcon(named: "dictray-logo-dark.png", template: false, size: NSSize(width: 15, height: 15))
+    )
+    if statusIcon != nil || activeStatusIcon != nil {
+      statusItem.length = 26
+    }
+    configureStatusButton(dictating: false, tooltip: "DicTray")
     renderPlaceholderMenu()
     refresh()
     timer = Timer.scheduledTimer(withTimeInterval: 0.45, repeats: true) { [weak self] _ in
@@ -96,6 +105,7 @@ final class StatusMenuController: NSObject, NSApplicationDelegate {
   }
 
   private func renderPlaceholderMenu() {
+    configureStatusButton(dictating: false, tooltip: "Waiting for DicTray")
     let menu = NSMenu()
     let item = NSMenuItem(title: "Waiting for DicTray", action: nil, keyEquivalent: "")
     item.isEnabled = false
@@ -126,8 +136,7 @@ final class StatusMenuController: NSObject, NSApplicationDelegate {
   private func render(_ payload: StatePayload) {
     let phase = (payload.phase ?? "idle").trimmingCharacters(in: .whitespacesAndNewlines)
     let dictating = payload.dictating == true || phase != "idle"
-    statusItem.button?.title = dictating ? "DicTray REC" : "DicTray"
-    statusItem.button?.toolTip = payload.phaseLabel ?? phase
+    configureStatusButton(dictating: dictating, tooltip: payload.phaseLabel ?? phase)
 
     let menu = NSMenu()
     appendMenuItems(payload.menu ?? [], to: menu)
@@ -136,6 +145,73 @@ final class StatusMenuController: NSObject, NSApplicationDelegate {
       return
     }
     statusItem.menu = menu
+  }
+
+  private func loadStatusIcon(named filename: String, template: Bool, size: NSSize) -> NSImage? {
+    let executable = URL(fileURLWithPath: CommandLine.arguments.first ?? "").resolvingSymlinksInPath()
+    let appCore = executable.deletingLastPathComponent().deletingLastPathComponent()
+    let candidates = [
+      appCore.appendingPathComponent("assets/brand/\(filename)")
+    ]
+
+    for candidate in candidates {
+      if let image = NSImage(contentsOf: candidate) {
+        image.isTemplate = template
+        image.size = size
+        return image
+      }
+    }
+
+    return nil
+  }
+
+  private func makeActiveStatusIcon(logo: NSImage?) -> NSImage? {
+    guard let logo else {
+      return nil
+    }
+
+    let image = NSImage(size: NSSize(width: 25, height: 18))
+    image.lockFocus()
+
+    logo.draw(
+      in: NSRect(x: 1, y: 1.5, width: 15, height: 15),
+      from: .zero,
+      operation: .sourceOver,
+      fraction: 1.0
+    )
+
+    NSColor.systemGreen.setFill()
+    NSBezierPath(ovalIn: NSRect(x: 18, y: 6, width: 6, height: 6)).fill()
+
+    image.unlockFocus()
+    image.isTemplate = false
+    return image
+  }
+
+  private func configureStatusButton(dictating: Bool, tooltip: String) {
+    guard let button = statusItem.button else {
+      return
+    }
+
+    let icon = dictating
+      ? (activeStatusIcon ?? statusIcon)
+      : (statusIcon ?? activeStatusIcon)
+
+    if let icon {
+      button.title = ""
+      button.image = icon
+      button.imagePosition = .imageOnly
+      button.layer?.backgroundColor = nil
+      button.layer?.cornerRadius = 0
+      button.layer?.masksToBounds = false
+      if #available(macOS 10.14, *) {
+        button.contentTintColor = nil
+      }
+    } else {
+      button.image = nil
+      button.title = dictating ? "DicTray REC" : "DicTray"
+    }
+    button.toolTip = tooltip
   }
 
   private func appendMenuItems(_ items: [MenuPayload], to menu: NSMenu) {

@@ -145,8 +145,11 @@ func focusTarget(processName: String, titleContains: String) -> Bool {
   guard let app = runningApp(named: processName) else {
     return false
   }
+  if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+    return true
+  }
   app.activate()
-  Thread.sleep(forTimeInterval: 0.12)
+  Thread.sleep(forTimeInterval: 0.06)
 
   if accessibilityTrusted() {
     let titleNeedle = compact(titleContains).lowercased()
@@ -158,7 +161,7 @@ func focusTarget(processName: String, titleContains: String) -> Bool {
       AXUIElementPerformAction(matchingWindow, kAXRaiseAction as CFString)
     }
   }
-  Thread.sleep(forTimeInterval: 0.08)
+  Thread.sleep(forTimeInterval: 0.04)
   return true
 }
 
@@ -171,7 +174,7 @@ func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
   down.flags = flags
   up.flags = flags
   down.post(tap: .cghidEventTap)
-  usleep(35_000)
+  usleep(25_000)
   up.post(tap: .cghidEventTap)
 }
 

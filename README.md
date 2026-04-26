@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/brand/dictray-logo-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="assets/brand/dictray-logo-light.png">
+  <img alt="DicTray logo" src="assets/brand/dictray-logo-light.png" width="96">
+</picture>
+
 # DicTray
 
 DicTray is a standalone tray/menu-bar app for fast local dictation on Linux and macOS, with Windows helper code still kept in the repo.
@@ -80,6 +86,8 @@ Regenerate the app icon assets from the SVG source:
 ```powershell
 pnpm icon:export
 ```
+
+The brand mark variants live under `assets/brand/`: `dictray-logo-dark.*` is white for dark surfaces, `dictray-logo-light.*` is black for light surfaces, `dictray-logo-active.*` is green for active states, and `dictray-logo-template.png` is used where the OS handles menu-bar tinting.
 
 The Windows tray uses the generated `assets/app-icon.ico`.
 
@@ -205,8 +213,8 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 - For local STT, the tray reports the active device/model in the status line.
 - Rewrite model selection is currently available for the optional Ollama provider only.
 - If focused-window paste fails, the final text is copied to the clipboard as a fallback.
-- macOS uses small native Swift helpers for the menu bar, global hotkey hook, Quick Start window, floating voice overlay, and focused-app paste, plus `pbcopy` for clipboard staging and `ffmpeg -f avfoundation` for microphone capture.
-- On macOS, grant Accessibility permission when prompted so the hotkey hook and paste automation can control the focused app. If paste or the hotkey is blocked, open System Settings > Privacy & Security > Accessibility and enable DicTray or its bundled helper. Grant Microphone permission to DicTray when macOS prompts for capture.
+- macOS uses small native Swift helpers for the menu bar, Quick Start window, floating voice overlay, and focused-app paste, plus `pbcopy` for clipboard staging and `ffmpeg -f avfoundation` for microphone capture. Packaged builds use a DicTray-branded accessibility helper for global hotkeys and paste automation.
+- On macOS, grant Accessibility permission when prompted so DicTray can control the focused app. If paste or the hotkey is blocked, open System Settings > Privacy & Security > Accessibility and enable DicTray. Grant Microphone permission to DicTray when macOS prompts for capture.
 - GNOME (Linux) can show DicTray in the top bar using the companion extension under `gnome-panel-extension/`.
 - On GNOME Linux, DicTray now defaults to the native capture backend, uses the Shell extension for the fixed dictation overlay, and opens microphone setup / Quick Start as native GTK utilities.
 - Packaged Linux builds are now pure Node bundles under `dist/DicTray-linux-x64/`, install a product-managed GNOME extension payload and autostart entry on first launch, and let the extension launch DicTray if the app is not already running.

@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import Foundation
 
@@ -7,6 +8,13 @@ struct HotkeyDefinition {
   let shift: Bool
   let command: Bool
   let keyCode: Int64
+}
+
+struct KeyPressDefinition {
+  let keyCode: CGKeyCode
+  let flags: CGEventFlags
+  let rawShortcut: String
+  let source: String
 }
 
 enum HotkeyParseError: Error, CustomStringConvertible {
@@ -213,6 +221,23 @@ func requiredFlags(for definition: HotkeyDefinition) -> CGEventFlags {
   return flags
 }
 
+func shortcutFlags(control: Bool, option: Bool, shift: Bool, command: Bool) -> CGEventFlags {
+  var flags = CGEventFlags()
+  if control {
+    flags.insert(.maskControl)
+  }
+  if option {
+    flags.insert(.maskAlternate)
+  }
+  if shift {
+    flags.insert(.maskShift)
+  }
+  if command {
+    flags.insert(.maskCommand)
+  }
+  return flags
+}
+
 func eventMatches(_ event: CGEvent, definition: HotkeyDefinition) -> Bool {
   let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
   if keyCode != definition.keyCode {
@@ -232,13 +257,357 @@ func requiredModifiersStillPressed(_ event: CGEvent, definition: HotkeyDefinitio
   return true
 }
 
+func overlayStateAllowsCancel(_ statePath: String) -> Bool {
+  let trimmedPath = statePath.trimmingCharacters(in: .whitespacesAndNewlines)
+  if trimmedPath.isEmpty {
+    return false
+  }
+
+  guard let data = FileManager.default.contents(atPath: trimmedPath),
+        let object = try? JSONSerialization.jsonObject(with: data),
+        let payload = object as? [String: Any]
+  else {
+    return false
+  }
+
+  let phase = compact(payload["phase"] as? String ?? "").lowercased()
+  let visible = payload["visible"] as? Bool ?? false
+  return visible && [
+    "listening",
+    "processing",
+    "transcribing",
+    "rewriting",
+    "inserting",
+    "pending_insert"
+  ].contains(phase)
+}
+
 func emit(_ text: String) {
   print(text)
   fflush(stdout)
 }
 
+func jsonEscape(_ value: String) -> String {
+  var result = ""
+  for scalar in value.unicodeScalars {
+    switch scalar {
+    case "\"":
+      result += "\\\""
+    case "\\":
+      result += "\\\\"
+    case "\n":
+      result += "\\n"
+    case "\r":
+      result += "\\r"
+    case "\t":
+      result += "\\t"
+    default:
+      if scalar.value < 0x20 {
+        result += String(format: "\\u%04x", scalar.value)
+      } else {
+        result.append(Character(scalar))
+      }
+    }
+  }
+  return result
+}
+
+func jsonString(_ value: String) -> String {
+  "\"\(jsonEscape(value))\""
+}
+
+func printError(_ message: String, code: Int32 = 1) -> Never {
+  fputs("\(message)\n", stderr)
+  exit(code)
+}
+
+func compact(_ value: String) -> String {
+  value
+    .components(separatedBy: .whitespacesAndNewlines)
+    .filter { !$0.isEmpty }
+    .joined(separator: " ")
+}
+
+func accessibilityTrusted(prompt: Bool = false) -> Bool {
+  if !prompt {
+    return AXIsProcessTrusted()
+  }
+  let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+  return AXIsProcessTrustedWithOptions(options)
+}
+
+func runningApp(named name: String) -> NSRunningApplication? {
+  let normalized = compact(name).lowercased()
+  if normalized.isEmpty {
+    return NSWorkspace.shared.frontmostApplication
+  }
+  return NSWorkspace.shared.runningApplications.first { app in
+    compact(app.localizedName ?? "").lowercased() == normalized
+      || compact(app.bundleIdentifier ?? "").lowercased() == normalized
+  }
+}
+
+func axString(_ element: AXUIElement, _ attribute: String) -> String {
+  var value: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success else {
+    return ""
+  }
+  return value as? String ?? ""
+}
+
+func axPoint(_ element: AXUIElement, _ attribute: String) -> CGPoint? {
+  var value: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+        let axValue = value,
+        CFGetTypeID(axValue) == AXValueGetTypeID()
+  else {
+    return nil
+  }
+  var point = CGPoint.zero
+  guard AXValueGetValue((axValue as! AXValue), .cgPoint, &point) else {
+    return nil
+  }
+  return point
+}
+
+func axSize(_ element: AXUIElement, _ attribute: String) -> CGSize? {
+  var value: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(element, attribute as CFString, &value) == .success,
+        let axValue = value,
+        CFGetTypeID(axValue) == AXValueGetTypeID()
+  else {
+    return nil
+  }
+  var size = CGSize.zero
+  guard AXValueGetValue((axValue as! AXValue), .cgSize, &size) else {
+    return nil
+  }
+  return size
+}
+
+func appWindows(_ app: NSRunningApplication) -> [AXUIElement] {
+  let appElement = AXUIElementCreateApplication(app.processIdentifier)
+  var value: CFTypeRef?
+  guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value) == .success else {
+    return []
+  }
+  return value as? [AXUIElement] ?? []
+}
+
+func shortcutFromCocoaKeyEquivalent(_ value: String, source: String) -> KeyPressDefinition? {
+  let raw = value.trimmingCharacters(in: .whitespacesAndNewlines)
+  if raw.isEmpty {
+    return nil
+  }
+
+  var control = false
+  var option = false
+  var shift = false
+  var command = false
+  var key = ""
+
+  for scalar in raw.unicodeScalars {
+    switch scalar {
+    case "^":
+      control = true
+    case "~":
+      option = true
+    case "$":
+      shift = true
+    case "@":
+      command = true
+    default:
+      key.append(Character(scalar))
+    }
+  }
+
+  let trimmedKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
+  if trimmedKey.isEmpty {
+    return nil
+  }
+
+  if trimmedKey.count == 1 && trimmedKey.uppercased() == trimmedKey && trimmedKey.lowercased() != trimmedKey {
+    shift = true
+  }
+
+  do {
+    let code = try keyCode(for: trimmedKey.lowercased())
+    return KeyPressDefinition(
+      keyCode: CGKeyCode(code),
+      flags: shortcutFlags(control: control, option: option, shift: shift, command: command),
+      rawShortcut: raw,
+      source: source
+    )
+  } catch {
+    return nil
+  }
+}
+
+func userKeyEquivalent(named menuTitle: String, inDomain domain: String) -> String? {
+  guard let preferences = UserDefaults.standard.persistentDomain(forName: domain),
+        let equivalents = preferences["NSUserKeyEquivalents"] as? [String: Any]
+  else {
+    return nil
+  }
+
+  let normalizedTitle = compact(menuTitle).lowercased()
+  for (key, value) in equivalents {
+    if compact(key).lowercased() == normalizedTitle {
+      return value as? String
+    }
+  }
+  return nil
+}
+
+func pasteShortcut(for app: NSRunningApplication?) -> KeyPressDefinition {
+  var domains: [(String, String)] = []
+  if let bundleIdentifier = app?.bundleIdentifier, !bundleIdentifier.isEmpty {
+    domains.append((bundleIdentifier, "app:\(bundleIdentifier)"))
+  }
+  domains.append((UserDefaults.globalDomain, "global"))
+  domains.append((".GlobalPreferences", "global"))
+
+  for (domain, source) in domains {
+    if let raw = userKeyEquivalent(named: "Paste", inDomain: domain),
+       let shortcut = shortcutFromCocoaKeyEquivalent(raw, source: source) {
+      return shortcut
+    }
+  }
+
+  return KeyPressDefinition(
+    keyCode: 9,
+    flags: .maskCommand,
+    rawShortcut: "@v",
+    source: "default"
+  )
+}
+
+func focusedWindowPayload() -> String {
+  let app = NSWorkspace.shared.frontmostApplication
+  let appName = compact(app?.localizedName ?? "")
+  var title = ""
+  var left = 0.0
+  var top = 0.0
+  var width = 0.0
+  var height = 0.0
+
+  if accessibilityTrusted(), let app {
+    let windows = appWindows(app)
+    if let window = windows.first {
+      title = compact(axString(window, kAXTitleAttribute))
+      if let position = axPoint(window, kAXPositionAttribute), let size = axSize(window, kAXSizeAttribute) {
+        left = Double(position.x)
+        top = Double(position.y)
+        width = Double(size.width)
+        height = Double(size.height)
+      }
+    }
+  }
+
+  return [
+    "\"ok\":true",
+    "\"focused\":true",
+    "\"processName\":\(jsonString(appName))",
+    "\"macosApplication\":\(jsonString(appName))",
+    "\"title\":\(jsonString(title))",
+    "\"bounds\":{\"left\":\(left),\"top\":\(top),\"width\":\(width),\"height\":\(height)}"
+  ].joined(separator: ",")
+}
+
+func focusTarget(processName: String, titleContains: String) -> Bool {
+  guard let app = runningApp(named: processName) else {
+    return false
+  }
+  if NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier {
+    return true
+  }
+  app.activate()
+  Thread.sleep(forTimeInterval: 0.06)
+
+  if accessibilityTrusted() {
+    let titleNeedle = compact(titleContains).lowercased()
+    let windows = appWindows(app)
+    let matchingWindow = titleNeedle.isEmpty
+      ? windows.first
+      : windows.first { compact(axString($0, kAXTitleAttribute)).lowercased().contains(titleNeedle) }
+    if let matchingWindow {
+      AXUIElementPerformAction(matchingWindow, kAXRaiseAction as CFString)
+    }
+  }
+  Thread.sleep(forTimeInterval: 0.04)
+  return true
+}
+
+func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags = []) {
+  let source = CGEventSource(stateID: .hidSystemState)
+  if let source {
+    source.localEventsSuppressionInterval = 0
+  }
+  guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+        let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+  else {
+    printError("Unable to create keyboard event.")
+  }
+  down.flags = flags
+  up.flags = flags
+  down.post(tap: .cghidEventTap)
+  usleep(25_000)
+  up.post(tap: .cghidEventTap)
+  usleep(20_000)
+}
+
+func handleUiAutomationCommand(_ command: String) {
+  if command == "--self-test" {
+    print("{\"ok\":true,\"script\":\"macos-hotkey-hook\"}")
+    exit(0)
+  }
+
+  if command == "focused" {
+    print("{\(focusedWindowPayload())}")
+    exit(0)
+  }
+
+  if command == "paste-shortcut" {
+    let processName = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : ""
+    let app = runningApp(named: processName) ?? NSWorkspace.shared.frontmostApplication
+    let shortcut = pasteShortcut(for: app)
+    print("{\"ok\":true,\"shortcut\":\(jsonString(shortcut.rawShortcut)),\"shortcutSource\":\(jsonString(shortcut.source))}")
+    exit(0)
+  }
+
+  if command != "paste" && command != "enter" {
+    return
+  }
+
+  if !accessibilityTrusted(prompt: true) {
+    printError("Accessibility permission is required for macOS paste automation.", code: 2)
+  }
+
+  let processName = CommandLine.arguments.count > 2 ? CommandLine.arguments[2] : ""
+  let titleContains = CommandLine.arguments.count > 3 ? CommandLine.arguments[3] : ""
+  let targetApp = runningApp(named: processName)
+  let focused = focusTarget(processName: processName, titleContains: titleContains)
+
+  switch command {
+  case "paste":
+    let shortcut = pasteShortcut(for: targetApp ?? NSWorkspace.shared.frontmostApplication)
+    postKey(shortcut.keyCode, flags: shortcut.flags)
+    print("{\"ok\":true,\"focused\":\(focused ? "true" : "false"),\"shortcut\":\(jsonString(shortcut.rawShortcut)),\"shortcutSource\":\(jsonString(shortcut.source))}")
+  case "enter":
+    postKey(36)
+    print("{\"ok\":true,\"focused\":\(focused ? "true" : "false")}")
+  default:
+    printError("Unsupported macOS UI automation command: \(command)")
+  }
+  exit(0)
+}
+
+let firstArgument = CommandLine.arguments.count > 1 ? compact(CommandLine.arguments[1]) : ""
+handleUiAutomationCommand(firstArgument)
+
 let mainHotkey: HotkeyDefinition
 let promptHotkey: HotkeyDefinition?
+let cancelStatePath = CommandLine.arguments.count > 3 ? CommandLine.arguments[3] : ""
 
 do {
   mainHotkey = try parseHotkey(CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "CommandOrControl+Space")
@@ -255,19 +624,33 @@ do {
   exit(1)
 }
 
-let promptOptions = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-if !AXIsProcessTrustedWithOptions(promptOptions) {
+if !accessibilityTrusted(prompt: true) {
   fputs("Accessibility permission is required for global push-to-talk on macOS.\n", stderr)
   exit(2)
 }
 
 var mainIsDown = false
 var promptIsDown = false
+var escapeIsDown = false
 
 let callback: CGEventTapCallBack = { _, type, event, _ in
   let isKeyDown = type == .keyDown
   let isKeyUp = type == .keyUp
   let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+
+  if keyCode == 53 {
+    if isKeyDown && !escapeIsDown && (mainIsDown || promptIsDown || overlayStateAllowsCancel(cancelStatePath)) {
+      escapeIsDown = true
+      mainIsDown = false
+      promptIsDown = false
+      emit("cancel")
+      return nil
+    }
+    if isKeyUp && escapeIsDown {
+      escapeIsDown = false
+      return nil
+    }
+  }
 
   if isKeyDown && eventMatches(event, definition: mainHotkey) {
     if !mainIsDown {
