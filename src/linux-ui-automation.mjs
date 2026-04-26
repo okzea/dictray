@@ -41,6 +41,32 @@ async function tryExec(cmd, args, timeoutMs = 5000) {
   }
 }
 
+function formatCommandFailure(result) {
+  return result?.error || 'unknown error'
+}
+
+async function spawnClipboardProvider(cmd, args, options, text = null) {
+  const child = spawn(cmd, args, options)
+
+  if (child.stdin) {
+    child.stdin.on('error', () => {})
+  }
+
+  const started = new Promise((resolve, reject) => {
+    child.once('spawn', resolve)
+    child.once('error', (error) => {
+      reject(new Error(`Failed to start ${cmd}: ${error?.message || error}`))
+    })
+  })
+
+  if (child.stdin && text !== null) {
+    child.stdin.end(text)
+  }
+
+  await started
+  child.unref()
+}
+
 async function sendGnomeExtensionCommand(action) {
   await writeFile(GNOME_PANEL_INPUT_PATH, JSON.stringify({ action, requestedAt: Date.now() }), 'utf8')
   // Give the extension time to poll and process the command (polls every 150ms)
@@ -74,7 +100,15 @@ async function pasteWayland() {
   if (wtypeResult.ok) return
 
   // xdotool works for XWayland apps when running in a mixed session
-  await tryExec('xdotool', ['key', '--clearmodifiers', 'ctrl+v'])
+  const xdotoolResult = await tryExec('xdotool', ['key', '--clearmodifiers', 'ctrl+v'])
+  if (xdotoolResult.ok) return
+
+  throw new Error([
+    'Failed to paste on Wayland with available backends:',
+    `ydotool: ${formatCommandFailure(ydotoolResult)}`,
+    `wtype: ${formatCommandFailure(wtypeResult)}`,
+    `xdotool: ${formatCommandFailure(xdotoolResult)}`
+  ].join(' '))
 }
 
 async function returnX11(windowId = null) {
@@ -225,21 +259,18 @@ export class LinuxUiAutomationBridge {
         // serial (causes "No serial found for selection"). Use wl-copy instead.
         // wl-copy must stay alive to serve clipboard content on Wayland, so spawn
         // it detached. It exits automatically when another app takes the clipboard.
-        const wlCopy = spawn('wl-copy', ['--', text], {
+        await spawnClipboardProvider('wl-copy', ['--', text], {
           stdio: 'ignore',
           detached: true
         })
-        wlCopy.unref()
         await delay(50)
         await pasteWayland()
       } else {
         // xclip stays alive to serve clipboard, so spawn detached
-        const xclip = spawn('xclip', ['-selection', 'clipboard'], {
+        await spawnClipboardProvider('xclip', ['-selection', 'clipboard'], {
           stdio: ['pipe', 'ignore', 'ignore'],
           detached: true
-        })
-        xclip.stdin.end(text)
-        xclip.unref()
+        }, text)
         await delay(50)
         await pasteX11(windowId)
       }
