@@ -5736,7 +5736,6 @@ async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = 
   runtimeConfig.ollama.think = currentRewriteThink
   runtimeConfig.ollama.temperature = currentRewriteTemperature
   await loadOnboardingState()
-  runtimeConfig.stt.local.model = sttModelForSpeechEffort(onboardingState?.choices?.speechEffort)
   if (!hotkeyManagedByEnv()) {
     trayHotkey = normalizeTrayHotkey(onboardingState?.choices?.pushToTalkHotkey || trayHotkey)
   }

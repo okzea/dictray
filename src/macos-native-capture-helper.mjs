@@ -628,10 +628,17 @@ async function handleCommand(message = {}) {
         }
       })
     case CAPTURE_COMMAND_START_RECORDING:
-      await startRecording().catch((error) => {
+      try {
+        await startRecording()
+      } catch (error) {
+        const errorMessage = compact(error?.message || error || 'Failed to start native capture.')
         reportRecordingState('idle')
-        reportError(compact(error?.message || error || 'Failed to start native capture.'))
-      })
+        reportError(errorMessage)
+        return createCaptureResponse(message?.id, {
+          ok: false,
+          error: errorMessage
+        })
+      }
       return createCaptureResponse(message?.id, {
         ok: true,
         payload: {
