@@ -904,9 +904,7 @@ async function handleExternalMenuCommand(command = {}) {
       }
       break
     case 'stop':
-      if (voiceState.phase === 'listening') {
-        void stopDictationCapture()
-      }
+      void stopOrCancelActiveDictation()
       break
     case 'cancel':
       void cancelDictationCapture('Dictation was cancelled.')
@@ -5221,18 +5219,24 @@ function beginTurnContextCapture() {
 }
 
 async function toggleDictationCapture({ pressEnterAfterInsert: overridePressEnter } = {}) {
-  if (voiceState.phase === 'listening') {
-    await stopDictationCapture()
-    return
-  }
-  if (voiceState.phase === 'pending_insert') {
-    cancelActiveSubmission('Pending insertion was cancelled.')
-    clearVoiceState()
+  if (await stopOrCancelActiveDictation()) {
     return
   }
   await startDictationCapture({
     pressEnterAfterInsert: overridePressEnter
   })
+}
+
+async function stopOrCancelActiveDictation() {
+  if (voiceState.phase === 'listening') {
+    await stopDictationCapture()
+    return true
+  }
+  if (isActiveDictationPhase(voiceState.phase)) {
+    await cancelDictationCapture('Dictation was cancelled.')
+    return true
+  }
+  return false
 }
 
 async function startDictationCapture({
