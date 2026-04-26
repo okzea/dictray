@@ -2797,7 +2797,8 @@ function currentDailyVoiceDetailMs(baseSavedMs = currentDailyBaseTimeSavedMs()) 
 
 function currentDailyTimeSavedMs() {
   const baseSavedMs = currentDailyBaseTimeSavedMs()
-  return Math.max(0, baseSavedMs + currentDailyVoiceDetailMs(baseSavedMs))
+  const estimatedTypingMs = currentDailyEstimatedTypingMs()
+  return Math.max(0, Math.min(estimatedTypingMs, baseSavedMs + currentDailyVoiceDetailMs(baseSavedMs)))
 }
 
 async function recordGeneratedCharacters(text, { dictationMs = 0 } = {}) {
