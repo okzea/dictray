@@ -60,6 +60,13 @@ export async function launchLinuxNativeUi(scriptName, { statePath = '', commandP
     stdio: ['ignore', 'ignore', 'ignore']
   })
 
+  await new Promise((resolve, reject) => {
+    child.once('spawn', resolve)
+    child.once('error', (error) => {
+      reject(new Error(`Failed to start ${GJS_BIN}: ${error?.message || error}`))
+    })
+  })
+
   child.unref()
 
   return {

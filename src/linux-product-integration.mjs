@@ -256,12 +256,12 @@ export async function ensureLinuxProductSetup({
 
       if (!sourceExists) {
         log(`GNOME extension payload not found: ${sourceDir}`)
-      } else if (targetExists || !nextState.extensionManaged) {
+      } else {
         await syncExtensionFiles(sourceDir, targetDir)
         await compileExtensionSchemas(targetDir)
 
         const adoptingExistingInstall = targetExists && !nextState.extensionManaged
-        const shouldEnableNewInstall = !targetExists && !nextState.extensionManaged
+        const shouldEnableSyncedInstall = !targetExists
         const shouldReloadManagedInstall = targetExists
           && nextState.extensionManaged
           && normalizedVersion
@@ -273,7 +273,7 @@ export async function ensureLinuxProductSetup({
           if (!enableResult.ok) {
             log(`Failed to reload GNOME extension ${EXTENSION_UUID}`)
           }
-        } else if (shouldEnableNewInstall) {
+        } else if (shouldEnableSyncedInstall) {
           const enableResult = await run('gnome-extensions', ['enable', EXTENSION_UUID], { cwd: targetDir })
           if (!enableResult.ok) {
             log(`Failed to enable GNOME extension ${EXTENSION_UUID}`)
