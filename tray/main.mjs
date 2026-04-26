@@ -1164,6 +1164,9 @@ async function initMacosMenuBarBridge() {
         }
       })
       helper.on('error', (error) => {
+        if (macosMenuProcess === helper) {
+          macosMenuProcess = null
+        }
         console.error('[dictray] Failed to start macOS menu bar helper:', error?.message || error)
       })
     } catch (error) {

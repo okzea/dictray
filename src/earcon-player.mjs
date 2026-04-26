@@ -278,6 +278,9 @@ export function createEarconPlayer({ logger = null } = {}) {
         stdio: 'ignore',
         windowsHide: true
       })
+      child.once('error', (error) => {
+        log(`[dictray] Earcon playback failed: ${String(error?.message || error)}`)
+      })
       child.unref()
       return {
         ok: true,
