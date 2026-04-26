@@ -52,6 +52,7 @@ const {
   Tray
 } = HOST_RUNTIME
 const LINUX_HEADLESS_HOST = HOST_RUNTIME.headless === true && isLinuxHeadlessHost()
+const MACOS_HEADLESS_HOST = HOST_RUNTIME.headless === true && process.platform === 'darwin'
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 if (process.platform === 'linux') {
@@ -5296,8 +5297,8 @@ function stopHotkeyBridge() {
 }
 
 function registerPressOnlyHotkey() {
-  if (LINUX_HEADLESS_HOST) {
-    return
+  if (LINUX_HEADLESS_HOST || MACOS_HEADLESS_HOST) {
+    return false
   }
 
   globalShortcut.unregisterAll()
@@ -5310,8 +5311,10 @@ function registerPressOnlyHotkey() {
 
   const promptOk = registerPromptShortcut()
   if (!promptOk && trayHotkey !== promptTrayHotkey) {
-    return
+    return false
   }
+
+  return ok
 }
 
 function registerPromptShortcut() {
@@ -5416,8 +5419,11 @@ function startHotkeyBridge() {
     }
     console.error('[dictray] Failed to start hotkey bridge:', error)
     stopHotkeyBridge()
-    registerPressOnlyHotkey()
-    showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge failed. Falling back to press-to-toggle.`)
+    if (registerPressOnlyHotkey()) {
+      showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge failed. Falling back to press-to-toggle.`)
+    } else {
+      showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge failed. Global shortcut is unavailable.`)
+    }
   })
 
   bridge.on('exit', (code) => {
@@ -5433,8 +5439,11 @@ function startHotkeyBridge() {
     if (scheduleHotkeyBridgeRestart()) {
       return
     }
-    registerPressOnlyHotkey()
-    showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge stopped. Falling back to press-to-toggle.`)
+    if (registerPressOnlyHotkey()) {
+      showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge stopped. Falling back to press-to-toggle.`)
+    } else {
+      showNotification(APP_NAME, `${process.platform === 'darwin' ? 'macOS' : 'Windows'} hold-to-talk bridge stopped. Global shortcut is unavailable.`)
+    }
   })
 
   registerPromptShortcut()
@@ -5455,6 +5464,10 @@ async function registerHotkey() {
     } catch {
       const platformLabel = process.platform === 'darwin' ? 'macOS' : 'Windows'
       console.error(`[dictray] Missing ${platformLabel} hotkey helper: ${HOTKEY_BRIDGE}`)
+      if (MACOS_HEADLESS_HOST) {
+        showNotification(APP_NAME, `${platformLabel} hotkey helper is missing. Global shortcut is unavailable.`)
+        return
+      }
       showNotification(APP_NAME, `${platformLabel} hotkey helper is missing. Falling back to press-to-toggle.`)
     }
   }
