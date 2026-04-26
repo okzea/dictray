@@ -5328,7 +5328,7 @@ function registerPressOnlyHotkey() {
 }
 
 function registerPromptShortcut() {
-  if (LINUX_HEADLESS_HOST) {
+  if (LINUX_HEADLESS_HOST || MACOS_HEADLESS_HOST) {
     return true
   }
 

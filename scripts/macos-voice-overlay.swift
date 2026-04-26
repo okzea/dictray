@@ -251,7 +251,7 @@ final class OverlayController: NSObject, NSApplicationDelegate {
       return
     }
 
-    if ["processing", "transcribing"].contains(phase) && lastCueVisible && lastCuePhase == "listening" {
+    if ["processing", "transcribing", "rewriting"].contains(phase) && lastCueVisible && lastCuePhase == "listening" {
       earconCuePlayer.play("submit")
     }
   }
