@@ -25,6 +25,7 @@ const DEFAULT_NATIVE_CAPTURE_HELPER = path.join(
   process.platform === 'darwin' ? 'macos-native-capture-helper.mjs' : 'native-capture-helper.mjs'
 )
 const NATIVE_CAPTURE_HELPER = String(process.env.DICTATION_TRAY_NATIVE_CAPTURE_HELPER || '').trim() || DEFAULT_NATIVE_CAPTURE_HELPER
+const NATIVE_CAPTURE_COMMAND_TIMEOUT_MS = 30000
 
 function errorMessage(error, fallback = 'Native capture helper failed.') {
   return String(error?.message || error || fallback).trim() || fallback
@@ -147,7 +148,9 @@ class NativeCaptureBridge {
           this.workerStdout = stdout
           resolve(child)
         }
-        void this.handleWorkerLine(line)
+        void this.handleWorkerLine(line).catch((error) => {
+          this.logger(`[dictray] Native capture helper message failed: ${errorMessage(error)}`)
+        })
       })
 
       setTimeout(() => {
@@ -181,10 +184,17 @@ class NativeCaptureBridge {
   }
 
   failPending(error) {
-    for (const pending of this.pending.values()) {
+    for (const [id, pending] of Array.from(this.pending.entries())) {
+      this.clearPending(id, pending)
       pending.reject(error)
     }
-    this.pending.clear()
+  }
+
+  clearPending(id, pending = this.pending.get(id)) {
+    this.pending.delete(id)
+    if (pending?.timer) {
+      clearTimeout(pending.timer)
+    }
   }
 
   async handleWorkerLine(line) {
@@ -203,7 +213,7 @@ class NativeCaptureBridge {
       if (!pending) {
         return
       }
-      this.pending.delete(requestId)
+      this.clearPending(requestId, pending)
       if (message?.ok) {
         pending.resolve(message?.payload || {})
       } else {
@@ -231,15 +241,21 @@ class NativeCaptureBridge {
 
     return new Promise((resolve, reject) => {
       const message = createCaptureCommand(type, payload)
+      const timer = setTimeout(() => {
+        this.clearPending(message.id)
+        reject(new Error(`Timed out waiting for native capture ${String(type || 'command')} response.`))
+      }, NATIVE_CAPTURE_COMMAND_TIMEOUT_MS)
+
       this.pending.set(message.id, {
         resolve,
-        reject
+        reject,
+        timer
       })
 
       try {
         this.writeMessage(message)
       } catch (error) {
-        this.pending.delete(message.id)
+        this.clearPending(message.id)
         reject(error)
       }
     })
