@@ -92,6 +92,8 @@ const MACOS_OVERLAY_HELPER = path.join(__dirname, '..', 'scripts', 'macos-voice-
 const MACOS_MENU_POLL_INTERVAL_MS = 500
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
+const SHORTCUT_MODE_TOGGLE = 'toggle'
+const SHORTCUT_MODE_HOLD = 'hold'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 const REWRITE_TEMPERATURE_OPTIONS = [0, 0.1, 0.2, 0.3, 0.5, 0.7, 1]
 const APP_ICON_SVG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.svg')
@@ -238,6 +240,7 @@ let duckingEnabled = true
 let duckingLevel = 0.3
 let pressEnterAfterInsert = false
 let activePressEnterAfterInsert = false
+let shortcutMode = SHORTCUT_MODE_TOGGLE
 let currentRewriteModel = ''
 let currentRewriteThink = 'off'
 let currentRewriteTemperature = 0.1
@@ -796,6 +799,26 @@ function buildGnomePanelMenu(options = {}) {
           }))
     },
     {
+      label: 'Shortcut Mode',
+      submenu: [{
+        label: 'Press once to start, again to stop',
+        type: 'radio',
+        checked: shortcutMode === SHORTCUT_MODE_TOGGLE,
+        command: {
+          action: 'set_shortcut_mode',
+          value: SHORTCUT_MODE_TOGGLE
+        }
+      }, {
+        label: 'Hold to dictate',
+        type: 'radio',
+        checked: shortcutMode === SHORTCUT_MODE_HOLD,
+        command: {
+          action: 'set_shortcut_mode',
+          value: SHORTCUT_MODE_HOLD
+        }
+      }]
+    },
+    {
       label: 'Submit Shortcut (with Enter)',
       submenu: PROMPT_HOTKEY_PRESETS.map((preset) => ({
         label: preset.label,
@@ -836,6 +859,7 @@ function buildGnomePanelPayload() {
     duckingEnabled: Boolean(duckingEnabled),
     hotkey: trayHotkey,
     promptHotkey: promptTrayHotkey,
+    shortcutMode,
     targetWindow: compactText(voiceState?.targetWindow || '', 70),
     note: compactText(voiceState?.note || '', 110),
     error: compactText(voiceState?.error || '', 180),
@@ -919,6 +943,9 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_press_enter_after_insert':
       void updatePressEnterAfterInsert(Boolean(command?.value))
+      break
+    case 'set_shortcut_mode':
+      void updateShortcutMode(command?.value)
       break
     case 'set_rewrite_provider':
       void updateRewriteProvider(command?.value)
@@ -1702,6 +1729,20 @@ function sttRuntimeMatchesPatch(runtime = {}, runtimePatch = {}) {
 
 function normalizeRewriteEnabled(value) {
   return value === undefined ? true : Boolean(value)
+}
+
+function normalizeShortcutMode(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === SHORTCUT_MODE_HOLD || normalized === 'push_to_talk' || normalized === 'push-to-talk') {
+    return SHORTCUT_MODE_HOLD
+  }
+  return SHORTCUT_MODE_TOGGLE
+}
+
+function shortcutModeLabel(value = shortcutMode) {
+  return normalizeShortcutMode(value) === SHORTCUT_MODE_HOLD
+    ? 'Hold to dictate'
+    : 'Press once to start, again to stop'
 }
 
 function nowMs(startedAt) {
@@ -2918,6 +2959,7 @@ async function loadTraySettings() {
   if (parsed?.pressEnterAfterInsert !== undefined) {
     pressEnterAfterInsert = Boolean(parsed?.pressEnterAfterInsert)
   }
+  shortcutMode = normalizeShortcutMode(parsed?.shortcutMode)
   if (parsed?.promptHotkey !== undefined) {
     promptTrayHotkey = normalizePromptHotkey(parsed?.promptHotkey)
     if (promptTrayHotkey === trayHotkey) {
@@ -2934,6 +2976,7 @@ async function saveTraySettings() {
     duckingEnabled,
     duckingLevel,
     pressEnterAfterInsert,
+    shortcutMode,
     promptHotkey: promptTrayHotkey,
     inputDeviceId: preferredInputDeviceId || undefined
   })
@@ -3685,6 +3728,24 @@ function rebuildMenu() {
           }))
     },
     {
+      label: 'Shortcut Mode',
+      submenu: [{
+        label: 'Press once to start, again to stop',
+        type: 'radio',
+        checked: shortcutMode === SHORTCUT_MODE_TOGGLE,
+        click: () => {
+          void updateShortcutMode(SHORTCUT_MODE_TOGGLE)
+        }
+      }, {
+        label: 'Hold to dictate',
+        type: 'radio',
+        checked: shortcutMode === SHORTCUT_MODE_HOLD,
+        click: () => {
+          void updateShortcutMode(SHORTCUT_MODE_HOLD)
+        }
+      }]
+    },
+    {
       label: 'Submit Shortcut (with Enter)',
       submenu: PROMPT_HOTKEY_PRESETS.map((preset) => ({
         label: preset.label,
@@ -4189,6 +4250,19 @@ async function updatePressEnterAfterInsert(value) {
   await saveTraySettings()
   rebuildMenu()
   showNotification(APP_NAME, `Send Enter after insert is ${pressEnterAfterInsert ? 'enabled' : 'disabled'}.`)
+}
+
+async function updateShortcutMode(value) {
+  const nextMode = normalizeShortcutMode(value)
+  if (nextMode === shortcutMode) {
+    return
+  }
+
+  shortcutMode = nextMode
+  await saveTraySettings()
+  rebuildMenu()
+  void syncMacosMenuState()
+  showNotification(APP_NAME, `Shortcut mode: ${shortcutModeLabel(shortcutMode)}.`)
 }
 
 async function updateTrayHotkey(value) {
@@ -5450,21 +5524,35 @@ function startHotkeyBridge() {
     }
     const event = String(line || '').trim().toLowerCase()
     if (event === 'down') {
-      void startDictationCapture()
+      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+        void startDictationCapture()
+      } else {
+        void toggleDictationCapture()
+      }
       return
     }
     if (event === 'up') {
-      void stopDictationCapture()
+      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+        void stopDictationCapture()
+      }
       return
     }
     if (event === 'prompt-down') {
-      void startDictationCapture({
-        pressEnterAfterInsert: true
-      })
+      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+        void startDictationCapture({
+          pressEnterAfterInsert: true
+        })
+      } else {
+        void toggleDictationCapture({
+          pressEnterAfterInsert: true
+        })
+      }
       return
     }
     if (event === 'prompt-up') {
-      void stopDictationCapture()
+      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+        void stopDictationCapture()
+      }
       return
     }
     if (event === 'cancel') {
