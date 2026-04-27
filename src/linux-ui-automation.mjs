@@ -130,6 +130,30 @@ async function copyTextToWaylandClipboard(text) {
   ].join(' '))
 }
 
+async function copyTextToX11Clipboard(text) {
+  const providers = [
+    { cmd: 'xclip', args: ['-selection', 'clipboard'] },
+    { cmd: 'xsel', args: ['--clipboard', '--input'] }
+  ]
+  const failures = []
+
+  for (const provider of providers) {
+    const result = await trySpawnClipboardProvider(provider.cmd, provider.args, {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      detached: true
+    }, text)
+    if (result.ok) {
+      return
+    }
+    failures.push(`${provider.cmd}: ${formatCommandFailure(result)}`)
+  }
+
+  throw new Error([
+    'Failed to start an X11 clipboard provider:',
+    ...failures
+  ].join(' '))
+}
+
 async function sendGnomeExtensionCommand(action) {
   const command = { action, requestedAt: Date.now() }
   try {
@@ -356,11 +380,9 @@ export class LinuxUiAutomationBridge {
         await delay(50)
         await pasteWayland()
       } else {
-        // xclip stays alive to serve clipboard, so spawn detached
-        await spawnClipboardProvider('xclip', ['-selection', 'clipboard'], {
-          stdio: ['pipe', 'ignore', 'ignore'],
-          detached: true
-        }, text)
+        // Clipboard providers stay alive to serve clipboard content, so spawn
+        // them detached. They exit automatically when another app takes the clipboard.
+        await copyTextToX11Clipboard(text)
         await delay(50)
         await pasteX11(windowId)
       }
