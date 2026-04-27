@@ -53,9 +53,38 @@ async function spawnClipboardProvider(cmd, args, options, text = null) {
   }
 
   const started = new Promise((resolve, reject) => {
-    child.once('spawn', resolve)
+    let settled = false
+    let startupTimer = null
+    const settle = (callback, value) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (startupTimer) {
+        clearTimeout(startupTimer)
+        startupTimer = null
+      }
+      callback(value)
+    }
+
+    child.once('spawn', () => {
+      startupTimer = setTimeout(() => {
+        settle(resolve)
+      }, 120)
+    })
     child.once('error', (error) => {
-      reject(new Error(`Failed to start ${cmd}: ${error?.message || error}`))
+      settle(reject, new Error(`Failed to start ${cmd}: ${error?.message || error}`))
+    })
+    child.once('exit', (code, signal) => {
+      if (settled) {
+        return
+      }
+      if (code === 0) {
+        settle(resolve)
+        return
+      }
+      const reason = code === null ? `signal ${signal}` : `code ${code}`
+      settle(reject, new Error(`${cmd} exited during startup with ${reason}`))
     })
   })
 
