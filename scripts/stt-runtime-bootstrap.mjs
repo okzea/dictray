@@ -439,7 +439,7 @@ export async function ensureBundledSttRuntime(options = {}) {
     const bootstrapPython = await resolveBootstrapPython()
     log(`Creating bundled STT runtime from ${bootstrapPython}.`)
     await rm(autoPythonRoot, { recursive: true, force: true })
-    await run(bootstrapPython, ['-m', 'venv', autoPythonRoot], {
+    await run(bootstrapPython, ['-m', 'venv', '--copies', autoPythonRoot], {
       cwd: rootDir,
       env
     })
