@@ -1,7 +1,7 @@
 import { mkdir, readFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { loadConfig } from '../src/config.mjs'
 import { createSttProvider } from '../src/stt-provider.mjs'
@@ -94,6 +94,52 @@ function isPidRunning(pid) {
   } catch (error) {
     return error?.code === 'EPERM'
   }
+}
+
+function readProcessOutput(command, args = []) {
+  try {
+    const result = spawnSync(command, args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true
+    })
+    return result.status === 0 ? String(result.stdout || '').trim() : ''
+  } catch {
+    return ''
+  }
+}
+
+function commandLineReferencesTrayMain(value) {
+  return String(value || '').replace(/\\/g, '/').includes('tray/main.mjs')
+}
+
+async function isExistingTrayOwner(pid) {
+  if (!isPidRunning(pid)) {
+    return false
+  }
+
+  if (process.platform === 'linux') {
+    try {
+      const command = String(await readFile(`/proc/${pid}/cmdline`, 'utf8') || '')
+        .split('\0')
+        .map((part) => part.trim())
+        .filter(Boolean)
+      const executableName = path.basename(command[0] || '').toLowerCase()
+      return executableName.includes('dictray') || command.some(commandLineReferencesTrayMain)
+    } catch {
+      return false
+    }
+  }
+
+  if (process.platform === 'darwin') {
+    const command = readProcessOutput('ps', ['-p', String(pid), '-o', 'comm='])
+    if (path.basename(command).toLowerCase().includes('dictray')) {
+      return true
+    }
+    return commandLineReferencesTrayMain(readProcessOutput('ps', ['-p', String(pid), '-o', 'args=']))
+  }
+
+  return false
 }
 
 async function waitForExistingTrayExit(previousPid, timeoutMs = 15000) {
@@ -195,6 +241,7 @@ async function ensureManagedHttpStt(childEnv, healthUrl) {
 async function requestExistingTrayExit(childEnv) {
   log('Checking for an already running tray instance.')
   const existingPid = await readExistingTrayPid()
+  const shouldWaitForExit = await isExistingTrayOwner(existingPid)
   await run(process.execPath, ['tray/main.mjs', '--dictray-exit-existing'], {
     env: process.platform === 'linux'
       ? {
@@ -205,7 +252,9 @@ async function requestExistingTrayExit(childEnv) {
     stdio: 'ignore'
   }).catch(() => {})
 
-  await waitForExistingTrayExit(existingPid)
+  if (shouldWaitForExit) {
+    await waitForExistingTrayExit(existingPid)
+  }
 }
 
 function usesDefaultLocalSttBootstrapPath(config) {
