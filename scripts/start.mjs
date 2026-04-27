@@ -1,4 +1,5 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
@@ -55,6 +56,61 @@ async function warmSttRuntime(sttProvider) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function configHome() {
+  return String(process.env.XDG_CONFIG_HOME || '').trim() || path.join(os.homedir(), '.config')
+}
+
+function existingTrayLockPath() {
+  if (process.platform === 'linux') {
+    return path.join(configHome(), 'dictray', 'linux-headless.lock')
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'DicTray', 'dictray.lock')
+  }
+  return ''
+}
+
+async function readExistingTrayPid() {
+  const lockPath = existingTrayLockPath()
+  if (!lockPath) {
+    return 0
+  }
+  try {
+    return Number.parseInt(String(await readFile(lockPath, 'utf8') || '').trim(), 10) || 0
+  } catch {
+    return 0
+  }
+}
+
+function isPidRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false
+  }
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return error?.code === 'EPERM'
+  }
+}
+
+async function waitForExistingTrayExit(previousPid, timeoutMs = 15000) {
+  if (!isPidRunning(previousPid)) {
+    return
+  }
+
+  const started = Date.now()
+  while ((Date.now() - started) < timeoutMs) {
+    const currentPid = await readExistingTrayPid()
+    if (currentPid !== previousPid || !isPidRunning(previousPid)) {
+      return
+    }
+    await sleep(250)
+  }
+
+  throw new Error(`Timed out waiting for existing tray process ${previousPid} to exit`)
 }
 
 async function checkSpeechHealthOnce(url, timeoutMs = 3000) {
@@ -138,6 +194,7 @@ async function ensureManagedHttpStt(childEnv, healthUrl) {
 
 async function requestExistingTrayExit(childEnv) {
   log('Checking for an already running tray instance.')
+  const existingPid = await readExistingTrayPid()
   await run(process.execPath, ['tray/main.mjs', '--dictray-exit-existing'], {
     env: process.platform === 'linux'
       ? {
@@ -148,7 +205,7 @@ async function requestExistingTrayExit(childEnv) {
     stdio: 'ignore'
   }).catch(() => {})
 
-  await sleep(900)
+  await waitForExistingTrayExit(existingPid)
 }
 
 function usesDefaultLocalSttBootstrapPath(config) {
