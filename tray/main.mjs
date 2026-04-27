@@ -2361,6 +2361,9 @@ async function initMacosVoiceOverlayBridge() {
       }
     })
     helper.on('error', (error) => {
+      if (macosOverlayProcess === helper) {
+        macosOverlayProcess = null
+      }
       console.error('[dictray] Failed to start macOS overlay helper:', error?.message || error)
     })
   } catch (error) {

@@ -329,7 +329,13 @@ function copyTextToLinuxClipboard(text) {
       if (!commandAvailable('wl-copy')) {
         throw new Error('wl-copy is not available.')
       }
-      spawnDetached('wl-copy', ['--', value])
+      const wlCopy = ignoreSpawnAndStdinErrors(spawn('wl-copy', [], {
+        stdio: ['pipe', 'ignore', 'ignore'],
+        detached: true,
+        windowsHide: true
+      }))
+      wlCopy.stdin.end(value)
+      wlCopy.unref()
       return
     } catch {
       // ignore and fall through
