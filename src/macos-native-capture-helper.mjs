@@ -702,7 +702,9 @@ async function initializeHelper() {
 }
 
 const stdin = readline.createInterface({ input: process.stdin })
-stdin.on('line', async (line) => {
+let commandQueue = Promise.resolve()
+
+async function handleStdinLine(line) {
   const message = readJsonPayload(line, null)
   if (!message || typeof message !== 'object') {
     reportError('Ignoring invalid native capture helper message.')
@@ -722,6 +724,14 @@ stdin.on('line', async (line) => {
   if (normalizeCaptureCommandType(message?.type) === CAPTURE_COMMAND_SHUTDOWN) {
     process.exit(0)
   }
+}
+
+stdin.on('line', (line) => {
+  commandQueue = commandQueue
+    .then(() => handleStdinLine(line))
+    .catch((error) => {
+      reportError(compact(error?.message || error || 'Native capture helper command failed.'))
+    })
 })
 
 writeMessage(createCaptureEvent(CAPTURE_EVENT_READY, {
