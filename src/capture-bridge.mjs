@@ -120,6 +120,9 @@ class NativeCaptureBridge {
       child.stderr.on('data', (chunk) => {
         stderr += String(chunk || '')
       })
+      child.stdin.on('error', (error) => {
+        this.handleWorkerPipeError(error, child)
+      })
 
       child.on('error', (error) => {
         if (!settled) {
@@ -187,6 +190,17 @@ class NativeCaptureBridge {
     for (const [id, pending] of Array.from(this.pending.entries())) {
       this.clearPending(id, pending)
       pending.reject(error)
+    }
+  }
+
+  handleWorkerPipeError(error, worker = this.worker) {
+    const failure = error instanceof Error
+      ? error
+      : new Error(errorMessage(error, 'Native capture helper pipe failed.'))
+    this.logger(`[dictray] Native capture helper pipe failed: ${errorMessage(failure)}`)
+    if (worker && this.worker === worker) {
+      this.failPending(failure)
+      this.resetWorker()
     }
   }
 
@@ -262,10 +276,15 @@ class NativeCaptureBridge {
   }
 
   writeMessage(payload) {
-    if (!this.worker || this.worker.killed || !this.worker.stdin) {
+    const worker = this.worker
+    if (!worker || worker.killed || !worker.stdin || worker.stdin.destroyed || !worker.stdin.writable) {
       throw new Error('Native capture helper is not running.')
     }
-    this.worker.stdin.write(`${JSON.stringify(payload)}\n`)
+    worker.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
+      if (error) {
+        this.handleWorkerPipeError(error, worker)
+      }
+    })
   }
 }
 
