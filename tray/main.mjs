@@ -4943,20 +4943,19 @@ async function processAudioSubmission(payload = {}) {
     ? payload.audioBytes
     : new Uint8Array(payload?.audioBytes || [])
 
-  if (!audioBytes.length) {
-    throw new Error('Recording was empty.')
-  }
-
-  await appendDiagnosticsLog('submission-start', {
-    mimeType: String(payload?.mimeType || 'application/octet-stream').trim(),
-    audioBytes: audioBytes.length,
-    recordingMs,
-    captureDevice: payload?.captureDevice || null
-  })
-
-  const contextPromise = submission.contextHandle?.promise || Promise.resolve(null)
-
   try {
+    if (!audioBytes.length) {
+      throw new Error('Recording was empty.')
+    }
+
+    await appendDiagnosticsLog('submission-start', {
+      mimeType: String(payload?.mimeType || 'application/octet-stream').trim(),
+      audioBytes: audioBytes.length,
+      recordingMs,
+      captureDevice: payload?.captureDevice || null
+    })
+
+    const contextPromise = submission.contextHandle?.promise || Promise.resolve(null)
     throwIfSubmissionCancelled(submission)
     updateVoiceState({
       phase: 'transcribing',
