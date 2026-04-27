@@ -80,16 +80,26 @@ async function waitForSpeechHealth(url, timeoutMs = 300000) {
   let lastError = 'unknown error'
 
   while (Date.now() - started < timeoutMs) {
+    const remainingMs = timeoutMs - (Date.now() - started)
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      controller.abort()
+    }, Math.max(250, Math.min(3000, remainingMs)))
+
     try {
-      const response = await fetch(url)
+      const response = await fetch(url, {
+        signal: controller.signal
+      })
       if (response.ok) {
         return
       }
       lastError = `HTTP ${response.status}`
     } catch (error) {
-      lastError = error?.message || String(error)
+      lastError = error?.name === 'AbortError' ? 'request timed out' : error?.message || String(error)
+    } finally {
+      clearTimeout(timer)
     }
-    await sleep(1500)
+    await sleep(Math.min(1500, Math.max(0, timeoutMs - (Date.now() - started))))
   }
 
   throw new Error(`Timed out waiting for ${url}: ${lastError}`)
