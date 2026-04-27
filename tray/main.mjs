@@ -292,6 +292,7 @@ let runtimeReloadInFlight = null
 let lastSttDiagnosticSignature = ''
 let lastSttHealthLogSignature = ''
 let volumeDuckState = null
+let volumeDuckSessionId = 0
 let dailyCharacterStats = {
   days: {}
 }
@@ -3817,16 +3818,46 @@ async function waitForPendingSttWarmup(signal = null) {
   })
 }
 
-async function duckSystemVolumeForPushToTalk(force = false) {
-  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled) {
+function beginVolumeDuckSession() {
+  volumeDuckSessionId += 1
+  return volumeDuckSessionId
+}
+
+function volumeDuckSessionIsCurrent(sessionId) {
+  return !sessionId || sessionId === volumeDuckSessionId
+}
+
+function normalizeVolumeDuckOptions(input = {}) {
+  if (typeof input === 'boolean') {
+    return {
+      force: input,
+      sessionId: 0
+    }
+  }
+
+  return {
+    force: Boolean(input?.force),
+    sessionId: Number(input?.sessionId) || 0
+  }
+}
+
+async function duckSystemVolumeForPushToTalk(input = {}) {
+  const { force, sessionId } = normalizeVolumeDuckOptions(input)
+  const stale = () => !volumeDuckSessionIsCurrent(sessionId)
+
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled || stale()) {
     return
   }
   if (volumeDuckState && !force) {
     return
   }
 
+  let previousForRestore = null
   try {
     if (volumeDuckState && force) {
+      if (stale()) {
+        return
+      }
       await systemVolume.setState({
         level: duckingLevel,
         muted: false
@@ -3835,22 +3866,40 @@ async function duckSystemVolumeForPushToTalk(force = false) {
     }
 
     const state = await systemVolume.getState()
+    if (stale()) {
+      return
+    }
+
     const currentLevel = clampUnitInterval(Number(state?.level))
     const currentMuted = Boolean(state?.muted)
     if (currentMuted || currentLevel <= duckingLevel) {
       return
     }
 
-    volumeDuckState = {
+    previousForRestore = {
       level: currentLevel,
       muted: currentMuted
     }
+    volumeDuckState = previousForRestore
+    if (stale()) {
+      if (volumeDuckState === previousForRestore) {
+        volumeDuckState = null
+      }
+      return
+    }
+
     await systemVolume.setState({
       level: duckingLevel,
       muted: false
     })
+    if (stale() && (volumeDuckState === previousForRestore || !volumeDuckState)) {
+      await systemVolume.setState(previousForRestore)
+      if (volumeDuckState === previousForRestore) {
+        volumeDuckState = null
+      }
+    }
   } catch (error) {
-    if (!force) {
+    if (!force && !previousForRestore) {
       volumeDuckState = null
     }
     console.error(`[dictray] Failed to duck system volume: ${error?.message || error}`)
@@ -3858,6 +3907,7 @@ async function duckSystemVolumeForPushToTalk(force = false) {
 }
 
 async function restoreSystemVolumeAfterPushToTalk() {
+  volumeDuckSessionId += 1
   if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !volumeDuckState) {
     return
   }
@@ -5205,9 +5255,17 @@ async function processAudioSubmission(payload = {}) {
   }
 }
 
-function beginTurnContextCapture() {
+function beginTurnContextCapture({ defer = false } = {}) {
+  const capturePromise = defer
+    ? new Promise((resolve) => {
+        setImmediate(() => {
+          resolve(captureFocusedWindowContext())
+        })
+      })
+    : captureFocusedWindowContext()
+
   const contextHandle = {
-    promise: captureFocusedWindowContext()
+    promise: capturePromise
       .then((context) => {
         if (activeTurnContext === contextHandle) {
           updateVoiceState({
@@ -5258,25 +5316,22 @@ async function startDictationCapture({
   }
 
   cancelActiveSubmission()
-  beginTurnContextCapture()
-
-  const focusedWindow = await getFocusedWindowSnapshot().catch(() => null)
-  const initialBounds = normalizeOverlayBounds(focusedWindow?.bounds)
-  voiceOverlayFocusedBounds = initialBounds
+  voiceOverlayFocusedBounds = null
+  beginTurnContextCapture({ defer: process.platform === 'darwin' })
 
   updateVoiceState({
     phase: process.platform === 'darwin' ? 'listening' : 'processing',
     transcript: '',
     finalText: '',
-    targetBounds: initialBounds,
+    targetBounds: null,
     targetElementBounds: null,
     note: '',
     error: '',
     targetWindow: ''
   })
 
-  await ensureVoiceWindow()
-  await duckSystemVolumeForPushToTalk()
+  const volumeDuckSession = beginVolumeDuckSession()
+  void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
   try {
     const bridge = await ensureCaptureBackend()
     await bridge.startRecording()
