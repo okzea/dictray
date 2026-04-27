@@ -151,8 +151,8 @@ function checkapp {
   npm.cmd run check
 }
 
-function packwin {
-  pnpm pack:win
+function packlinux {
+  pnpm pack:linux
 }
 ```
 

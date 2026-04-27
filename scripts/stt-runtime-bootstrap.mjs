@@ -322,14 +322,14 @@ export async function ensureBundledSttRuntime(options = {}) {
   function pythonRuntimeCandidates() {
     const explicitRuntimeDir = normalizeAbsolute(env.DICTATION_TRAY_BUNDLED_PYTHON_DIR)
     const explicitPythonExe = normalizeAbsolute(env.DICTATION_TRAY_BUNDLED_PYTHON)
-    const fromExe = explicitPythonExe
-      ? [
-          path.dirname(explicitPythonExe),
-          path.basename(path.dirname(explicitPythonExe)).toLowerCase() === 'scripts'
-            ? path.dirname(path.dirname(explicitPythonExe))
-            : ''
-        ]
-      : []
+    const explicitPythonDir = explicitPythonExe ? path.dirname(explicitPythonExe) : ''
+    const explicitPythonDirName = path.basename(explicitPythonDir).toLowerCase()
+    const explicitPythonRoot = ['bin', 'scripts'].includes(explicitPythonDirName)
+      ? path.dirname(explicitPythonDir)
+      : explicitPythonDir
+    const explicitPythonRel = explicitPythonExe
+      ? path.relative(explicitPythonRoot, explicitPythonExe)
+      : ''
 
     return [
       explicitRuntimeDir && {
@@ -337,13 +337,11 @@ export async function ensureBundledSttRuntime(options = {}) {
         relativePythonBin: VENV_PYTHON_REL,
         sourceType: 'explicit-runtime-dir'
       },
-      ...fromExe.filter(Boolean).map((candidateRoot) => ({
-        sourceRoot: candidateRoot,
-        relativePythonBin: path.basename(candidateRoot).toLowerCase() === VENV_BIN_DIR.toLowerCase()
-          ? VENV_PYTHON_NAME
-          : VENV_PYTHON_REL,
+      explicitPythonExe && {
+        sourceRoot: explicitPythonRoot,
+        relativePythonBin: explicitPythonRel,
         sourceType: 'explicit-python-exe'
-      })),
+      },
       {
         sourceRoot: autoPythonRoot,
         relativePythonBin: VENV_PYTHON_REL,
