@@ -1,0 +1,27 @@
+{
+  "name": "dictray",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Tray app for local speech-to-text dictation with focused-window-aware text insertion",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "bundle:runtime": "node scripts/prepare-bundled-runtime.mjs",
+    "pack:linux": "node scripts/build-linux-package.mjs --dir",
+    "dist:linux": "node scripts/build-linux-package.mjs --archive",
+    "pack:mac": "node scripts/build-macos-dmg.mjs --dir",
+    "dist:mac": "node scripts/build-macos-dmg.mjs --dmg",
+    "icon:export": "node scripts/export-icon.mjs assets/app-icon.svg assets/app-icon.png assets/app-icon.ico",
+    "gnome:reload": "node scripts/reload-gnome-extension.mjs",
+    "start": "node scripts/start.mjs",
+    "start:ob": "node scripts/start-onboarding.mjs",
+    "smoke:two-turns": "node scripts/smoke-two-turns.mjs",
+    "tray": "node scripts/run-tray.mjs",
+    "tray:dev": "node --watch scripts/run-tray.mjs",
+    "check": "node scripts/check.mjs",
+    "build:helpers": "dotnet build scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj -c Release && dotnet build scripts/windows-ui-automation/WindowsUiAutomation.csproj -c Release && dotnet build scripts/windows-system-volume/WindowsSystemVolume.csproj -c Release",
+    "tray:linux-headless": "DICTATION_TRAY_LINUX_HEADLESS=1 node tray/main.mjs"
+  }
+}

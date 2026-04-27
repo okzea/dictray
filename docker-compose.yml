@@ -1,0 +1,18 @@
+services:
+  speech-stt:
+    build:
+      context: ./docker/stt
+    container_name: dictray-speech-stt
+    ports:
+      - "127.0.0.1:4593:4591"
+    environment:
+      STT_MODEL: ${STT_MODEL:-base.en}
+      STT_DEVICE: ${STT_DEVICE:-cpu}
+      STT_COMPUTE_TYPE: ${STT_COMPUTE_TYPE:-}
+      STT_AVAILABLE_DEVICES: ${STT_AVAILABLE_DEVICES:-auto}
+      STT_FFMPEG_BIN: ffmpeg
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-compute,utility}
+    volumes:
+      - ./docker/stt/cache:/models/cache
+    restart: unless-stopped

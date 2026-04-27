@@ -1,0 +1,37 @@
+{
+  "memory": {
+    "stateDir": "./local/state"
+  },
+  "stt": {
+    "provider": "local",
+    "enabled": true,
+    "timeoutMs": 120000,
+    "local": {
+      "model": "small.en",
+      "device": "auto",
+      "computeType": "auto"
+    },
+    "http": {
+      "baseUrl": "http://127.0.0.1:4593",
+      "path": "/transcribe",
+      "healthPath": "/health",
+      "timeoutMs": 120000
+    }
+  },
+  "rewrite": {
+    "provider": "none",
+    "ollama": {
+      "baseUrl": "http://127.0.0.1:11434",
+      "model": "qwen3-coder:30b",
+      "timeoutMs": 45000,
+      "keepAlive": "30m",
+      "think": "off",
+      "temperature": 0.1
+    }
+  },
+  "dictation": {
+    "rewriteEnabled": false,
+    "duckingEnabled": true,
+    "duckingLevel": 0.3
+  }
+}
