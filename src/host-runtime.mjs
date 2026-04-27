@@ -159,24 +159,9 @@ function readProcessOutput(command, args = []) {
   }
 }
 
-function readMacosProcessCwd(pid) {
-  const output = readProcessOutput('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'])
-  const line = output.split('\n').find((entry) => entry.startsWith('n'))
-  return line ? line.slice(1).trim() : ''
-}
-
-function isDictrayMainScriptArg(value, cwd = '') {
+function commandLineReferencesDictrayMain(value) {
   const normalized = String(value || '').replace(/\\/g, '/')
-  if (normalized !== 'tray/main.mjs' && !normalized.endsWith('/tray/main.mjs')) {
-    return false
-  }
-  const expectedMain = path.join(projectRoot(), 'tray', 'main.mjs')
-  const resolved = path.isAbsolute(value)
-    ? path.resolve(value)
-    : cwd
-      ? path.resolve(cwd, value)
-      : ''
-  return resolved === expectedMain
+  return normalized.includes('tray/main.mjs')
 }
 
 function isMacosHeadlessLockOwner(pid) {
@@ -196,8 +181,15 @@ function isMacosHeadlessLockOwner(pid) {
   if (!args) {
     return false
   }
-  const cwd = readMacosProcessCwd(pid)
-  return args.split(/\s+/).some((part) => isDictrayMainScriptArg(part, cwd))
+  return commandLineReferencesDictrayMain(args)
+}
+
+function notifyExistingHeadlessInstance(pid) {
+  try {
+    process.kill(pid, 'SIGUSR1')
+  } catch {
+    // ignore notification failures; the caller still rejects the second instance
+  }
 }
 
 function acquireLinuxHeadlessLock({ requestExit = false } = {}) {
@@ -218,6 +210,7 @@ function acquireLinuxHeadlessLock({ requestExit = false } = {}) {
   }
 
   if (existingLockOwner) {
+    notifyExistingHeadlessInstance(existingPid)
     return false
   }
 
@@ -273,6 +266,7 @@ function acquirePidLock(lockPath, { requestExit = false, isLockOwner = () => fal
   }
 
   if (existingLockOwner) {
+    notifyExistingHeadlessInstance(existingPid)
     return false
   }
 
@@ -649,6 +643,9 @@ function createHeadlessApp() {
   process.on('SIGINT', () => {
     app.quit()
   })
+  process.on('SIGUSR1', () => {
+    app.emit('second-instance', null, [])
+  })
 
   return app
 }
@@ -723,6 +720,9 @@ function createMacosHeadlessApp() {
   })
   process.on('SIGINT', () => {
     app.quit()
+  })
+  process.on('SIGUSR1', () => {
+    app.emit('second-instance', null, [])
   })
 
   return app
