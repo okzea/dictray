@@ -3,7 +3,6 @@ services:
     build:
       context: ./docker/stt
     container_name: dictray-speech-stt
-    gpus: all
     ports:
       - "127.0.0.1:4593:4591"
     environment:
