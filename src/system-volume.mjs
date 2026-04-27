@@ -151,6 +151,7 @@ export class SystemVolumeBridge {
         stderr += String(chunk || '')
       })
       child.on('error', reject)
+      child.stdin.on('error', reject)
       child.on('exit', (code) => {
         let parsed = null
         if (stdout.trim()) {

@@ -187,8 +187,15 @@ export class UiAutomationBridge {
           settled = true
           reject(error)
         }
-        this.failPending(error)
-        this.resetWorker()
+        this.handleWorkerPipeError(error, child)
+      })
+
+      child.stdin.on('error', (error) => {
+        if (!settled) {
+          settled = true
+          reject(error)
+        }
+        this.handleWorkerPipeError(error, child)
       })
 
       child.on('exit', (code) => {
@@ -224,7 +231,16 @@ export class UiAutomationBridge {
         }
       }, 3000)
 
-      child.stdin.write('{"id":"startup","command":"health"}\n')
+      child.stdin.write('{"id":"startup","command":"health"}\n', (error) => {
+        if (!error) {
+          return
+        }
+        if (!settled) {
+          settled = true
+          reject(error)
+        }
+        this.handleWorkerPipeError(error, child)
+      })
     }).finally(() => {
       this.startPromise = null
     })
@@ -242,6 +258,17 @@ export class UiAutomationBridge {
       }
       this.workerStdout = null
     }
+  }
+
+  handleWorkerPipeError(error, worker = this.worker) {
+    const failure = error instanceof Error
+      ? error
+      : new Error(String(error?.message || error || 'Windows UI automation helper pipe failed.'))
+    if (worker && this.worker !== worker) {
+      return
+    }
+    this.failPending(failure)
+    this.resetWorker()
   }
 
   failPending(error) {
@@ -313,6 +340,11 @@ export class UiAutomationBridge {
         signal.addEventListener('abort', abortListener, { once: true })
       }
 
+      if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) {
+        reject(new Error('Windows UI automation helper pipe is not writable.'))
+        return
+      }
+
       const timer = setTimeout(() => {
         this.clearPending(id)
         reject(new Error(`Timed out waiting for Windows UI automation ${String(command || 'health')} response.`))
@@ -331,7 +363,11 @@ export class UiAutomationBridge {
           id,
           command: String(command || 'health'),
           payload: payload && Object.keys(payload).length ? payload : undefined
-        })}\n`)
+        })}\n`, (error) => {
+          if (error) {
+            this.handleWorkerPipeError(error, child)
+          }
+        })
       } catch (error) {
         this.clearPending(id)
         reject(error)
