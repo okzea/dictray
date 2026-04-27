@@ -1020,6 +1020,13 @@ export class SpeechTools {
 
   async checkTtsHealth() {
     const tts = this.config.tts
+    if (!tts || tts.enabled === false) {
+      return {
+        ok: true,
+        enabled: false,
+        provider: 'none'
+      }
+    }
 
     if (tts.provider === 'http') {
       try {
