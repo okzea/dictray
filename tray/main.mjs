@@ -5313,7 +5313,7 @@ function stopHotkeyBridge() {
 }
 
 function registerPressOnlyHotkey() {
-  if (LINUX_HEADLESS_HOST || MACOS_HEADLESS_HOST) {
+  if (MACOS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
     return false
   }
 
@@ -5334,7 +5334,7 @@ function registerPressOnlyHotkey() {
 }
 
 function registerPromptShortcut() {
-  if (LINUX_HEADLESS_HOST || MACOS_HEADLESS_HOST) {
+  if (MACOS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
     return true
   }
 
@@ -5466,7 +5466,7 @@ function startHotkeyBridge() {
 }
 
 async function registerHotkey() {
-  if (LINUX_HEADLESS_HOST) {
+  if (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled) {
     console.log('[dictray] Linux headless host: shortcuts are managed by the GNOME Shell extension.')
     return
   }

@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, readFileSync, readlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { projectRoot } from './runtime-paths.mjs'
@@ -122,14 +122,6 @@ function readLinuxProcessCommand(pid) {
   }
 }
 
-function readLinuxProcessCwd(pid) {
-  try {
-    return readlinkSync(`/proc/${pid}/cwd`)
-  } catch {
-    return ''
-  }
-}
-
 function isLinuxHeadlessLockOwner(pid) {
   if (pid === process.pid) {
     return true
@@ -148,20 +140,9 @@ function isLinuxHeadlessLockOwner(pid) {
     return true
   }
 
-  const rootDir = projectRoot()
-  const expectedMain = path.join(rootDir, 'tray', 'main.mjs')
-  const cwd = readLinuxProcessCwd(pid)
   return command.some((part) => {
     const normalized = String(part || '').replace(/\\/g, '/')
-    if (normalized !== 'tray/main.mjs' && !normalized.endsWith('/tray/main.mjs')) {
-      return false
-    }
-    const resolved = path.isAbsolute(part)
-      ? path.resolve(part)
-      : cwd
-        ? path.resolve(cwd, part)
-        : ''
-    return resolved === expectedMain
+    return normalized === 'tray/main.mjs' || normalized.endsWith('/tray/main.mjs')
   })
 }
 
