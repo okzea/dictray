@@ -37,7 +37,7 @@ export class LinuxSystemVolumeBridge {
   }
 
   async detectBackend() {
-    if (this._backend) return this._backend
+    if (this._backend && this._backend !== 'none') return this._backend
 
     const wpctlResult = await tryExec('wpctl', ['get-volume', '@DEFAULT_AUDIO_SINK@'])
     if (wpctlResult.ok && parseWpctlVolume(wpctlResult.stdout) !== null) {
@@ -51,7 +51,6 @@ export class LinuxSystemVolumeBridge {
       return 'pactl'
     }
 
-    this._backend = 'none'
     return 'none'
   }
 

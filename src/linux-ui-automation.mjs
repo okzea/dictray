@@ -67,6 +67,40 @@ async function spawnClipboardProvider(cmd, args, options, text = null) {
   child.unref()
 }
 
+async function trySpawnClipboardProvider(cmd, args, options, text = null) {
+  try {
+    await spawnClipboardProvider(cmd, args, options, text)
+    return { ok: true }
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error) }
+  }
+}
+
+async function copyTextToWaylandClipboard(text) {
+  const providers = [
+    { cmd: 'wl-copy', args: [] },
+    { cmd: 'xclip', args: ['-selection', 'clipboard'] },
+    { cmd: 'xsel', args: ['--clipboard', '--input'] }
+  ]
+  const failures = []
+
+  for (const provider of providers) {
+    const result = await trySpawnClipboardProvider(provider.cmd, provider.args, {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      detached: true
+    }, text)
+    if (result.ok) {
+      return
+    }
+    failures.push(`${provider.cmd}: ${formatCommandFailure(result)}`)
+  }
+
+  throw new Error([
+    'Failed to start a Wayland clipboard provider:',
+    ...failures
+  ].join(' '))
+}
+
 async function sendGnomeExtensionCommand(action) {
   const command = { action, requestedAt: Date.now() }
   try {
@@ -287,12 +321,9 @@ export class LinuxUiAutomationBridge {
       if (this.sessionType === 'wayland') {
         // Clipboard handoff on Wayland needs an active provider process
         // serial (causes "No serial found for selection"). Use wl-copy instead.
-        // wl-copy must stay alive to serve clipboard content on Wayland, so spawn
-        // it detached. It exits automatically when another app takes the clipboard.
-        await spawnClipboardProvider('wl-copy', [], {
-          stdio: ['pipe', 'ignore', 'ignore'],
-          detached: true
-        }, text)
+        // Provider processes must stay alive to serve clipboard content, so spawn
+        // them detached. They exit automatically when another app takes the clipboard.
+        await copyTextToWaylandClipboard(text)
         await delay(50)
         await pasteWayland()
       } else {
