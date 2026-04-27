@@ -199,6 +199,7 @@ let windowIcon = null
 let hotkeyBridge = null
 let hotkeyBridgeRestartTimer = null
 let hotkeyBridgeRestartAtMs = []
+let shortcutReleaseEventsAvailable = false
 let refreshTimer = null
 let sttKeepWarmTimer = null
 let voiceOverlayHideTimer = null
@@ -809,8 +810,9 @@ function buildGnomePanelMenu(options = {}) {
           value: SHORTCUT_MODE_TOGGLE
         }
       }, {
-        label: 'Hold to dictate',
+        label: shortcutHoldModeMenuLabel(),
         type: 'radio',
+        enabled: shortcutHoldModeAvailable(),
         checked: shortcutMode === SHORTCUT_MODE_HOLD,
         command: {
           action: 'set_shortcut_mode',
@@ -1743,6 +1745,16 @@ function shortcutModeLabel(value = shortcutMode) {
   return normalizeShortcutMode(value) === SHORTCUT_MODE_HOLD
     ? 'Hold to dictate'
     : 'Press once to start, again to stop'
+}
+
+function shortcutHoldModeAvailable() {
+  return Boolean(shortcutReleaseEventsAvailable)
+}
+
+function shortcutHoldModeMenuLabel() {
+  return shortcutHoldModeAvailable()
+    ? 'Hold to dictate'
+    : 'Hold to dictate (native shortcut helper required)'
 }
 
 function nowMs(startedAt) {
@@ -3737,8 +3749,9 @@ function rebuildMenu() {
           void updateShortcutMode(SHORTCUT_MODE_TOGGLE)
         }
       }, {
-        label: 'Hold to dictate',
+        label: shortcutHoldModeMenuLabel(),
         type: 'radio',
+        enabled: shortcutHoldModeAvailable(),
         checked: shortcutMode === SHORTCUT_MODE_HOLD,
         click: () => {
           void updateShortcutMode(SHORTCUT_MODE_HOLD)
@@ -4255,6 +4268,11 @@ async function updatePressEnterAfterInsert(value) {
 async function updateShortcutMode(value) {
   const nextMode = normalizeShortcutMode(value)
   if (nextMode === shortcutMode) {
+    return
+  }
+  if (nextMode === SHORTCUT_MODE_HOLD && !shortcutHoldModeAvailable()) {
+    showNotification(APP_NAME, 'Hold to dictate requires the native shortcut helper. Press-to-toggle remains active.')
+    rebuildMenu()
     return
   }
 
@@ -5408,7 +5426,9 @@ async function startDictationCapture({
   void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
   try {
     const bridge = await ensureCaptureBackend()
-    await bridge.startRecording()
+    await bridge.startRecording({
+      preferredInputDeviceId
+    })
   } catch (error) {
     clearVoiceState(String(error?.message || error || 'Failed to start recording.'))
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
@@ -5426,6 +5446,7 @@ async function stopDictationCapture() {
 }
 
 function stopHotkeyBridge() {
+  shortcutReleaseEventsAvailable = false
   if (hotkeyBridgeRestartTimer) {
     clearTimeout(hotkeyBridgeRestartTimer)
     hotkeyBridgeRestartTimer = null
@@ -5445,6 +5466,7 @@ function registerPressOnlyHotkey() {
     return false
   }
 
+  shortcutReleaseEventsAvailable = false
   globalShortcut.unregisterAll()
   const ok = globalShortcut.register(trayHotkey, () => {
     void toggleDictationCapture()
@@ -5516,6 +5538,8 @@ function startHotkeyBridge() {
     windowsHide: true
   })
   hotkeyBridge = bridge
+  shortcutReleaseEventsAvailable = true
+  rebuildMenu()
 
   const stdout = readline.createInterface({ input: bridge.stdout })
   stdout.on('line', (line) => {
@@ -5524,7 +5548,7 @@ function startHotkeyBridge() {
     }
     const event = String(line || '').trim().toLowerCase()
     if (event === 'down') {
-      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
         void startDictationCapture()
       } else {
         void toggleDictationCapture()
@@ -5532,13 +5556,13 @@ function startHotkeyBridge() {
       return
     }
     if (event === 'up') {
-      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
         void stopDictationCapture()
       }
       return
     }
     if (event === 'prompt-down') {
-      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
         void startDictationCapture({
           pressEnterAfterInsert: true
         })
@@ -5550,7 +5574,7 @@ function startHotkeyBridge() {
       return
     }
     if (event === 'prompt-up') {
-      if (shortcutMode === SHORTCUT_MODE_HOLD) {
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
         void stopDictationCapture()
       }
       return
@@ -5575,6 +5599,7 @@ function startHotkeyBridge() {
     if (hotkeyBridge !== bridge) {
       return
     }
+    shortcutReleaseEventsAvailable = false
     console.error('[dictray] Failed to start hotkey bridge:', error)
     stopHotkeyBridge()
     if (registerPressOnlyHotkey()) {
@@ -5587,6 +5612,7 @@ function startHotkeyBridge() {
   bridge.on('exit', (code) => {
     if (hotkeyBridge === bridge) {
       hotkeyBridge = null
+      shortcutReleaseEventsAvailable = false
     } else {
       return
     }
@@ -5609,6 +5635,7 @@ function startHotkeyBridge() {
 
 async function registerHotkey() {
   if (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled) {
+    shortcutReleaseEventsAvailable = false
     console.log('[dictray] Linux headless host: shortcuts are managed by the GNOME Shell extension.')
     return
   }
@@ -5631,6 +5658,7 @@ async function registerHotkey() {
   }
 
   if (process.platform === 'linux' && gnomePanelBridgeEnabled) {
+    shortcutReleaseEventsAvailable = false
     console.log('[dictray] Shortcuts are managed by the GNOME Shell extension on Linux GNOME.')
     return
   }

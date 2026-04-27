@@ -983,6 +983,17 @@ async function applyConfiguration(payload = {}) {
   await ensureCaptureServiceStarted()
 }
 
+function applyPreferredInputDevice(payload = {}) {
+  if (payload?.preferredInputDeviceId === undefined && payload?.selectedDeviceId === undefined) {
+    return
+  }
+
+  preferredInputDeviceId = normalizeDeviceId(
+    payload?.preferredInputDeviceId
+      ?? payload?.selectedDeviceId
+  )
+}
+
 async function handleCommand(message = {}) {
   switch (normalizeCaptureCommandType(message?.type)) {
     case CAPTURE_COMMAND_CONFIGURE:
@@ -996,6 +1007,7 @@ async function handleCommand(message = {}) {
       })
     case CAPTURE_COMMAND_START_RECORDING:
       try {
+        applyPreferredInputDevice(message?.payload || {})
         await startRecording()
       } catch (error) {
         const errorMessage = String(error?.message || error || 'Failed to start native capture.')
