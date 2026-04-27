@@ -324,6 +324,9 @@ function copyTextToLinuxClipboard(text) {
   }
 
   try {
+    if (!commandAvailable('xclip')) {
+      throw new Error('xclip is not available.')
+    }
     const xclip = ignoreSpawnAndStdinErrors(spawn('xclip', ['-selection', 'clipboard'], {
       stdio: ['pipe', 'ignore', 'ignore'],
       detached: true,
@@ -421,6 +424,149 @@ class HeadlessTray extends EventEmitter {
   setImage() {}
   setContextMenu() {}
   setToolTip() {}
+}
+
+function linuxShortcutExpression(accelerator) {
+  const parts = String(accelerator || '')
+    .split('+')
+    .map((part) => part.trim())
+    .filter(Boolean)
+  if (parts.length < 2) {
+    return ''
+  }
+
+  return parts.map((part) => {
+    const normalized = part.toLowerCase()
+    if (normalized === 'commandorcontrol'
+      || normalized === 'command'
+      || normalized === 'control'
+      || normalized === 'ctrl') {
+      return 'Control'
+    }
+    if (normalized === 'alt' || normalized === 'option') {
+      return 'Alt'
+    }
+    if (normalized === 'shift') {
+      return 'Shift'
+    }
+    if (normalized === 'space') {
+      return 'space'
+    }
+    return part.length === 1 ? part.toLowerCase() : part
+  }).join(' + ')
+}
+
+class HeadlessGlobalShortcut {
+  constructor() {
+    this._registrations = new Map()
+    this._pollTimer = null
+    this._bindingProcess = null
+    this._stopping = false
+    this._commandPath = path.join(xdgConfigHome(), 'dictray', `headless-shortcut-${process.pid}.command`)
+    this._configPath = path.join(xdgConfigHome(), 'dictray', `headless-shortcut-${process.pid}.xbindkeysrc`)
+  }
+
+  register(accelerator, callback) {
+    if (process.platform !== 'linux' || !commandAvailable('xbindkeys')) {
+      return false
+    }
+    const shortcut = linuxShortcutExpression(accelerator)
+    if (!shortcut) {
+      return false
+    }
+
+    this._registrations.set(String(accelerator || ''), {
+      shortcut,
+      callback
+    })
+    return this._restart()
+  }
+
+  unregisterAll() {
+    this._registrations.clear()
+    this._stop()
+  }
+
+  _restart() {
+    this._stop()
+    if (!this._registrations.size) {
+      return true
+    }
+
+    try {
+      mkdirSync(path.dirname(this._commandPath), { recursive: true })
+      const config = [...this._registrations.entries()].map(([accelerator, registration]) => [
+        `"printf '%s\\n' ${shellQuote(accelerator)} > ${shellQuote(this._commandPath)}"`,
+        `  ${registration.shortcut}`
+      ].join('\n')).join('\n\n')
+      writeFileSync(this._configPath, `${config}\n`, 'utf8')
+    } catch {
+      return false
+    }
+
+    try {
+      this._stopping = false
+      this._bindingProcess = spawn('xbindkeys', ['-n', '-f', this._configPath], {
+        stdio: 'ignore',
+        windowsHide: true
+      })
+      this._bindingProcess.once('error', () => {
+        this._stop()
+      })
+      this._bindingProcess.once('exit', () => {
+        if (!this._stopping) {
+          this._bindingProcess = null
+        }
+      })
+      this._startPolling()
+      return true
+    } catch {
+      this._stop()
+      return false
+    }
+  }
+
+  _startPolling() {
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer)
+    }
+    this._pollTimer = setInterval(() => {
+      let accelerator = ''
+      try {
+        accelerator = String(readFileSync(this._commandPath, 'utf8') || '').trim()
+        unlinkSync(this._commandPath)
+      } catch {
+        return
+      }
+      const callback = this._registrations.get(accelerator)?.callback
+      if (callback) {
+        callback()
+      }
+    }, 100)
+    this._pollTimer.unref?.()
+  }
+
+  _stop() {
+    this._stopping = true
+    if (this._pollTimer) {
+      clearInterval(this._pollTimer)
+      this._pollTimer = null
+    }
+    if (this._bindingProcess && !this._bindingProcess.killed) {
+      this._bindingProcess.kill()
+    }
+    this._bindingProcess = null
+    try {
+      unlinkSync(this._commandPath)
+    } catch {
+      // ignore missing command file
+    }
+    try {
+      unlinkSync(this._configPath)
+    } catch {
+      // ignore missing config file
+    }
+  }
 }
 
 function emptyImage() {
@@ -603,12 +749,7 @@ function createHeadlessRuntime({
         clipboardWriter(value)
       }
     },
-    globalShortcut: {
-      register() {
-        return true
-      },
-      unregisterAll() {}
-    },
+    globalShortcut: new HeadlessGlobalShortcut(),
     ipcMain: {
       handle() {},
       on() {}
