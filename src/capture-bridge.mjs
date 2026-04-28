@@ -54,8 +54,8 @@ class NativeCaptureBridge {
     return this.runCommand(CAPTURE_COMMAND_CONFIGURE, payload)
   }
 
-  async startRecording() {
-    return this.runCommand(CAPTURE_COMMAND_START_RECORDING)
+  async startRecording(payload = {}) {
+    return this.runCommand(CAPTURE_COMMAND_START_RECORDING, payload)
   }
 
   async cancelRecording() {

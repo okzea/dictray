@@ -92,6 +92,8 @@ const MACOS_OVERLAY_HELPER = path.join(__dirname, '..', 'scripts', 'macos-voice-
 const MACOS_MENU_POLL_INTERVAL_MS = 500
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
+const SHORTCUT_MODE_TOGGLE = 'toggle'
+const SHORTCUT_MODE_HOLD = 'hold'
 const DUCKING_LEVEL_OPTIONS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 const REWRITE_TEMPERATURE_OPTIONS = [0, 0.1, 0.2, 0.3, 0.5, 0.7, 1]
 const APP_ICON_SVG_PATH = path.join(__dirname, '..', 'assets', 'app-icon.svg')
@@ -197,6 +199,7 @@ let windowIcon = null
 let hotkeyBridge = null
 let hotkeyBridgeRestartTimer = null
 let hotkeyBridgeRestartAtMs = []
+let shortcutReleaseEventsAvailable = false
 let refreshTimer = null
 let sttKeepWarmTimer = null
 let voiceOverlayHideTimer = null
@@ -238,6 +241,7 @@ let duckingEnabled = true
 let duckingLevel = 0.3
 let pressEnterAfterInsert = false
 let activePressEnterAfterInsert = false
+let shortcutMode = SHORTCUT_MODE_TOGGLE
 let currentRewriteModel = ''
 let currentRewriteThink = 'off'
 let currentRewriteTemperature = 0.1
@@ -292,6 +296,7 @@ let runtimeReloadInFlight = null
 let lastSttDiagnosticSignature = ''
 let lastSttHealthLogSignature = ''
 let volumeDuckState = null
+let volumeDuckSessionId = 0
 let dailyCharacterStats = {
   days: {}
 }
@@ -795,6 +800,27 @@ function buildGnomePanelMenu(options = {}) {
           }))
     },
     {
+      label: 'Shortcut Mode',
+      submenu: [{
+        label: 'Press once to start, again to stop',
+        type: 'radio',
+        checked: shortcutMode === SHORTCUT_MODE_TOGGLE,
+        command: {
+          action: 'set_shortcut_mode',
+          value: SHORTCUT_MODE_TOGGLE
+        }
+      }, {
+        label: shortcutHoldModeMenuLabel(),
+        type: 'radio',
+        enabled: shortcutHoldModeAvailable(),
+        checked: shortcutMode === SHORTCUT_MODE_HOLD,
+        command: {
+          action: 'set_shortcut_mode',
+          value: SHORTCUT_MODE_HOLD
+        }
+      }]
+    },
+    {
       label: 'Submit Shortcut (with Enter)',
       submenu: PROMPT_HOTKEY_PRESETS.map((preset) => ({
         label: preset.label,
@@ -835,6 +861,7 @@ function buildGnomePanelPayload() {
     duckingEnabled: Boolean(duckingEnabled),
     hotkey: trayHotkey,
     promptHotkey: promptTrayHotkey,
+    shortcutMode,
     targetWindow: compactText(voiceState?.targetWindow || '', 70),
     note: compactText(voiceState?.note || '', 110),
     error: compactText(voiceState?.error || '', 180),
@@ -918,6 +945,9 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_press_enter_after_insert':
       void updatePressEnterAfterInsert(Boolean(command?.value))
+      break
+    case 'set_shortcut_mode':
+      void updateShortcutMode(command?.value)
       break
     case 'set_rewrite_provider':
       void updateRewriteProvider(command?.value)
@@ -1701,6 +1731,39 @@ function sttRuntimeMatchesPatch(runtime = {}, runtimePatch = {}) {
 
 function normalizeRewriteEnabled(value) {
   return value === undefined ? true : Boolean(value)
+}
+
+function normalizeShortcutMode(value) {
+  const normalized = String(value || '').trim().toLowerCase()
+  if (normalized === SHORTCUT_MODE_HOLD || normalized === 'push_to_talk' || normalized === 'push-to-talk') {
+    return SHORTCUT_MODE_HOLD
+  }
+  return SHORTCUT_MODE_TOGGLE
+}
+
+function shortcutModeLabel(value = shortcutMode) {
+  return normalizeShortcutMode(value) === SHORTCUT_MODE_HOLD
+    ? 'Hold to dictate'
+    : 'Press once to start, again to stop'
+}
+
+function shortcutHoldModeAvailable() {
+  return Boolean(shortcutReleaseEventsAvailable)
+}
+
+function setShortcutReleaseEventsAvailable(value) {
+  const nextValue = Boolean(value)
+  if (shortcutReleaseEventsAvailable === nextValue) {
+    return
+  }
+  shortcutReleaseEventsAvailable = nextValue
+  rebuildMenu()
+}
+
+function shortcutHoldModeMenuLabel() {
+  return shortcutHoldModeAvailable()
+    ? 'Hold to dictate'
+    : 'Hold to dictate (native shortcut helper required)'
 }
 
 function nowMs(startedAt) {
@@ -2917,6 +2980,7 @@ async function loadTraySettings() {
   if (parsed?.pressEnterAfterInsert !== undefined) {
     pressEnterAfterInsert = Boolean(parsed?.pressEnterAfterInsert)
   }
+  shortcutMode = normalizeShortcutMode(parsed?.shortcutMode)
   if (parsed?.promptHotkey !== undefined) {
     promptTrayHotkey = normalizePromptHotkey(parsed?.promptHotkey)
     if (promptTrayHotkey === trayHotkey) {
@@ -2933,6 +2997,7 @@ async function saveTraySettings() {
     duckingEnabled,
     duckingLevel,
     pressEnterAfterInsert,
+    shortcutMode,
     promptHotkey: promptTrayHotkey,
     inputDeviceId: preferredInputDeviceId || undefined
   })
@@ -3684,6 +3749,25 @@ function rebuildMenu() {
           }))
     },
     {
+      label: 'Shortcut Mode',
+      submenu: [{
+        label: 'Press once to start, again to stop',
+        type: 'radio',
+        checked: shortcutMode === SHORTCUT_MODE_TOGGLE,
+        click: () => {
+          void updateShortcutMode(SHORTCUT_MODE_TOGGLE)
+        }
+      }, {
+        label: shortcutHoldModeMenuLabel(),
+        type: 'radio',
+        enabled: shortcutHoldModeAvailable(),
+        checked: shortcutMode === SHORTCUT_MODE_HOLD,
+        click: () => {
+          void updateShortcutMode(SHORTCUT_MODE_HOLD)
+        }
+      }]
+    },
+    {
       label: 'Submit Shortcut (with Enter)',
       submenu: PROMPT_HOTKEY_PRESETS.map((preset) => ({
         label: preset.label,
@@ -3817,16 +3901,46 @@ async function waitForPendingSttWarmup(signal = null) {
   })
 }
 
-async function duckSystemVolumeForPushToTalk(force = false) {
-  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled) {
+function beginVolumeDuckSession() {
+  volumeDuckSessionId += 1
+  return volumeDuckSessionId
+}
+
+function volumeDuckSessionIsCurrent(sessionId) {
+  return !sessionId || sessionId === volumeDuckSessionId
+}
+
+function normalizeVolumeDuckOptions(input = {}) {
+  if (typeof input === 'boolean') {
+    return {
+      force: input,
+      sessionId: 0
+    }
+  }
+
+  return {
+    force: Boolean(input?.force),
+    sessionId: Number(input?.sessionId) || 0
+  }
+}
+
+async function duckSystemVolumeForPushToTalk(input = {}) {
+  const { force, sessionId } = normalizeVolumeDuckOptions(input)
+  const stale = () => !volumeDuckSessionIsCurrent(sessionId)
+
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled || stale()) {
     return
   }
   if (volumeDuckState && !force) {
     return
   }
 
+  let previousForRestore = null
   try {
     if (volumeDuckState && force) {
+      if (stale()) {
+        return
+      }
       await systemVolume.setState({
         level: duckingLevel,
         muted: false
@@ -3835,22 +3949,40 @@ async function duckSystemVolumeForPushToTalk(force = false) {
     }
 
     const state = await systemVolume.getState()
+    if (stale()) {
+      return
+    }
+
     const currentLevel = clampUnitInterval(Number(state?.level))
     const currentMuted = Boolean(state?.muted)
     if (currentMuted || currentLevel <= duckingLevel) {
       return
     }
 
-    volumeDuckState = {
+    previousForRestore = {
       level: currentLevel,
       muted: currentMuted
     }
+    volumeDuckState = previousForRestore
+    if (stale()) {
+      if (volumeDuckState === previousForRestore) {
+        volumeDuckState = null
+      }
+      return
+    }
+
     await systemVolume.setState({
       level: duckingLevel,
       muted: false
     })
+    if (stale() && (volumeDuckState === previousForRestore || !volumeDuckState)) {
+      await systemVolume.setState(previousForRestore)
+      if (volumeDuckState === previousForRestore) {
+        volumeDuckState = null
+      }
+    }
   } catch (error) {
-    if (!force) {
+    if (!force && !previousForRestore) {
       volumeDuckState = null
     }
     console.error(`[dictray] Failed to duck system volume: ${error?.message || error}`)
@@ -3858,6 +3990,7 @@ async function duckSystemVolumeForPushToTalk(force = false) {
 }
 
 async function restoreSystemVolumeAfterPushToTalk() {
+  volumeDuckSessionId += 1
   if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !volumeDuckState) {
     return
   }
@@ -4139,6 +4272,24 @@ async function updatePressEnterAfterInsert(value) {
   await saveTraySettings()
   rebuildMenu()
   showNotification(APP_NAME, `Send Enter after insert is ${pressEnterAfterInsert ? 'enabled' : 'disabled'}.`)
+}
+
+async function updateShortcutMode(value) {
+  const nextMode = normalizeShortcutMode(value)
+  if (nextMode === shortcutMode) {
+    return
+  }
+  if (nextMode === SHORTCUT_MODE_HOLD && !shortcutHoldModeAvailable()) {
+    showNotification(APP_NAME, 'Hold to dictate requires the native shortcut helper. Press-to-toggle remains active.')
+    rebuildMenu()
+    return
+  }
+
+  shortcutMode = nextMode
+  await saveTraySettings()
+  rebuildMenu()
+  void syncMacosMenuState()
+  showNotification(APP_NAME, `Shortcut mode: ${shortcutModeLabel(shortcutMode)}.`)
 }
 
 async function updateTrayHotkey(value) {
@@ -5205,9 +5356,17 @@ async function processAudioSubmission(payload = {}) {
   }
 }
 
-function beginTurnContextCapture() {
+function beginTurnContextCapture({ defer = false } = {}) {
+  const capturePromise = defer
+    ? new Promise((resolve) => {
+        setImmediate(() => {
+          resolve(captureFocusedWindowContext())
+        })
+      })
+    : captureFocusedWindowContext()
+
   const contextHandle = {
-    promise: captureFocusedWindowContext()
+    promise: capturePromise
       .then((context) => {
         if (activeTurnContext === contextHandle) {
           updateVoiceState({
@@ -5258,28 +5417,27 @@ async function startDictationCapture({
   }
 
   cancelActiveSubmission()
-  beginTurnContextCapture()
-
-  const focusedWindow = await getFocusedWindowSnapshot().catch(() => null)
-  const initialBounds = normalizeOverlayBounds(focusedWindow?.bounds)
-  voiceOverlayFocusedBounds = initialBounds
+  voiceOverlayFocusedBounds = null
+  beginTurnContextCapture({ defer: process.platform === 'darwin' })
 
   updateVoiceState({
     phase: process.platform === 'darwin' ? 'listening' : 'processing',
     transcript: '',
     finalText: '',
-    targetBounds: initialBounds,
+    targetBounds: null,
     targetElementBounds: null,
     note: '',
     error: '',
     targetWindow: ''
   })
 
-  await ensureVoiceWindow()
-  await duckSystemVolumeForPushToTalk()
+  const volumeDuckSession = beginVolumeDuckSession()
+  void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
   try {
     const bridge = await ensureCaptureBackend()
-    await bridge.startRecording()
+    await bridge.startRecording({
+      preferredInputDeviceId
+    })
   } catch (error) {
     clearVoiceState(String(error?.message || error || 'Failed to start recording.'))
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
@@ -5297,6 +5455,7 @@ async function stopDictationCapture() {
 }
 
 function stopHotkeyBridge() {
+  setShortcutReleaseEventsAvailable(false)
   if (hotkeyBridgeRestartTimer) {
     clearTimeout(hotkeyBridgeRestartTimer)
     hotkeyBridgeRestartTimer = null
@@ -5316,6 +5475,7 @@ function registerPressOnlyHotkey() {
     return false
   }
 
+  setShortcutReleaseEventsAvailable(false)
   globalShortcut.unregisterAll()
   const ok = globalShortcut.register(trayHotkey, () => {
     void toggleDictationCapture()
@@ -5387,6 +5547,7 @@ function startHotkeyBridge() {
     windowsHide: true
   })
   hotkeyBridge = bridge
+  setShortcutReleaseEventsAvailable(true)
 
   const stdout = readline.createInterface({ input: bridge.stdout })
   stdout.on('line', (line) => {
@@ -5395,21 +5556,35 @@ function startHotkeyBridge() {
     }
     const event = String(line || '').trim().toLowerCase()
     if (event === 'down') {
-      void startDictationCapture()
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
+        void startDictationCapture()
+      } else {
+        void toggleDictationCapture()
+      }
       return
     }
     if (event === 'up') {
-      void stopDictationCapture()
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
+        void stopDictationCapture()
+      }
       return
     }
     if (event === 'prompt-down') {
-      void startDictationCapture({
-        pressEnterAfterInsert: true
-      })
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
+        void startDictationCapture({
+          pressEnterAfterInsert: true
+        })
+      } else {
+        void toggleDictationCapture({
+          pressEnterAfterInsert: true
+        })
+      }
       return
     }
     if (event === 'prompt-up') {
-      void stopDictationCapture()
+      if (shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()) {
+        void stopDictationCapture()
+      }
       return
     }
     if (event === 'cancel') {
@@ -5432,6 +5607,7 @@ function startHotkeyBridge() {
     if (hotkeyBridge !== bridge) {
       return
     }
+    setShortcutReleaseEventsAvailable(false)
     console.error('[dictray] Failed to start hotkey bridge:', error)
     stopHotkeyBridge()
     if (registerPressOnlyHotkey()) {
@@ -5444,6 +5620,7 @@ function startHotkeyBridge() {
   bridge.on('exit', (code) => {
     if (hotkeyBridge === bridge) {
       hotkeyBridge = null
+      setShortcutReleaseEventsAvailable(false)
     } else {
       return
     }
@@ -5466,6 +5643,7 @@ function startHotkeyBridge() {
 
 async function registerHotkey() {
   if (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled) {
+    setShortcutReleaseEventsAvailable(false)
     console.log('[dictray] Linux headless host: shortcuts are managed by the GNOME Shell extension.')
     return
   }
@@ -5488,6 +5666,7 @@ async function registerHotkey() {
   }
 
   if (process.platform === 'linux' && gnomePanelBridgeEnabled) {
+    setShortcutReleaseEventsAvailable(false)
     console.log('[dictray] Shortcuts are managed by the GNOME Shell extension on Linux GNOME.')
     return
   }
