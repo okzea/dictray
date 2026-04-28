@@ -1751,6 +1751,15 @@ function shortcutHoldModeAvailable() {
   return Boolean(shortcutReleaseEventsAvailable)
 }
 
+function setShortcutReleaseEventsAvailable(value) {
+  const nextValue = Boolean(value)
+  if (shortcutReleaseEventsAvailable === nextValue) {
+    return
+  }
+  shortcutReleaseEventsAvailable = nextValue
+  rebuildMenu()
+}
+
 function shortcutHoldModeMenuLabel() {
   return shortcutHoldModeAvailable()
     ? 'Hold to dictate'
@@ -5446,7 +5455,7 @@ async function stopDictationCapture() {
 }
 
 function stopHotkeyBridge() {
-  shortcutReleaseEventsAvailable = false
+  setShortcutReleaseEventsAvailable(false)
   if (hotkeyBridgeRestartTimer) {
     clearTimeout(hotkeyBridgeRestartTimer)
     hotkeyBridgeRestartTimer = null
@@ -5466,7 +5475,7 @@ function registerPressOnlyHotkey() {
     return false
   }
 
-  shortcutReleaseEventsAvailable = false
+  setShortcutReleaseEventsAvailable(false)
   globalShortcut.unregisterAll()
   const ok = globalShortcut.register(trayHotkey, () => {
     void toggleDictationCapture()
@@ -5538,8 +5547,7 @@ function startHotkeyBridge() {
     windowsHide: true
   })
   hotkeyBridge = bridge
-  shortcutReleaseEventsAvailable = true
-  rebuildMenu()
+  setShortcutReleaseEventsAvailable(true)
 
   const stdout = readline.createInterface({ input: bridge.stdout })
   stdout.on('line', (line) => {
@@ -5599,7 +5607,7 @@ function startHotkeyBridge() {
     if (hotkeyBridge !== bridge) {
       return
     }
-    shortcutReleaseEventsAvailable = false
+    setShortcutReleaseEventsAvailable(false)
     console.error('[dictray] Failed to start hotkey bridge:', error)
     stopHotkeyBridge()
     if (registerPressOnlyHotkey()) {
@@ -5612,7 +5620,7 @@ function startHotkeyBridge() {
   bridge.on('exit', (code) => {
     if (hotkeyBridge === bridge) {
       hotkeyBridge = null
-      shortcutReleaseEventsAvailable = false
+      setShortcutReleaseEventsAvailable(false)
     } else {
       return
     }
@@ -5635,7 +5643,7 @@ function startHotkeyBridge() {
 
 async function registerHotkey() {
   if (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled) {
-    shortcutReleaseEventsAvailable = false
+    setShortcutReleaseEventsAvailable(false)
     console.log('[dictray] Linux headless host: shortcuts are managed by the GNOME Shell extension.')
     return
   }
@@ -5658,7 +5666,7 @@ async function registerHotkey() {
   }
 
   if (process.platform === 'linux' && gnomePanelBridgeEnabled) {
-    shortcutReleaseEventsAvailable = false
+    setShortcutReleaseEventsAvailable(false)
     console.log('[dictray] Shortcuts are managed by the GNOME Shell extension on Linux GNOME.')
     return
   }
