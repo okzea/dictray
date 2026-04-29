@@ -21,6 +21,7 @@ import {
 } from '../src/capture-protocol.mjs'
 import { buildLinuxLauncherManifest, ensureLinuxProductSetup } from '../src/linux-product-integration.mjs'
 import { launchLinuxNativeUi } from '../src/linux-native-ui.mjs'
+import { NearbyDuckingService } from '../src/nearby-ducking.mjs'
 import { createRewriteProvider } from '../src/rewrite-provider.mjs'
 import { resolveBundledHelperExecutable, resolveBundledSttConfig } from '../src/runtime-paths.mjs'
 import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
@@ -177,6 +178,7 @@ let runtimeConfig = null
 let speech = null
 let rewriteProvider = null
 let systemVolume = null
+let nearbyDucking = null
 let uiAutomation = null
 let captureBridge = null
 let earconPlayer = null
@@ -239,6 +241,8 @@ let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
 let duckingEnabled = true
 let duckingLevel = 0.3
+let nearbyDuckingEnabled = false
+let nearbyDuckingSharedSecret = ''
 let pressEnterAfterInsert = false
 let activePressEnterAfterInsert = false
 let shortcutMode = SHORTCUT_MODE_TOGGLE
@@ -297,6 +301,8 @@ let lastSttDiagnosticSignature = ''
 let lastSttHealthLogSignature = ''
 let volumeDuckState = null
 let volumeDuckSessionId = 0
+let nearbyRemoteDuckState = null
+let nearbyRemoteRestoreTimer = null
 let dailyCharacterStats = {
   days: {}
 }
@@ -879,6 +885,47 @@ function buildDetailedControlMenu(options = {}) {
         ...duckingLevelMenu
       ]
     },
+    {
+      label: 'Nearby Ducking',
+      submenu: [
+        {
+          label: nearbyDuckingStatusLabel(),
+          enabled: false
+        },
+        {
+          label: 'Enable Nearby Ducking',
+          type: 'checkbox',
+          checked: nearbyDuckingEnabled,
+          command: {
+            action: 'set_nearby_ducking_enabled',
+            value: !nearbyDuckingEnabled
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'Show Pairing Code',
+          command: {
+            action: 'start_nearby_pairing'
+          }
+        },
+        {
+          label: 'Connect with Code',
+          command: {
+            action: 'connect_nearby_pairing'
+          }
+        },
+        ...(nearbyDuckingSharedSecret
+          ? [{
+              type: 'separator'
+            }, {
+              label: 'Forget Paired Device',
+              command: {
+                action: 'forget_nearby_pairing'
+              }
+            }]
+          : [])
+      ]
+    },
     { type: 'separator' },
     {
       label: 'Input Source',
@@ -1068,6 +1115,26 @@ function buildGnomePanelPreferencesPayload() {
         action: 'set_ducking_enabled',
         value: !duckingEnabled
       }
+    },
+    nearbyDucking: {
+      enabled: nearbyDuckingEnabled,
+      paired: Boolean(nearbyDuckingSharedSecret),
+      status: nearbyDuckingStatusLabel(),
+      enabledCommand: {
+        action: 'set_nearby_ducking_enabled',
+        value: !nearbyDuckingEnabled
+      },
+      hostCommand: {
+        action: 'start_nearby_pairing'
+      },
+      connectCommand: {
+        action: 'connect_nearby_pairing'
+      },
+      forgetCommand: nearbyDuckingSharedSecret
+        ? {
+            action: 'forget_nearby_pairing'
+          }
+        : null
     },
     stt: {
       supported: sttPreferences.supported,
@@ -1270,6 +1337,18 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_ducking_level':
       void updateDuckingLevel(command?.value)
+      break
+    case 'set_nearby_ducking_enabled':
+      void updateNearbyDuckingEnabled(Boolean(command?.value))
+      break
+    case 'start_nearby_pairing':
+      void startNearbyDuckingPairingHost()
+      break
+    case 'connect_nearby_pairing':
+      void connectNearbyDuckingPairing()
+      break
+    case 'forget_nearby_pairing':
+      void forgetNearbyDuckingPairing()
       break
     case 'switch_rewrite_model':
       if (String(command?.value || '').trim()) {
@@ -3275,6 +3354,8 @@ async function loadTraySettings() {
   rewriteEnabled = normalizeRewriteEnabled(runtimeConfig?.dictation?.rewriteEnabled)
   duckingEnabled = normalizeDuckingEnabled(runtimeConfig?.dictation?.duckingEnabled)
   duckingLevel = normalizeDuckingLevel(runtimeConfig?.dictation?.duckingLevel)
+  nearbyDuckingEnabled = Boolean(runtimeConfig?.nearbyDucking?.enabled)
+  nearbyDuckingSharedSecret = String(runtimeConfig?.nearbyDucking?.sharedSecret || '').trim()
   if (!hotkeyManagedByEnv()) {
     trayHotkey = normalizeTrayHotkey(parsed?.hotkey)
   }
@@ -3289,6 +3370,12 @@ async function loadTraySettings() {
   }
   if (parsed?.duckingLevel !== undefined) {
     duckingLevel = normalizeDuckingLevel(parsed?.duckingLevel)
+  }
+  if (parsed?.nearbyDuckingEnabled !== undefined) {
+    nearbyDuckingEnabled = Boolean(parsed?.nearbyDuckingEnabled)
+  }
+  if (parsed?.nearbyDuckingSharedSecret !== undefined) {
+    nearbyDuckingSharedSecret = String(parsed?.nearbyDuckingSharedSecret || '').trim()
   }
   if (parsed?.pressEnterAfterInsert !== undefined) {
     pressEnterAfterInsert = Boolean(parsed?.pressEnterAfterInsert)
@@ -3309,6 +3396,8 @@ async function saveTraySettings() {
     rewriteEnabled,
     duckingEnabled,
     duckingLevel,
+    nearbyDuckingEnabled,
+    nearbyDuckingSharedSecret: nearbyDuckingSharedSecret || undefined,
     pressEnterAfterInsert,
     shortcutMode,
     promptHotkey: promptTrayHotkey,
@@ -3770,6 +3859,53 @@ function rewriteThinkSetting() {
   return normalizeRewriteThink(currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'off')
 }
 
+function nearbyDuckingStatusLabel() {
+  if (!nearbyDuckingEnabled) {
+    return 'Disabled'
+  }
+  return nearbyDuckingSharedSecret ? 'Enabled and paired' : 'Enabled, not paired'
+}
+
+function buildNearbyDuckingMenuTemplate() {
+  return [
+    {
+      label: nearbyDuckingStatusLabel(),
+      enabled: false
+    },
+    {
+      label: 'Enable Nearby Ducking',
+      type: 'checkbox',
+      checked: nearbyDuckingEnabled,
+      click: (item) => {
+        void updateNearbyDuckingEnabled(Boolean(item.checked))
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Show Pairing Code',
+      click: () => {
+        void startNearbyDuckingPairingHost()
+      }
+    },
+    {
+      label: 'Connect with Code',
+      click: () => {
+        void connectNearbyDuckingPairing()
+      }
+    },
+    ...(nearbyDuckingSharedSecret
+      ? [{
+          type: 'separator'
+        }, {
+          label: 'Forget Paired Device',
+          click: () => {
+            void forgetNearbyDuckingPairing()
+          }
+        }]
+      : [])
+  ]
+}
+
 function rebuildMenu() {
   if (!tray) {
     return
@@ -3999,6 +4135,10 @@ function rebuildMenu() {
         { type: 'separator' },
         ...duckingLevelMenu
       ]
+    },
+    {
+      label: 'Nearby Ducking',
+      submenu: buildNearbyDuckingMenuTemplate()
     },
     { type: 'separator' },
     {
@@ -4302,8 +4442,130 @@ async function duckSystemVolumeForPushToTalk(input = {}) {
   }
 }
 
+function notifyNearbyDuckingStart() {
+  try {
+    nearbyDucking?.sendStart?.(duckingLevel)
+  } catch (error) {
+    console.error(`[dictray] Failed to send nearby ducking start: ${error?.message || error}`)
+  }
+}
+
+function notifyNearbyDuckingStop() {
+  try {
+    nearbyDucking?.sendStop?.(duckingLevel)
+  } catch (error) {
+    console.error(`[dictray] Failed to send nearby ducking stop: ${error?.message || error}`)
+  }
+}
+
+function clearNearbyRemoteRestoreTimer() {
+  if (nearbyRemoteRestoreTimer) {
+    clearTimeout(nearbyRemoteRestoreTimer)
+    nearbyRemoteRestoreTimer = null
+  }
+}
+
+function scheduleNearbyRemoteRestore(event = {}) {
+  clearNearbyRemoteRestoreTimer()
+  const timeoutMs = Math.max(3000, Number(event?.staleTimeoutMs || runtimeConfig?.nearbyDucking?.staleTimeoutMs || 12000))
+  nearbyRemoteRestoreTimer = setTimeout(() => {
+    void restoreSystemVolumeAfterNearbyDucking(event).catch(() => null)
+  }, timeoutMs)
+}
+
+async function duckSystemVolumeForNearbyPeer(event = {}) {
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled) {
+    return
+  }
+
+  const level = normalizeDuckingLevel(event?.level ?? duckingLevel)
+  try {
+    if (nearbyRemoteDuckState) {
+      nearbyRemoteDuckState = {
+        ...nearbyRemoteDuckState,
+        eventId: String(event?.eventId || nearbyRemoteDuckState.eventId || '').trim(),
+        deviceId: String(event?.deviceId || nearbyRemoteDuckState.deviceId || '').trim(),
+        deviceName: String(event?.deviceName || nearbyRemoteDuckState.deviceName || '').trim(),
+        targetLevel: level
+      }
+      await systemVolume.setState({
+        level,
+        muted: false
+      })
+      scheduleNearbyRemoteRestore(event)
+      return
+    }
+
+    if (volumeDuckState) {
+      scheduleNearbyRemoteRestore(event)
+      return
+    }
+
+    const state = await systemVolume.getState()
+    const currentLevel = clampUnitInterval(Number(state?.level))
+    const currentMuted = Boolean(state?.muted)
+    if (currentMuted || currentLevel <= level) {
+      return
+    }
+
+    nearbyRemoteDuckState = {
+      eventId: String(event?.eventId || '').trim(),
+      deviceId: String(event?.deviceId || '').trim(),
+      deviceName: String(event?.deviceName || '').trim(),
+      previousLevel: currentLevel,
+      muted: currentMuted,
+      targetLevel: level
+    }
+    await systemVolume.setState({
+      level,
+      muted: false
+    })
+    scheduleNearbyRemoteRestore(event)
+  } catch (error) {
+    nearbyRemoteDuckState = null
+    clearNearbyRemoteRestoreTimer()
+    console.error(`[dictray] Failed to duck system volume for nearby peer: ${error?.message || error}`)
+  }
+}
+
+async function refreshNearbyDuckingHeartbeat(event = {}) {
+  if (!nearbyRemoteDuckState) {
+    await duckSystemVolumeForNearbyPeer(event)
+    return
+  }
+  scheduleNearbyRemoteRestore(event)
+}
+
+async function restoreSystemVolumeAfterNearbyDucking(event = {}) {
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !nearbyRemoteDuckState) {
+    return
+  }
+
+  const expectedEventId = String(event?.eventId || '').trim()
+  if (expectedEventId && nearbyRemoteDuckState.eventId && expectedEventId !== nearbyRemoteDuckState.eventId) {
+    return
+  }
+
+  const previous = nearbyRemoteDuckState
+  nearbyRemoteDuckState = null
+  clearNearbyRemoteRestoreTimer()
+  if (volumeDuckState) {
+    return
+  }
+
+  try {
+    await systemVolume.setState({
+      level: previous.previousLevel,
+      muted: previous.muted
+    })
+  } catch (error) {
+    console.error(`[dictray] Failed to restore system volume after nearby ducking: ${error?.message || error}`)
+  }
+}
+
 async function restoreSystemVolumeAfterPushToTalk() {
   volumeDuckSessionId += 1
+  notifyNearbyDuckingStop()
   if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !volumeDuckState) {
     return
   }
@@ -4555,6 +4817,7 @@ async function updateDuckingEnabled(value) {
   rebuildMenu()
   if (!duckingEnabled) {
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
+    void restoreSystemVolumeAfterNearbyDucking().catch(() => {})
     showNotification(APP_NAME, 'Output ducking disabled.')
     return
   }
@@ -4578,6 +4841,139 @@ async function updateDuckingLevel(value) {
   if (voiceState.phase === 'listening') {
     await duckSystemVolumeForPushToTalk(Boolean(volumeDuckState)).catch(() => null)
   }
+}
+
+async function updateNearbyDuckingEnabled(value) {
+  nearbyDuckingEnabled = Boolean(value)
+  await saveTraySettings()
+  await restartNearbyDucking()
+  rebuildMenu()
+  showNotification(APP_NAME, nearbyDuckingEnabled ? 'Nearby ducking enabled.' : 'Nearby ducking disabled.')
+}
+
+async function completeNearbyDuckingPairing(result = {}) {
+  const secret = String(result?.sharedSecret || '').trim()
+  if (!secret) {
+    return
+  }
+  nearbyDuckingEnabled = true
+  nearbyDuckingSharedSecret = secret
+  await saveTraySettings()
+  await restartNearbyDucking()
+  rebuildMenu()
+  const peerName = String(result?.peerDeviceName || result?.peerDeviceId || 'nearby device').trim()
+  showNotification(APP_NAME, `Nearby ducking paired with ${compactText(peerName, 48)}.`)
+}
+
+async function startNearbyDuckingPairingHost() {
+  if (!nearbyDuckingEnabled) {
+    nearbyDuckingEnabled = true
+    await saveTraySettings()
+    await restartNearbyDucking()
+  }
+  if (!nearbyDucking) {
+    showNotification(APP_NAME, 'Nearby ducking could not start on this device.')
+    return
+  }
+  const pairing = nearbyDucking.beginPairingHost({ ttlMs: 120000 })
+  clipboard.writeText(pairing.code)
+  rebuildMenu()
+  showNotification(APP_NAME, `Nearby ducking code: ${pairing.code}. It was copied and expires in 2 minutes.`)
+}
+
+async function connectNearbyDuckingPairing() {
+  if (!nearbyDuckingEnabled) {
+    nearbyDuckingEnabled = true
+    await saveTraySettings()
+    await restartNearbyDucking()
+  }
+  if (!nearbyDucking) {
+    showNotification(APP_NAME, 'Nearby ducking could not start on this device.')
+    return
+  }
+
+  const code = await promptNearbyPairingCode().catch((error) => {
+    showNotification(APP_NAME, compactText(error?.message || error || 'Could not open pairing prompt.', 140))
+    return ''
+  })
+  if (!code) {
+    return
+  }
+
+  showNotification(APP_NAME, 'Looking for the nearby DicTray pairing host...')
+  await nearbyDucking.joinPairingCode(code, { timeoutMs: 120000 }).catch((error) => {
+    showNotification(APP_NAME, compactText(error?.message || error || 'Nearby ducking pairing failed.', 160))
+  })
+}
+
+async function forgetNearbyDuckingPairing() {
+  nearbyDuckingSharedSecret = ''
+  await saveTraySettings()
+  await restartNearbyDucking()
+  rebuildMenu()
+  showNotification(APP_NAME, 'Nearby ducking paired device forgotten.')
+}
+
+function runTextPrompt(command, args = []) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk || '')
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '')
+    })
+    child.on('error', reject)
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve(String(stdout || '').trim())
+        return
+      }
+      if (code === 1) {
+        resolve('')
+        return
+      }
+      reject(new Error(stderr.trim() || `${command} exited with code ${code ?? 1}`))
+    })
+  })
+}
+
+async function promptNearbyPairingCode() {
+  if (process.platform === 'darwin') {
+    return runTextPrompt('osascript', [
+      '-e',
+      'text returned of (display dialog "Enter the DicTray nearby ducking code from the other device." default answer "" with title "DicTray Nearby Ducking" buttons {"Cancel", "Connect"} default button "Connect")'
+    ])
+  }
+
+  if (process.platform === 'linux') {
+    if (commandAvailable('zenity')) {
+      return runTextPrompt('zenity', [
+        '--entry',
+        '--title',
+        'DicTray Nearby Ducking',
+        '--text',
+        'Enter the pairing code from the other DicTray device:',
+        '--entry-text',
+        ''
+      ])
+    }
+    if (commandAvailable('kdialog')) {
+      return runTextPrompt('kdialog', [
+        '--title',
+        'DicTray Nearby Ducking',
+        '--inputbox',
+        'Enter the pairing code from the other DicTray device:'
+      ])
+    }
+  }
+
+  throw new Error('No pairing prompt is available. Install zenity/kdialog or use the tray on a desktop session.')
 }
 
 async function updatePressEnterAfterInsert(value) {
@@ -5751,6 +6147,7 @@ async function startDictationCapture({
     await bridge.startRecording({
       preferredInputDeviceId
     })
+    notifyNearbyDuckingStart()
   } catch (error) {
     clearVoiceState(String(error?.message || error || 'Failed to start recording.'))
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
@@ -6212,6 +6609,46 @@ async function replaceSpeechProvider(sttConfig) {
   }, stateDir)
 }
 
+function effectiveNearbyDuckingConfig({ enabled = nearbyDuckingEnabled } = {}) {
+  return {
+    ...(runtimeConfig?.nearbyDucking || {}),
+    enabled: Boolean(enabled),
+    sharedSecret: String(nearbyDuckingSharedSecret || runtimeConfig?.nearbyDucking?.sharedSecret || '').trim()
+  }
+}
+
+async function restartNearbyDucking() {
+  const previous = nearbyDucking
+  nearbyDucking = null
+  if (previous) {
+    await previous.dispose().catch((error) => {
+      console.error('[dictray] Failed to stop nearby ducking:', error?.message || error)
+    })
+  }
+
+  clearNearbyRemoteRestoreTimer()
+  nearbyRemoteDuckState = null
+
+  const config = effectiveNearbyDuckingConfig()
+  if (!config.enabled) {
+    return
+  }
+
+  nearbyDucking = new NearbyDuckingService({
+    config,
+    getDuckingLevel: () => duckingLevel,
+    onRemoteStart: duckSystemVolumeForNearbyPeer,
+    onRemoteHeartbeat: refreshNearbyDuckingHeartbeat,
+    onRemoteStop: restoreSystemVolumeAfterNearbyDucking,
+    onPairingComplete: completeNearbyDuckingPairing,
+    logger: (message) => {
+      console.log(message)
+    }
+  })
+  await nearbyDucking.start()
+  console.log(`[dictray] Nearby ducking enabled on UDP port ${config.port}.`)
+}
+
 async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = {}) {
   runtimeConfig = nextConfig
   applyStatePaths(runtimeConfig)
@@ -6264,6 +6701,7 @@ async function reloadRuntimeConfig() {
 
   runtimeReloadInFlight = (async () => {
     await applyRuntimeConfig(await loadConfig(), { loadPersistentState: false })
+    await restartNearbyDucking()
     sttReadyForDictation = false
     sttReadyNotificationAttached = false
     clearSttKeepWarmTimer()
@@ -6285,6 +6723,7 @@ async function bootstrap() {
   }
   await applyRuntimeConfig(await loadConfig(), { loadPersistentState: true })
   systemVolume = new SystemVolumeBridge()
+  await restartNearbyDucking()
   uiAutomation = new UiAutomationBridge()
   earconPlayer = createEarconPlayer({
     logger: (message) => {
@@ -6376,11 +6815,18 @@ async function performQuitCleanup() {
     await speech?.dispose?.().catch((error) => {
       console.error('[dictray] Failed to dispose speech runtime during quit:', error?.message || error)
     })
+    await nearbyDucking?.dispose?.().catch((error) => {
+      console.error('[dictray] Failed to dispose nearby ducking during quit:', error?.message || error)
+    })
+    nearbyDucking = null
 
     if (volumeDuckState) {
       isRestoringVolumeForQuit = true
       await restoreSystemVolumeAfterPushToTalk().catch(() => null)
       isRestoringVolumeForQuit = false
+    }
+    if (nearbyRemoteDuckState) {
+      await restoreSystemVolumeAfterNearbyDucking().catch(() => null)
     }
   })().finally(() => {
     quitCleanupComplete = true

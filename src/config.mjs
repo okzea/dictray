@@ -48,6 +48,16 @@ const DEFAULTS = {
     rewriteEnabled: false,
     duckingEnabled: true,
     duckingLevel: 0.3
+  },
+  nearbyDucking: {
+    enabled: false,
+    sendEvents: true,
+    receiveEvents: true,
+    port: 47321,
+    sharedSecret: '',
+    allowUnsigned: true,
+    heartbeatIntervalMs: 3000,
+    staleTimeoutMs: 12000
   }
 }
 
@@ -73,6 +83,22 @@ function clampRatio(value, fallback) {
     return fallback
   }
   return Math.max(0, Math.min(1, Number(value)))
+}
+
+function clampPort(value, fallback) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) {
+    return fallback
+  }
+  return Math.max(1024, Math.min(65535, Math.floor(numeric)))
+}
+
+function clampNearbyInterval(value, fallback, minimum = 1000) {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) {
+    return fallback
+  }
+  return Math.max(minimum, Math.floor(numeric))
 }
 
 function normalizeUrl(value, fallback) {
@@ -277,6 +303,32 @@ export async function loadConfig(configPathArg) {
         ? Boolean(parsed.dictation.duckingEnabled)
         : DEFAULTS.dictation.duckingEnabled,
       duckingLevel: clampRatio(parsed?.dictation?.duckingLevel ?? DEFAULTS.dictation.duckingLevel, DEFAULTS.dictation.duckingLevel)
+    },
+    nearbyDucking: {
+      enabled: parsed?.nearbyDucking?.enabled !== undefined
+        ? Boolean(parsed.nearbyDucking.enabled)
+        : DEFAULTS.nearbyDucking.enabled,
+      sendEvents: parsed?.nearbyDucking?.sendEvents !== undefined
+        ? Boolean(parsed.nearbyDucking.sendEvents)
+        : DEFAULTS.nearbyDucking.sendEvents,
+      receiveEvents: parsed?.nearbyDucking?.receiveEvents !== undefined
+        ? Boolean(parsed.nearbyDucking.receiveEvents)
+        : DEFAULTS.nearbyDucking.receiveEvents,
+      port: clampPort(parsed?.nearbyDucking?.port ?? DEFAULTS.nearbyDucking.port, DEFAULTS.nearbyDucking.port),
+      sharedSecret: String(parsed?.nearbyDucking?.sharedSecret || '').trim(),
+      allowUnsigned: parsed?.nearbyDucking?.allowUnsigned !== undefined
+        ? Boolean(parsed.nearbyDucking.allowUnsigned)
+        : DEFAULTS.nearbyDucking.allowUnsigned,
+      heartbeatIntervalMs: clampNearbyInterval(
+        parsed?.nearbyDucking?.heartbeatIntervalMs ?? DEFAULTS.nearbyDucking.heartbeatIntervalMs,
+        DEFAULTS.nearbyDucking.heartbeatIntervalMs,
+        1000
+      ),
+      staleTimeoutMs: clampNearbyInterval(
+        parsed?.nearbyDucking?.staleTimeoutMs ?? DEFAULTS.nearbyDucking.staleTimeoutMs,
+        DEFAULTS.nearbyDucking.staleTimeoutMs,
+        3000
+      )
     },
     resolved: {
       hotkeyEnv: String(process.env.DICTATION_TRAY_HOTKEY || '').trim(),

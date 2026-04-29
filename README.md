@@ -123,7 +123,16 @@ Current provider config shape:
 
 - `stt.provider`: `local` is the standard app path
 - `rewrite.provider`: currently `none` or `ollama`
+- `nearbyDucking.enabled`: opt-in LAN-only ducking between DicTray devices on the same network
 - legacy `speech.stt` and top-level `ollama` still load for backward compatibility
+
+Nearby ducking can be enabled on two machines on the same LAN:
+
+1. On the music computer, open Nearby Ducking and choose **Show Pairing Code**.
+2. On the speaking computer, choose **Connect with Code** and enter the short code.
+3. DicTray exchanges a real shared secret locally and stores it in local state for future signed messages.
+
+When one DicTray device starts push-to-talk, it broadcasts a small signed local-network event so paired peers can duck their own output. Heartbeats keep the remote ducking alive during recording, and receivers restore automatically if heartbeats stop. The short pairing code is temporary; it is not the long-term secret.
 
 Compatibility note:
 
@@ -133,6 +142,7 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 
 - While push-to-talk is actively recording, output volume can be ducked and then restored to the exact prior level when capture stops.
 - Ducking defaults to enabled at `30%`, and you can change or disable it from the tray or via `dictation.duckingEnabled` / `dictation.duckingLevel` in config.
+- Nearby ducking is disabled by default and only sends start, heartbeat, and stop events; no audio, transcript, clipboard, or app content is sent.
 - The default config uses `stt.provider = local` with `scripts/faster_whisper_cli.py`.
 - Legacy `local-http` / `http` STT configs are treated as `local` during config loading so existing installations keep working.
 - Direct local STT currently expects a working local Python environment with `faster-whisper` installed. When `stt.local.device = auto`, it will choose CUDA automatically if it is available and otherwise fall back to CPU.
