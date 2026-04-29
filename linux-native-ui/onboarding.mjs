@@ -30,108 +30,11 @@ const TYPING_SCORE_BANDS = [
   'Very fast: 90+'
 ]
 
-function moduleFilePath() {
-  try {
-    const [filePath] = GLib.filename_from_uri(import.meta.url)
-    return String(filePath || '').trim()
-  } catch {
-    return ''
-  }
-}
-
-const MODULE_PATH = moduleFilePath()
-const MODULE_DIR = MODULE_PATH ? GLib.path_get_dirname(MODULE_PATH) : ''
-const RESOURCE_ROOT = MODULE_DIR ? GLib.path_get_dirname(MODULE_DIR) : ''
-
 if (cli.selfTest) {
   installCss('window {}')
   print(JSON.stringify({ ok: true, script: 'onboarding' }))
 } else {
   Adw.init()
-  installCss(`
-    window {
-      background: linear-gradient(180deg, #08131a 0%, #071018 100%);
-    }
-    .hero-card,
-    .section-card {
-      background: rgba(10, 24, 31, 0.94);
-      border: 1px solid rgba(117, 217, 176, 0.18);
-      border-radius: 22px;
-      box-shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
-      padding: 22px;
-    }
-    .eyebrow {
-      color: #69e4ac;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.22em;
-      text-transform: uppercase;
-    }
-    .headline {
-      color: #f0fff7;
-      font-size: 28px;
-      font-weight: 800;
-      letter-spacing: -0.03em;
-    }
-    .subtle,
-    .section-copy,
-    .field-hint,
-    .runtime-copy,
-    .summary-copy,
-    .sample-copy {
-      color: rgba(220, 244, 234, 0.78);
-    }
-    .section-title {
-      color: #f4fff8;
-      font-size: 17px;
-      font-weight: 700;
-    }
-    .sample-card {
-      background: rgba(105, 228, 172, 0.1);
-      border: 1px solid rgba(105, 228, 172, 0.22);
-      border-radius: 18px;
-      padding: 14px 16px;
-    }
-    .sample-text {
-      color: #f4fff8;
-      font-size: 22px;
-      font-weight: 800;
-      letter-spacing: 0.01em;
-    }
-    .status-label {
-      color: #dff8eb;
-    }
-    .status-label.error {
-      color: #ff9f9f;
-    }
-    .status-label.success {
-      color: #69e4ac;
-    }
-    .summary-copy.success,
-    .field-hint.success {
-      color: #69e4ac;
-    }
-    entry,
-    textview,
-    dropdown,
-    button {
-      border-radius: 16px;
-    }
-    textview {
-      background: rgba(3, 13, 18, 0.88);
-      color: #f3fff8;
-      min-height: 140px;
-    }
-    .choice-card {
-      background: rgba(255, 255, 255, 0.04);
-      border: 1px solid rgba(117, 217, 176, 0.14);
-      border-radius: 18px;
-      padding: 12px 14px;
-    }
-    .brand-logo {
-      opacity: 0.96;
-    }
-  `)
 
   let window = null
   let statePollId = 0
@@ -152,29 +55,6 @@ if (cli.selfTest) {
   const widgets = {
     effortButtons: new Map(),
     hotkeyPresets: []
-  }
-
-  function firstExistingPath(paths) {
-    return paths.find((filePath) => filePath && GLib.file_test(filePath, GLib.FileTest.EXISTS)) || ''
-  }
-
-  function brandLogoPath() {
-    return firstExistingPath([
-      GLib.build_filenamev([RESOURCE_ROOT, 'assets', 'brand', 'dictray-logo-dark.png']),
-      GLib.build_filenamev([RESOURCE_ROOT, 'runtime', 'linux-core', 'assets', 'brand', 'dictray-logo-dark.png'])
-    ])
-  }
-
-  function makeBrandLogo(size = 56) {
-    const logoPath = brandLogoPath()
-    if (!logoPath) {
-      return null
-    }
-
-    const image = Gtk.Image.new_from_file(logoPath)
-    image.set_pixel_size(size)
-    image.add_css_class('brand-logo')
-    return image
   }
 
   function normalizeTypedText(value) {
@@ -339,8 +219,8 @@ if (cli.selfTest) {
   }
 
   function setBenchmarkState(state) {
-    widgets.benchmarkSummaryLabel.set_css_classes(state === 'complete' ? ['summary-copy', 'success'] : ['summary-copy'])
-    widgets.benchmarkHintLabel.set_css_classes(state === 'complete' ? ['field-hint', 'success'] : ['field-hint'])
+    widgets.benchmarkSummaryLabel.set_css_classes(state === 'complete' ? ['success'] : ['dim-label'])
+    widgets.benchmarkHintLabel.set_css_classes(state === 'complete' ? ['success'] : ['dim-label'])
   }
 
   function benchmarkStats(elapsedMs) {
@@ -374,7 +254,7 @@ if (cli.selfTest) {
 
   function showStatus(message, cssClass = '') {
     widgets.statusLabel.set_label(compactSpaces(message) || 'Ready.')
-    widgets.statusLabel.set_css_classes(cssClass ? ['status-label', cssClass] : ['status-label'])
+    widgets.statusLabel.set_css_classes(cssClass ? [cssClass] : ['dim-label'])
   }
 
   function updateRuntimeSummary() {
@@ -573,13 +453,13 @@ if (cli.selfTest) {
       orientation: Gtk.Orientation.VERTICAL,
       spacing: 10
     })
-    box.add_css_class('choice-card')
+    box.add_css_class('card')
 
     const titleLabel = new Gtk.Label({ label: title, xalign: 0, wrap: true })
-    titleLabel.add_css_class('section-title')
+    titleLabel.add_css_class('heading')
 
     const bodyLabel = new Gtk.Label({ label: body, xalign: 0, wrap: true })
-    bodyLabel.add_css_class('section-copy')
+    bodyLabel.add_css_class('dim-label')
 
     box.append(titleLabel)
     box.append(bodyLabel)
@@ -608,46 +488,26 @@ if (cli.selfTest) {
       orientation: Gtk.Orientation.VERTICAL,
       spacing: 8
     })
-    hero.add_css_class('hero-card')
-
-    const eyebrow = new Gtk.Label({ label: 'Quick Start', xalign: 0 })
-    eyebrow.add_css_class('eyebrow')
+    hero.add_css_class('card')
 
     const headline = new Gtk.Label({
-      label: 'Native Linux setup',
+      label: 'Quick Start',
       xalign: 0,
       wrap: true
     })
-    headline.add_css_class('headline')
+    headline.add_css_class('title-1')
 
     const subtitle = new Gtk.Label({
-      label: 'DicTray now uses a Linux-native setup flow. Set your profile, measure your typing pace once, choose your speech effort, and finish with one clean pass.',
+      label: 'Set your profile, measure your typing pace once, choose your speech effort, and finish with one clean pass.',
       xalign: 0,
       wrap: true
     })
-    subtitle.add_css_class('subtle')
+    subtitle.add_css_class('dim-label')
 
     widgets.runtimeLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
-    widgets.runtimeLabel.add_css_class('runtime-copy')
+    widgets.runtimeLabel.add_css_class('dim-label')
 
-    const brandRow = new Gtk.Box({
-      orientation: Gtk.Orientation.HORIZONTAL,
-      spacing: 14
-    })
-    brandRow.set_valign(Gtk.Align.CENTER)
-    const brandText = new Gtk.Box({
-      orientation: Gtk.Orientation.VERTICAL,
-      spacing: 2
-    })
-    brandText.append(eyebrow)
-    brandText.append(headline)
-    const brandLogo = makeBrandLogo()
-    if (brandLogo) {
-      brandRow.append(brandLogo)
-    }
-    brandRow.append(brandText)
-
-    hero.append(brandRow)
+    hero.append(headline)
     hero.append(subtitle)
     hero.append(widgets.runtimeLabel)
 
@@ -663,11 +523,11 @@ if (cli.selfTest) {
     })
 
     const profileCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
-    profileCard.add_css_class('section-card')
+    profileCard.add_css_class('card')
     const profileTitle = new Gtk.Label({ label: 'Your name', xalign: 0 })
-    profileTitle.add_css_class('section-title')
+    profileTitle.add_css_class('heading')
     const profileCopy = new Gtk.Label({ label: 'DicTray uses this in the tray greeting and in your daily savings summary.', xalign: 0, wrap: true })
-    profileCopy.add_css_class('section-copy')
+    profileCopy.add_css_class('dim-label')
     widgets.nameEntry = new Gtk.Entry({ placeholder_text: 'Avery' })
     widgets.nameEntry.connect('changed', () => {
       updateSummary()
@@ -677,21 +537,21 @@ if (cli.selfTest) {
     profileCard.append(widgets.nameEntry)
 
     const benchmarkCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 12 })
-    benchmarkCard.add_css_class('section-card')
+    benchmarkCard.add_css_class('card')
     const benchmarkTitle = new Gtk.Label({ label: 'Typing Pace', xalign: 0 })
-    benchmarkTitle.add_css_class('section-title')
+    benchmarkTitle.add_css_class('heading')
     const benchmarkCopy = new Gtk.Label({ label: 'Read the phrase once, then type it naturally. DicTray uses the timing to estimate saved keyboard time.', xalign: 0, wrap: true })
-    benchmarkCopy.add_css_class('section-copy')
+    benchmarkCopy.add_css_class('dim-label')
     const sampleCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 6 })
-    sampleCard.add_css_class('sample-card')
+    sampleCard.add_css_class('card')
     const sampleHint = new Gtk.Label({ label: 'Type this exact phrase', xalign: 0 })
-    sampleHint.add_css_class('sample-copy')
+    sampleHint.add_css_class('dim-label')
     widgets.sampleLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
-    widgets.sampleLabel.add_css_class('sample-text')
+    widgets.sampleLabel.add_css_class('title-3')
     sampleCard.append(sampleHint)
     sampleCard.append(widgets.sampleLabel)
     widgets.benchmarkSummaryLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
-    widgets.benchmarkSummaryLabel.add_css_class('summary-copy')
+    widgets.benchmarkSummaryLabel.add_css_class('dim-label')
     widgets.benchmarkSummaryLabel.set_hexpand(true)
     widgets.benchmarkInfoButton = new Gtk.Button({ label: '?' })
     widgets.benchmarkInfoButton.set_tooltip_text(typingScoreTooltip())
@@ -726,7 +586,7 @@ if (cli.selfTest) {
     const typingScroller = new Gtk.ScrolledWindow({ min_content_height: 160, hexpand: true })
     typingScroller.set_child(widgets.typingView)
     widgets.benchmarkHintLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
-    widgets.benchmarkHintLabel.add_css_class('field-hint')
+    widgets.benchmarkHintLabel.add_css_class('dim-label')
     benchmarkCard.append(benchmarkTitle)
     benchmarkCard.append(benchmarkCopy)
     benchmarkCard.append(sampleCard)
@@ -743,7 +603,7 @@ if (cli.selfTest) {
       'Use text improvement only if you want the transcript polished before insert. Built-in speech to text works on its own.',
       widgets.rewriteSwitch
     )
-    rewriteCard.add_css_class('section-card')
+    rewriteCard.add_css_class('card')
 
     const effortBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
     const lowButton = new Gtk.CheckButton({ label: 'Low (Faster)' })
@@ -765,18 +625,18 @@ if (cli.selfTest) {
       'Pick the balance you want between speed and quality for local STT on Linux.',
       effortBox
     )
-    effortCard.add_css_class('section-card')
+    effortCard.add_css_class('card')
 
     const contextCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
-    contextCard.add_css_class('section-card')
+    contextCard.add_css_class('card')
     const contextTitle = new Gtk.Label({ label: 'Speech context', xalign: 0 })
-    contextTitle.add_css_class('section-title')
+    contextTitle.add_css_class('heading')
     const contextCopy = new Gtk.Label({
       label: 'Add names, company terms, product words, and corrections. Example: Avery writes for Northstar Labs; LumaNote is one word.',
       xalign: 0,
       wrap: true
     })
-    contextCopy.add_css_class('section-copy')
+    contextCopy.add_css_class('dim-label')
     widgets.sttContextView = new Gtk.TextView({ monospace: false, wrap_mode: Gtk.WrapMode.WORD_CHAR })
     widgets.sttContextView.get_buffer().connect('changed', () => {
       updateSummary()
@@ -792,7 +652,7 @@ if (cli.selfTest) {
       updateSummary()
     })
     widgets.hotkeyHintLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
-    widgets.hotkeyHintLabel.add_css_class('field-hint')
+    widgets.hotkeyHintLabel.add_css_class('dim-label')
     const hotkeyBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
     hotkeyBox.append(widgets.hotkeyDropdown)
     hotkeyBox.append(widgets.hotkeyHintLabel)
@@ -801,14 +661,14 @@ if (cli.selfTest) {
       'Hold this shortcut when you want DicTray to listen.',
       hotkeyBox
     )
-    hotkeyCard.add_css_class('section-card')
+    hotkeyCard.add_css_class('card')
 
     const summaryCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
-    summaryCard.add_css_class('section-card')
+    summaryCard.add_css_class('card')
     const summaryTitle = new Gtk.Label({ label: 'Ready to finish', xalign: 0 })
-    summaryTitle.add_css_class('section-title')
+    summaryTitle.add_css_class('heading')
     widgets.summaryLabel = new Gtk.Label({ label: '', xalign: 0, wrap: true })
-    widgets.summaryLabel.add_css_class('summary-copy')
+    widgets.summaryLabel.add_css_class('dim-label')
     summaryCard.append(summaryTitle)
     summaryCard.append(widgets.summaryLabel)
 
@@ -826,7 +686,7 @@ if (cli.selfTest) {
       spacing: 12,
       hexpand: true
     })
-    footer.add_css_class('section-card')
+    footer.add_css_class('toolbar')
 
     widgets.statusLabel = new Gtk.Label({
       label: 'Complete the fields above, then finish Quick Start.',
@@ -834,7 +694,7 @@ if (cli.selfTest) {
       hexpand: true,
       wrap: true
     })
-    widgets.statusLabel.add_css_class('status-label')
+    widgets.statusLabel.add_css_class('dim-label')
 
     const skipButton = new Gtk.Button({ label: 'Skip for now' })
     skipButton.connect('clicked', () => {
@@ -842,6 +702,7 @@ if (cli.selfTest) {
     })
 
     widgets.finishButton = new Gtk.Button({ label: 'Finish Quick Start' })
+    widgets.finishButton.add_css_class('suggested-action')
     widgets.finishButton.connect('clicked', () => {
       sendCompleteCommand()
     })
