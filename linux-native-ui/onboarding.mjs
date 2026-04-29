@@ -44,6 +44,7 @@ const MODULE_DIR = MODULE_PATH ? GLib.path_get_dirname(MODULE_PATH) : ''
 const RESOURCE_ROOT = MODULE_DIR ? GLib.path_get_dirname(MODULE_DIR) : ''
 
 if (cli.selfTest) {
+  installCss('window {}')
   print(JSON.stringify({ ok: true, script: 'onboarding' }))
 } else {
   Adw.init()
@@ -488,7 +489,7 @@ if (cli.selfTest) {
     widgets.hotkeyDropdown.set_selected(hotkeyIndex)
 
     const buffer = widgets.typingView.get_buffer()
-    buffer.set_text(String(typingBenchmark?.sampleText && typingBenchmark?.elapsedMs ? latestPayload.sampleText : ''))
+    buffer.set_text(String(typingBenchmark?.sampleText && typingBenchmark?.elapsedMs ? latestPayload.sampleText : ''), -1)
     benchmarkElapsedMs = Math.max(0, Number(typingBenchmark?.elapsedMs || 0) || 0)
     benchmarkStartedAt = benchmarkElapsedMs ? Date.now() - benchmarkElapsedMs : 0
 
@@ -886,5 +887,5 @@ if (cli.selfTest) {
     removeSource(closeDelayId)
   })
 
-  app.run(ARGV)
+  app.run([])
 }

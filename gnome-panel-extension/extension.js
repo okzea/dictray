@@ -687,6 +687,33 @@ function writeCommand(action) {
   }
 }
 
+function openPreferencesWindow() {
+  ensureAppRunning();
+
+  try {
+    Gio.DBus.session.call(
+      'org.gnome.Shell.Extensions',
+      '/org/gnome/Shell/Extensions',
+      'org.gnome.Shell.Extensions',
+      'OpenExtensionPrefs',
+      new GLib.Variant('(ssa{sv})', [EXTENSION_ID, '', {}]),
+      null,
+      Gio.DBusCallFlags.NONE,
+      -1,
+      null,
+      (_connection, result) => {
+        try {
+          Gio.DBus.session.call_finish(result);
+        } catch (error) {
+          console.error('[dictray] Failed to open preferences: ' + error);
+        }
+      }
+    );
+  } catch (error) {
+    console.error('[dictray] Failed to open preferences: ' + error);
+  }
+}
+
 let _virtualKeyboard = null;
 
 function getVirtualKeyboard() {
@@ -920,6 +947,8 @@ class DicTrayIndicator extends PanelMenu.Button {
       {label: 'Target: unavailable', enabled: false},
       {label: 'Note: unavailable', enabled: false},
       {label: 'Error: none', enabled: false},
+      {type: 'separator'},
+      {label: 'Preferences', command: {action: 'open_preferences'}},
     ]);
     _activeExtension?._syncCancelKeybinding();
   }
@@ -932,6 +961,8 @@ class DicTrayIndicator extends PanelMenu.Button {
     this._overlay.hideNow();
     this._syncMenu([
       {label: 'App has quit', enabled: false},
+      {type: 'separator'},
+      {label: 'Preferences', command: {action: 'open_preferences'}},
     ]);
     _activeExtension?._syncCancelKeybinding();
   }
@@ -973,7 +1004,13 @@ class DicTrayIndicator extends PanelMenu.Button {
 
     if (item.command && item.enabled !== false) {
       menuItem.connect('activate', () => {
-        writeCommand(String(item.command.action || ''), item.command.value);
+        const action = String(item.command.action || '').trim();
+        if (action === 'open_preferences') {
+          openPreferencesWindow();
+          return;
+        }
+
+        writeCommand(action, item.command.value);
       });
     }
 

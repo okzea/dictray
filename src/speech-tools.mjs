@@ -13,6 +13,11 @@ function nowMs(started) {
   return Math.round(performance.now() - started)
 }
 
+function encodeHeaderBase64(value) {
+  const text = String(value || '').trim()
+  return text ? Buffer.from(text, 'utf8').toString('base64') : ''
+}
+
 function buildSilentWav(durationSec = 0.1) {
   const sampleRate = 16000
   const numSamples = Math.round(sampleRate * durationSec)
@@ -648,7 +653,7 @@ class LocalSttDaemonClient {
           'x-stt-model-dir': String(payload?.modelDir || '').trim(),
           'x-stt-device': String(payload?.device || '').trim() || 'auto',
           'x-stt-compute-type': String(payload?.computeType || '').trim() || 'auto',
-          'x-stt-initial-prompt': String(payload?.initialPrompt || '').trim()
+          'x-stt-initial-prompt-b64': encodeHeaderBase64(payload?.initialPrompt)
         },
         signal: options?.signal || null,
         body: audioBuffer

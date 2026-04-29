@@ -64,5 +64,6 @@ The Linux rewrite now targets GNOME-native UI throughout:
 - This path is intentionally Linux-first and GNOME-first.
 - A fixed overlay on Wayland is reliable in Shell UI; it is not reliable as a regular GTK window without layer-shell.
 - Linux input setup and Quick Start now launch as GJS/GTK utilities through a file bridge under `~/.config/dictray/linux-ui/`.
+- Persistent GNOME settings live in the extension preferences window, opened from the panel menu or `gnome-extensions prefs dictray-gnome-panel@okzea`.
 - The Linux headless core now runs directly under `node` in development and is the default `npm run tray` path on Linux.
 - Packaged Linux builds now ship as a pure Node bundle with staged runtime resources under `dist/DicTray-linux-x64/`.

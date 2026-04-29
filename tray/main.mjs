@@ -477,7 +477,150 @@ function isActiveDictationPhase(value) {
   return GNOME_PANEL_ACTIVE_PHASES.has(String(value || 'idle').trim())
 }
 
-function buildGnomePanelMenu(options = {}) {
+function buildGnomePanelMenu() {
+  const greetingMenuLabel = greetingLabel()
+  const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
+  const historyMenu = outputHistory.entries.length > 0
+    ? [{
+        label: 'Click any entry to copy it',
+        enabled: false
+      }, {
+        type: 'separator'
+      }, ...outputHistory.entries.map((entry) => ({
+        label: outputHistoryMenuLabel(entry),
+        command: {
+          action: 'copy_history',
+          value: String(entry?.text || '')
+        }
+      }))]
+    : [{
+        label: 'No saved text yet',
+        enabled: false
+      }]
+  const selectedInputDevice = selectedInputSource()
+  const inputSourceMenu = [
+    {
+      label: inputSourcePrimaryActionLabel(),
+      command: {
+        action: 'open_input_preview'
+      }
+    },
+    { type: 'separator' },
+    ...(preferredInputDeviceId && inputDeviceState.available.length && !selectedInputDevice
+      ? [{
+          label: 'Selected microphone is unavailable. Falling back to the system default when needed.',
+          enabled: false
+        }]
+      : []),
+    ...(inputDeviceState.error
+      ? [{
+          label: `Status: ${compactText(inputDeviceState.error, 72)}`,
+          enabled: false
+        }]
+      : []),
+    {
+      label: 'System Default',
+      type: 'radio',
+      checked: !preferredInputDeviceId,
+      command: {
+        action: 'set_input_source',
+        value: ''
+      }
+    },
+    ...(inputDeviceState.available.length
+      ? inputDeviceState.available.map((device) => ({
+          label: compactText(device.label, 56),
+          type: 'radio',
+          checked: preferredInputDeviceId === device.deviceId,
+          command: {
+            action: 'set_input_source',
+            value: device.deviceId
+          }
+        }))
+      : [{
+          label: inputDeviceState.permission === 'denied'
+            ? 'Microphone access denied'
+            : inputDeviceState.permission === 'granted'
+              ? 'No microphones detected'
+              : 'Start dictation once to grant microphone access',
+          enabled: false
+        }]),
+    { type: 'separator' },
+    {
+      label: 'Refresh Inputs',
+      command: {
+        action: 'refresh_inputs'
+      }
+    }
+  ]
+  const duckingLevelMenu = [{
+    label: 'Ducking Level',
+    type: 'slider',
+    value: duckingLevel,
+    min: DUCKING_LEVEL_OPTIONS[0],
+    max: DUCKING_LEVEL_OPTIONS[DUCKING_LEVEL_OPTIONS.length - 1],
+    step: 0.1,
+    command: {
+      action: 'set_ducking_level'
+    }
+  }]
+
+  return [
+    { label: greetingMenuLabel, enabled: false },
+    { label: dailyTimeSavedLabel, enabled: false },
+    {
+      label: isActiveDictationPhase(voiceState?.phase) ? 'Stop Dictation' : 'Start Dictation',
+      command: {
+        action: 'toggle'
+      }
+    },
+    {
+      label: 'History',
+      submenu: historyMenu
+    },
+    { type: 'separator' },
+    {
+      label: 'Output Ducking',
+      submenu: [
+        {
+          label: duckingEnabled ? `Enabled (${duckingPercentLabel()})` : 'Disabled',
+          enabled: false
+        },
+        {
+          label: 'Enable Ducking',
+          type: 'checkbox',
+          checked: duckingEnabled,
+          command: {
+            action: 'set_ducking_enabled',
+            value: !duckingEnabled
+          }
+        },
+        { type: 'separator' },
+        ...duckingLevelMenu
+      ]
+    },
+    {
+      label: 'Input Source',
+      submenu: inputSourceMenu
+    },
+    { type: 'separator' },
+    {
+      label: 'Preferences',
+      command: {
+        action: 'open_preferences'
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Quit',
+      command: {
+        action: 'quit_app'
+      }
+    }
+  ]
+}
+
+function buildDetailedControlMenu(options = {}) {
   const useDuckingSlider = Boolean(options?.duckingSlider)
   const greetingMenuLabel = greetingLabel()
   const dailyTimeSavedLabel = compactText(timeSavedTrayLabel(), 110)
@@ -849,6 +992,175 @@ function buildGnomePanelMenu(options = {}) {
   ]
 }
 
+function buildPreferenceOptions(values = [], labelForValue = (value) => String(value), currentValue = '') {
+  return values.map((value) => ({
+    label: labelForValue(value),
+    value,
+    checked: value === currentValue
+  }))
+}
+
+function buildCommandOptions(options = [], action = '', currentValue = '') {
+  return options.map((option) => ({
+    label: String(option?.label || '').trim(),
+    value: option?.value,
+    checked: option?.value === currentValue,
+    command: {
+      action,
+      value: option?.value
+    }
+  }))
+}
+
+function buildGnomePanelPreferencesPayload() {
+  const selectedInputDevice = selectedInputSource()
+  const inputOptions = [
+    {
+      label: 'System Default',
+      value: '',
+      checked: !preferredInputDeviceId,
+      command: {
+        action: 'set_input_source',
+        value: ''
+      }
+    },
+    ...inputDeviceState.available.map((device) => ({
+      label: compactText(device.label, 72),
+      value: device.deviceId,
+      checked: preferredInputDeviceId === device.deviceId,
+      command: {
+        action: 'set_input_source',
+        value: device.deviceId
+      }
+    }))
+  ]
+
+  return {
+    quickStart: {
+      completed: onboardingCompleted(),
+      label: onboardingCompleted() ? 'Open Quick Start' : 'Finish Quick Start',
+      command: {
+        action: 'open_quick_start'
+      }
+    },
+    inputSource: {
+      label: inputSourceMenuLabel(),
+      activeLabel: inputDeviceState.activeLabel,
+      selectedUnavailable: Boolean(preferredInputDeviceId && inputDeviceState.available.length && !selectedInputDevice),
+      error: inputDeviceState.error,
+      options: inputOptions,
+      setupCommand: {
+        action: 'open_input_preview'
+      },
+      refreshCommand: {
+        action: 'refresh_inputs'
+      }
+    },
+    ducking: {
+      enabled: duckingEnabled,
+      level: duckingLevel,
+      options: buildCommandOptions(
+        buildPreferenceOptions(DUCKING_LEVEL_OPTIONS, duckingLevelMenuLabel, duckingLevel),
+        'set_ducking_level',
+        duckingLevel
+      ),
+      enabledCommand: {
+        action: 'set_ducking_enabled',
+        value: !duckingEnabled
+      }
+    },
+    stt: {
+      supported: sttPreferences.supported,
+      templateSupported: sttPreferences.templateSupported,
+      deviceOptions: sttPreferences.supported
+        ? buildCommandOptions(
+          buildPreferenceOptions(sttPreferences.options, sttDeviceMenuLabel, sttPreferences.selectedDevice),
+          'set_stt_device',
+          sttPreferences.selectedDevice
+        )
+        : [],
+      modelOptions: sttPreferences.supported
+        ? buildCommandOptions(
+          buildPreferenceOptions(sttPreferences.modelOptions, sttModelMenuOptionLabel, sttPreferences.selectedModel),
+          'set_stt_model',
+          sttPreferences.selectedModel
+        )
+        : [],
+      templateOptions: sttPreferences.templateSupported
+        ? buildCommandOptions(
+          buildPreferenceOptions(sttPreferences.templateOptions, sttPromptTemplateMenuLabel, sttPreferences.selectedTemplate),
+          'set_stt_prompt_template',
+          sttPreferences.selectedTemplate
+        )
+        : []
+    },
+    rewrite: {
+      enabled: rewriteEnabled,
+      provider: rewriteProviderId(),
+      model: currentRewriteModel,
+      think: currentRewriteThink,
+      temperature: currentRewriteTemperature,
+      enabledCommand: {
+        action: 'set_rewrite_enabled',
+        value: !rewriteEnabled
+      },
+      providerOptions: buildCommandOptions([{
+        label: 'Off (skip text improvement)',
+        value: 'none'
+      }, {
+        label: 'Ollama (local rewrite provider)',
+        value: 'ollama'
+      }], 'set_rewrite_provider', rewriteProviderId()),
+      thinkOptions: buildCommandOptions(['off', 'default', 'on'].map((value) => ({
+        label: rewriteThinkMenuOptionLabel(value),
+        value
+      })), 'set_rewrite_think', normalizeRewriteThink(currentRewriteThink)),
+      temperatureOptions: buildCommandOptions(REWRITE_TEMPERATURE_OPTIONS.map((value) => ({
+        label: rewriteTemperatureMenuOptionLabel(value),
+        value
+      })), 'set_rewrite_temperature', normalizeRewriteTemperature(currentRewriteTemperature)),
+      modelOptions: rewriteSupportsModelSelection()
+        ? rewriteModels.map((model) => ({
+          label: String(model?.name || '').trim() || 'unknown',
+          value: String(model?.name || '').trim(),
+          checked: String(model?.name || '').trim() === currentRewriteModel,
+          command: {
+            action: 'switch_rewrite_model',
+            value: String(model?.name || '').trim()
+          }
+        }))
+        : []
+    },
+    shortcuts: {
+      hotkeyManagedByEnv: hotkeyManagedByEnv(),
+      shortcutMode,
+      hotkey: trayHotkey,
+      promptHotkey: promptTrayHotkey,
+      shortcutModeOptions: [{
+        label: 'Press once to start, again to stop',
+        value: SHORTCUT_MODE_TOGGLE,
+        checked: shortcutMode === SHORTCUT_MODE_TOGGLE,
+        command: {
+          action: 'set_shortcut_mode',
+          value: SHORTCUT_MODE_TOGGLE
+        }
+      }, {
+        label: shortcutHoldModeMenuLabel(),
+        value: SHORTCUT_MODE_HOLD,
+        checked: shortcutMode === SHORTCUT_MODE_HOLD,
+        command: {
+          action: 'set_shortcut_mode',
+          value: SHORTCUT_MODE_HOLD
+        }
+      }],
+      hotkeyOptions: hotkeyManagedByEnv()
+        ? []
+        : buildCommandOptions(HOTKEY_PRESETS, 'set_tray_hotkey', trayHotkey),
+      promptHotkeyOptions: buildCommandOptions(PROMPT_HOTKEY_PRESETS, 'set_prompt_hotkey', promptTrayHotkey)
+    }
+  }
+}
+
 function buildGnomePanelPayload() {
   return {
     version: 1,
@@ -867,7 +1179,8 @@ function buildGnomePanelPayload() {
     error: compactText(voiceState?.error || '', 180),
     nativeOverlay: gnomeNativeOverlayActive(),
     inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
-    menu: buildGnomePanelMenu({ duckingSlider: true })
+    preferences: buildGnomePanelPreferencesPayload(),
+    menu: buildGnomePanelMenu()
   }
 }
 
@@ -1107,7 +1420,7 @@ function buildMacosMenuPayload() {
   return {
     ...payload,
     platform: 'darwin',
-    menu: buildGnomePanelMenu({ duckingSlider: true })
+    menu: buildDetailedControlMenu({ duckingSlider: true })
   }
 }
 
