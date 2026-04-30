@@ -78,7 +78,8 @@ export function writeJsonFile(filePath, payload) {
 
 export function installCss(css) {
   const provider = new Gtk.CssProvider()
-  provider.load_from_data(css)
+  const content = String(css || '')
+  provider.load_from_data(content, content.length)
   const display = Gdk.Display.get_default()
   if (!display) {
     return

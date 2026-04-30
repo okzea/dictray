@@ -1,4 +1,4 @@
-import { access, cp, lstat, mkdir, readFile, readdir, readlink, rm, writeFile } from 'node:fs/promises'
+import { access, cp, lstat, mkdir, readFile, readdir, readlink, rm, symlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -174,6 +174,41 @@ async function prunePythonBytecode(rootDir) {
   }
 }
 
+async function rewriteInternalAbsoluteSymlinks(rootDir) {
+  const root = path.resolve(rootDir)
+
+  async function visit(entryPath) {
+    const stats = await lstat(entryPath)
+    if (stats.isSymbolicLink()) {
+      const target = await readlink(entryPath)
+      if (!path.isAbsolute(target)) {
+        return
+      }
+
+      const resolvedTarget = path.resolve(path.dirname(entryPath), target)
+      if (!isPathInside(root, resolvedTarget)) {
+        return
+      }
+
+      const relativeTarget = path.relative(path.dirname(entryPath), resolvedTarget) || '.'
+      await rm(entryPath, { force: true })
+      await symlink(relativeTarget, entryPath)
+      return
+    }
+
+    if (!stats.isDirectory()) {
+      return
+    }
+
+    const entries = await readdir(entryPath)
+    await Promise.all(entries.map((entry) => visit(path.join(entryPath, entry))))
+  }
+
+  if (await pathExists(root)) {
+    await visit(root)
+  }
+}
+
 async function rewritePythonEntrypointShebangs(pythonRoot) {
   const binDir = path.join(pythonRoot, VENV_BIN_DIR)
   if (!await pathExists(binDir)) {
@@ -208,6 +243,7 @@ async function rewritePythonEntrypointShebangs(pythonRoot) {
 }
 
 async function sanitizePythonRuntime(rootDir) {
+  await rewriteInternalAbsoluteSymlinks(rootDir)
   await rewritePythonEntrypointShebangs(rootDir)
   await prunePythonBytecode(rootDir)
 }
@@ -506,7 +542,8 @@ export async function ensureBundledSttRuntime(options = {}) {
     log(`Copying Python runtime from ${pythonRuntime.sourceRoot}.`)
     await cp(pythonRuntime.sourceRoot, targetRoot, {
       recursive: true,
-      force: true
+      force: true,
+      verbatimSymlinks: true
     })
     await sanitizePythonRuntime(targetRoot)
     await assertPortableRuntime(targetRoot)

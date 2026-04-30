@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from array import array
 import argparse
+import base64
 import gc
 import json
 import math
@@ -58,6 +59,16 @@ def read_json_bytes(raw: bytes) -> dict:
         return {}
     parsed = json.loads(raw.decode("utf-8"))
     return parsed if isinstance(parsed, dict) else {}
+
+
+def decode_header_base64(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return base64.b64decode(text, validate=True).decode("utf-8").strip()
+    except Exception:
+        return ""
 
 
 def error_text(error: Exception) -> str:
@@ -578,12 +589,16 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if parsed.path == "/transcribe":
+                initial_prompt = (
+                    decode_header_base64(self.headers.get("X-Stt-Initial-Prompt-B64", ""))
+                    or self.headers.get("X-Stt-Initial-Prompt", "")
+                )
                 payload = {
                     "model": self.headers.get("X-Stt-Model", "base.en"),
                     "modelDir": self.headers.get("X-Stt-Model-Dir", ""),
                     "device": self.headers.get("X-Stt-Device", "auto"),
                     "computeType": self.headers.get("X-Stt-Compute-Type", "auto"),
-                    "initialPrompt": self.headers.get("X-Stt-Initial-Prompt", ""),
+                    "initialPrompt": initial_prompt,
                 }
                 result = transcribe_audio(payload, raw_body, self.headers.get("Content-Type", "application/octet-stream"))
                 self.send_json(200, result)

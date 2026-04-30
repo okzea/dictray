@@ -49,7 +49,17 @@ async function readPackageVersion() {
 function launcherScript() {
   return `#!/usr/bin/env bash
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${'${BASH_SOURCE[0]}'}")" && pwd)"
+SOURCE="${'${BASH_SOURCE[0]}'}"
+while [[ -L "$SOURCE" ]]; do
+  SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  TARGET="$(readlink "$SOURCE")"
+  if [[ "$TARGET" == /* ]]; then
+    SOURCE="$TARGET"
+  else
+    SOURCE="$SCRIPT_DIR/$TARGET"
+  fi
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
 APP_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 export DICTATION_TRAY_LINUX_HEADLESS=1
 export DICTATION_TRAY_PACKAGED=1

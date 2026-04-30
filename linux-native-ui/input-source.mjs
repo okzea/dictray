@@ -22,6 +22,7 @@ const CAPTURE_CHANNELS = 1
 const PROBE_CLIENT_NAME = 'DicTray Preview'
 
 if (cli.selfTest) {
+  installCss('window {}')
   print(JSON.stringify({ ok: true, script: 'input-source' }))
 } else {
   Adw.init()
@@ -587,5 +588,5 @@ if (cli.selfTest) {
     removeSource(meterAnimationId)
   })
 
-  app.run(ARGV)
+  app.run([])
 }
