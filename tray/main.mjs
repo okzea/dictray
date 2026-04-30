@@ -1291,6 +1291,10 @@ let gnomePanelCommandProcessing = false
 
 async function handleExternalMenuCommand(command = {}) {
   const action = String(command?.action || '').trim()
+  void appendDiagnosticsLog('external-menu-command', {
+    action,
+    hasValue: command?.value !== undefined
+  })
 
   switch (action) {
     case 'toggle': {
@@ -3863,7 +3867,12 @@ function nearbyDuckingStatusLabel() {
   if (!nearbyDuckingEnabled) {
     return 'Disabled'
   }
-  return nearbyDuckingSharedSecret ? 'Enabled and paired' : 'Enabled, not paired'
+  if (nearbyDuckingSharedSecret) {
+    return 'Enabled and paired'
+  }
+  return runtimeConfig?.nearbyDucking?.allowUnsigned === true
+    ? 'Enabled, unsigned LAN mode'
+    : 'Enabled, pairing required'
 }
 
 function buildNearbyDuckingMenuTemplate() {
@@ -6617,6 +6626,29 @@ function effectiveNearbyDuckingConfig({ enabled = nearbyDuckingEnabled } = {}) {
   }
 }
 
+async function logNearbyDuckingPairingEvent(event = {}) {
+  const type = String(event?.type || '').trim()
+  const peer = String(event?.peerDeviceName || event?.peerDeviceId || event?.address || '').trim()
+  await appendDiagnosticsLog('nearby-ducking-pairing', {
+    type,
+    peer,
+    address: String(event?.address || '').trim(),
+    reason: String(event?.reason || '').trim()
+  })
+
+  if (type === 'offer-received') {
+    console.log(`[dictray] Nearby ducking pairing offer received${peer ? ` from ${peer}` : ''}.`)
+  } else if (type === 'request-received') {
+    console.log(`[dictray] Nearby ducking pairing request received${peer ? ` from ${peer}` : ''}.`)
+  } else if (type === 'request-rejected') {
+    showNotification(APP_NAME, 'Nearby ducking pairing request received, but the code did not match.')
+  } else if (type === 'accept-received') {
+    console.log(`[dictray] Nearby ducking pairing accept received${peer ? ` from ${peer}` : ''}.`)
+  } else if (type === 'join-timeout') {
+    console.log('[dictray] Nearby ducking pairing timed out.')
+  }
+}
+
 async function restartNearbyDucking() {
   const previous = nearbyDucking
   nearbyDucking = null
@@ -6641,6 +6673,7 @@ async function restartNearbyDucking() {
     onRemoteHeartbeat: refreshNearbyDuckingHeartbeat,
     onRemoteStop: restoreSystemVolumeAfterNearbyDucking,
     onPairingComplete: completeNearbyDuckingPairing,
+    onPairingEvent: logNearbyDuckingPairingEvent,
     logger: (message) => {
       console.log(message)
     }

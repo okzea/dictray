@@ -154,6 +154,15 @@ function legacyPreferencesFromMenu(status = {}) {
         value: !Boolean(status.duckingEnabled),
       },
     },
+    nearbyDucking: {
+      enabled: false,
+      paired: false,
+      status: _('Unavailable'),
+      enabledCommand: {action: 'set_nearby_ducking_enabled', value: true},
+      hostCommand: {action: 'start_nearby_pairing'},
+      connectCommand: {action: 'connect_nearby_pairing'},
+      forgetCommand: null,
+    },
     stt: {
       supported: true,
       templateSupported: true,
@@ -315,6 +324,11 @@ export default class DicTrayPreferences extends ExtensionPreferences {
     page.add(outputGroup);
     addSwitchRow(outputGroup, _('Output Ducking'), _('Lower system volume while recording.'), preferences.ducking?.enabled, preferences.ducking?.enabledCommand);
     addCommandCombo(outputGroup, _('Ducking Level'), '', preferences.ducking?.options);
+    addSwitchRow(outputGroup, _('Nearby Ducking'), preferences.nearbyDucking?.status || _('LAN-only ducking for another DicTray device.'), preferences.nearbyDucking?.enabled, preferences.nearbyDucking?.enabledCommand);
+    addButtonRow(outputGroup, _('Show Pairing Code'), _('Host pairing on this device and copy the short code.'), _('Show Code'), preferences.nearbyDucking?.hostCommand || {action: 'start_nearby_pairing'});
+    addButtonRow(outputGroup, _('Connect with Code'), _('Enter the short code shown on another DicTray device.'), _('Connect'), preferences.nearbyDucking?.connectCommand || {action: 'connect_nearby_pairing'});
+    if (preferences.nearbyDucking?.paired && preferences.nearbyDucking?.forgetCommand)
+      addButtonRow(outputGroup, _('Forget Paired Device'), _('Remove the stored nearby ducking secret from this device.'), _('Forget'), preferences.nearbyDucking.forgetCommand, 'destructive-action');
     addSwitchRow(outputGroup, _('Improve Text'), _('Clean up raw speech before insertion.'), preferences.rewrite?.enabled, preferences.rewrite?.enabledCommand);
     addCommandCombo(outputGroup, _('Text Improvement Provider'), '', preferences.rewrite?.providerOptions);
     addCommandCombo(outputGroup, _('Text Improvement Model'), '', preferences.rewrite?.modelOptions);

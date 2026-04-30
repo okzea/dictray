@@ -75,7 +75,7 @@ function normalizeConfig(config = {}) {
     receiveEvents: config?.receiveEvents !== false,
     port: normalizePort(config?.port),
     sharedSecret: String(config?.sharedSecret || '').trim(),
-    allowUnsigned: config?.allowUnsigned !== false,
+    allowUnsigned: config?.allowUnsigned === true,
     heartbeatIntervalMs: normalizeInterval(config?.heartbeatIntervalMs, 3000, 1000),
     staleTimeoutMs: normalizeInterval(config?.staleTimeoutMs, 12000, 3000),
     deviceId: String(config?.deviceId || '').trim() || randomId(),
@@ -91,6 +91,7 @@ export class NearbyDuckingService {
     onRemoteHeartbeat = async () => {},
     onRemoteStop = async () => {},
     onPairingComplete = async () => {},
+    onPairingEvent = async () => {},
     logger = () => {}
   } = {}) {
     this.config = normalizeConfig(config)
@@ -99,6 +100,7 @@ export class NearbyDuckingService {
     this.onRemoteHeartbeat = onRemoteHeartbeat
     this.onRemoteStop = onRemoteStop
     this.onPairingComplete = onPairingComplete
+    this.onPairingEvent = onPairingEvent
     this.logger = logger
     this.socket = null
     this.activeEventId = ''
@@ -107,6 +109,16 @@ export class NearbyDuckingService {
     this.pendingJoinPairing = null
     this.pairingOffers = new Map()
     this.started = false
+  }
+
+  reportPairingEvent(type, payload = {}) {
+    void this.onPairingEvent({
+      type,
+      ...payload,
+      at: nowMs()
+    }).catch((error) => {
+      this.logger(`[dictray] Nearby ducking pairing event failed: ${error?.message || error}`)
+    })
   }
 
   async start() {
@@ -219,6 +231,10 @@ export class NearbyDuckingService {
     }, Math.max(30000, Number(ttlMs) || 120000))
     this.pendingHostPairing = pairing
     this.broadcastPairingOffer()
+    this.reportPairingEvent('host-started', {
+      pairingId: pairing.pairingId,
+      expiresAt: pairing.expiresAt
+    })
     return {
       code,
       expiresAt: pairing.expiresAt
@@ -238,6 +254,7 @@ export class NearbyDuckingService {
     const ecdh = crypto.createECDH('prime256v1')
     ecdh.generateKeys()
     const publicKey = ecdh.getPublicKey('base64')
+    this.reportPairingEvent('join-started')
     return await new Promise((resolve, reject) => {
       const pairing = {
         code: normalizedCode,
@@ -247,6 +264,7 @@ export class NearbyDuckingService {
         reject,
         expiryTimer: setTimeout(() => {
           this.clearJoinPairing()
+          this.reportPairingEvent('join-timeout')
           reject(new Error('Nearby ducking pairing timed out. Start pairing on the other device and try again.'))
         }, Math.max(30000, Number(timeoutMs) || 120000))
       }
@@ -275,7 +293,7 @@ export class NearbyDuckingService {
   }
 
   canSend() {
-    return Boolean(this.config.enabled && this.config.sendEvents && this.socket)
+    return Boolean(this.config.enabled && this.config.sendEvents && this.socket && (this.config.sharedSecret || this.config.allowUnsigned))
   }
 
   startHeartbeat() {
@@ -403,7 +421,7 @@ export class NearbyDuckingService {
 
     const secret = this.config.sharedSecret
     if (!secret) {
-      return this.config.allowUnsigned || Boolean(message.signature)
+      return this.config.allowUnsigned && !message.signature
     }
 
     return signaturesMatch(signMessage(message, secret), message.signature)
@@ -449,6 +467,12 @@ export class NearbyDuckingService {
       expiresAt,
       address: String(remote?.address || '').trim()
     })
+    this.reportPairingEvent('offer-received', {
+      pairingId,
+      peerDeviceId: deviceId,
+      peerDeviceName: String(message?.deviceName || '').trim(),
+      address: String(remote?.address || '').trim()
+    })
     this.sendPairRequestsForKnownOffers()
   }
 
@@ -481,6 +505,12 @@ export class NearbyDuckingService {
         proof,
         ts: nowMs()
       })
+      this.reportPairingEvent('request-sent', {
+        pairingId: offer.pairingId,
+        peerDeviceId: offer.deviceId,
+        peerDeviceName: offer.deviceName,
+        address: offer.address
+      })
     }
   }
 
@@ -493,6 +523,12 @@ export class NearbyDuckingService {
       return
     }
 
+    this.reportPairingEvent('request-received', {
+      pairingId,
+      peerDeviceId: joinDeviceId,
+      peerDeviceName: String(message?.deviceName || '').trim()
+    })
+
     const expectedProof = pairProof(pairing.code, 'request', {
       pairingId,
       hostDeviceId: this.config.deviceId,
@@ -501,6 +537,11 @@ export class NearbyDuckingService {
       joinPublicKey
     })
     if (!signaturesMatch(expectedProof, message?.proof)) {
+      this.reportPairingEvent('request-rejected', {
+        pairingId,
+        peerDeviceId: joinDeviceId,
+        reason: 'code_mismatch'
+      })
       return
     }
 
@@ -524,6 +565,11 @@ export class NearbyDuckingService {
       proof: acceptProof,
       ts: nowMs()
     })
+    this.reportPairingEvent('accept-sent', {
+      pairingId,
+      peerDeviceId: joinDeviceId,
+      peerDeviceName: String(message?.deviceName || '').trim()
+    })
     this.clearHostPairing()
     await this.onPairingComplete({
       role: 'host',
@@ -543,6 +589,12 @@ export class NearbyDuckingService {
       return
     }
 
+    this.reportPairingEvent('accept-received', {
+      pairingId,
+      peerDeviceId: hostDeviceId,
+      peerDeviceName: String(message?.deviceName || '').trim()
+    })
+
     const expectedProof = pairProof(pairing.code, 'accept', {
       pairingId,
       hostDeviceId,
@@ -551,6 +603,11 @@ export class NearbyDuckingService {
       joinPublicKey: pairing.publicKey
     })
     if (!signaturesMatch(expectedProof, message?.proof)) {
+      this.reportPairingEvent('accept-rejected', {
+        pairingId,
+        peerDeviceId: hostDeviceId,
+        reason: 'proof_mismatch'
+      })
       return
     }
 

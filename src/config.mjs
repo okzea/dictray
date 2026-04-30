@@ -55,7 +55,7 @@ const DEFAULTS = {
     receiveEvents: true,
     port: 47321,
     sharedSecret: '',
-    allowUnsigned: true,
+    allowUnsigned: false,
     heartbeatIntervalMs: 3000,
     staleTimeoutMs: 12000
   }
