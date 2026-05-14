@@ -5,7 +5,7 @@ import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
-import { isLinuxHeadlessHost, loadHostRuntime } from '../src/host-runtime.mjs'
+import { isLinuxHeadlessHost, isWindowsHeadlessHost, loadHostRuntime } from '../src/host-runtime.mjs'
 import { loadConfig, normalizeRewriteProviderId } from '../src/config.mjs'
 import { createCaptureBridge } from '../src/capture-bridge.mjs'
 import { createEarconPlayer } from '../src/earcon-player.mjs'
@@ -54,6 +54,7 @@ const {
 } = HOST_RUNTIME
 const LINUX_HEADLESS_HOST = HOST_RUNTIME.headless === true && isLinuxHeadlessHost()
 const MACOS_HEADLESS_HOST = HOST_RUNTIME.headless === true && process.platform === 'darwin'
+const WINDOWS_HEADLESS_HOST = HOST_RUNTIME.headless === true && isWindowsHeadlessHost()
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 if (process.platform === 'linux') {
@@ -91,6 +92,13 @@ const MACOS_OVERLAY_DIR = path.join(os.homedir(), 'Library', 'Application Suppor
 const MACOS_OVERLAY_STATE_PATH = path.join(MACOS_OVERLAY_DIR, 'status.json')
 const MACOS_OVERLAY_HELPER = path.join(__dirname, '..', 'scripts', 'macos-voice-overlay')
 const MACOS_MENU_POLL_INTERVAL_MS = 500
+const WINDOWS_APPDATA_HOME = String(process.env.APPDATA || '').trim() || path.join(os.homedir(), 'AppData', 'Roaming')
+const WINDOWS_TRAY_DIR = path.join(WINDOWS_APPDATA_HOME, 'DicTray', 'tray')
+const WINDOWS_TRAY_STATE_PATH = path.join(WINDOWS_TRAY_DIR, 'status.json')
+const WINDOWS_TRAY_COMMAND_PATH = path.join(WINDOWS_TRAY_DIR, 'command.json')
+const WINDOWS_TRAY_HELPER = resolveBundledHelperExecutable('windows-tray-host', 'WindowsTrayHost.exe')
+  || path.join(__dirname, '..', 'scripts', 'windows-tray-host', 'bin', 'Release', 'net10.0-windows', 'WindowsTrayHost.exe')
+const WINDOWS_TRAY_POLL_INTERVAL_MS = 500
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const SHORTCUT_MODE_TOGGLE = 'toggle'
@@ -236,6 +244,11 @@ let macosOnboardingUiError = ''
 let macosOverlayProcess = null
 let macosOverlayEnabled = false
 let macosOverlayLastPayload = ''
+let windowsTrayProcess = null
+let windowsTrayPollTimer = null
+let windowsTrayCommandWatcher = null
+let windowsTrayCommandProcessing = false
+let windowsTrayBridgeEnabled = false
 let trayHotkey = DEFAULT_HOTKEY
 let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
@@ -1689,6 +1702,159 @@ function stopMacosMenuBarBridge() {
   }
   try {
     writeFileSync(MACOS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+}
+
+function buildWindowsTrayPayload() {
+  const payload = buildGnomePanelPayload()
+  return {
+    ...payload,
+    platform: 'win32',
+    menu: buildDetailedControlMenu()
+  }
+}
+
+async function syncWindowsTrayState() {
+  if (!windowsTrayBridgeEnabled) {
+    return
+  }
+  try {
+    await writeFile(WINDOWS_TRAY_STATE_PATH, JSON.stringify(buildWindowsTrayPayload()), { encoding: 'utf8' })
+  } catch (error) {
+    console.error('[dictray] Failed to sync Windows tray state:', error?.message || error)
+  }
+}
+
+async function processWindowsTrayCommand() {
+  if (!windowsTrayBridgeEnabled || windowsTrayCommandProcessing) {
+    return
+  }
+  windowsTrayCommandProcessing = true
+  try {
+    let rawCommand = ''
+    try {
+      rawCommand = await readFile(WINDOWS_TRAY_COMMAND_PATH, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        console.error('[dictray] Failed to read Windows tray command file:', error?.message || error)
+      }
+      return
+    }
+    await unlink(WINDOWS_TRAY_COMMAND_PATH).catch(() => {})
+    if (!String(rawCommand || '').trim()) {
+      return
+    }
+
+    let command = {}
+    try {
+      command = JSON.parse(String(rawCommand || '').trim())
+    } catch {
+      return
+    }
+    await handleExternalMenuCommand(command)
+  } finally {
+    windowsTrayCommandProcessing = false
+  }
+}
+
+async function initWindowsTrayBridge() {
+  if (process.platform !== 'win32') {
+    return false
+  }
+
+  try {
+    await mkdir(WINDOWS_TRAY_DIR, { recursive: true })
+    await access(WINDOWS_TRAY_HELPER)
+  } catch (error) {
+    console.error('[dictray] Windows tray helper is unavailable:', error?.message || error)
+    return false
+  }
+
+  windowsTrayBridgeEnabled = true
+  await syncWindowsTrayState()
+
+  if (!windowsTrayProcess || windowsTrayProcess.killed) {
+    try {
+      windowsTrayProcess = spawn(WINDOWS_TRAY_HELPER, [WINDOWS_TRAY_STATE_PATH, WINDOWS_TRAY_COMMAND_PATH, APP_ICON_ICO_PATH], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        windowsHide: true
+      })
+      if (windowsTrayProcess.stderr) {
+        const stderr = readline.createInterface({ input: windowsTrayProcess.stderr })
+        stderr.on('line', (line) => {
+          const message = String(line || '').trim()
+          if (message) {
+            console.error(`[dictray] Windows tray helper: ${message}`)
+          }
+        })
+      }
+      const helper = windowsTrayProcess
+      helper.on('exit', (code) => {
+        if (windowsTrayProcess === helper) {
+          windowsTrayProcess = null
+        }
+        if (!isQuitting) {
+          console.error(`[dictray] Windows tray helper exited with code ${code ?? 0}.`)
+        }
+      })
+      helper.on('error', (error) => {
+        if (windowsTrayProcess === helper) {
+          windowsTrayProcess = null
+        }
+        console.error('[dictray] Failed to start Windows tray helper:', error?.message || error)
+      })
+    } catch (error) {
+      console.error('[dictray] Failed to launch Windows tray helper:', error?.message || error)
+      windowsTrayBridgeEnabled = false
+      return false
+    }
+  }
+
+  if (!windowsTrayPollTimer) {
+    windowsTrayPollTimer = setInterval(() => {
+      void processWindowsTrayCommand().catch(() => {})
+    }, WINDOWS_TRAY_POLL_INTERVAL_MS)
+  }
+
+  if (!windowsTrayCommandWatcher) {
+    try {
+      windowsTrayCommandWatcher = fsWatch(WINDOWS_TRAY_DIR, { persistent: false }, (_eventType, filename) => {
+        if (filename === path.basename(WINDOWS_TRAY_COMMAND_PATH)) {
+          void processWindowsTrayCommand().catch(() => {})
+        }
+      })
+      windowsTrayCommandWatcher.on('error', () => {})
+    } catch {
+      windowsTrayCommandWatcher = null
+    }
+  }
+
+  return true
+}
+
+function stopWindowsTrayBridge() {
+  if (windowsTrayPollTimer) {
+    clearInterval(windowsTrayPollTimer)
+    windowsTrayPollTimer = null
+  }
+  if (windowsTrayCommandWatcher) {
+    windowsTrayCommandWatcher.close()
+    windowsTrayCommandWatcher = null
+  }
+  if (windowsTrayProcess && !windowsTrayProcess.killed) {
+    try {
+      windowsTrayProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  windowsTrayProcess = null
+  windowsTrayBridgeEnabled = false
+
+  try {
+    writeFileSync(WINDOWS_TRAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
   } catch {
     // best-effort — the process is exiting
   }
@@ -3563,6 +3729,12 @@ async function openInputSourceWindow() {
     return null
   }
 
+  if (process.platform === 'win32') {
+    await refreshInputSources()
+    showNotification(APP_NAME, 'Microphone list refreshed from Windows input devices.')
+    return null
+  }
+
   if (!linuxNativeUtilityWindowsEnabled()) {
     showNotification(APP_NAME, 'Microphone setup now requires the native GNOME utility window.')
     return null
@@ -3596,6 +3768,11 @@ async function openOnboardingWindow({ markSeen = false } = {}) {
       console.error('[dictray] Failed to open native macOS Quick Start window:', error?.message || error)
       showNotification(APP_NAME, compactText(error?.message || error || 'Failed to open Quick Start.', 180))
     }
+    return null
+  }
+
+  if (process.platform === 'win32') {
+    showNotification(APP_NAME, 'Quick Start is not available in the native Windows tray yet.')
     return null
   }
 
@@ -3738,6 +3915,7 @@ function updateVoiceState(patch = {}) {
   syncVoiceOverlay()
   scheduleGnomePanelStateSync()
   void syncMacosMenuState()
+  void syncWindowsTrayState()
 }
 
 function clearVoiceState(error = '') {
@@ -4260,6 +4438,7 @@ function rebuildMenu() {
   void syncGnomePanelState()
   void syncMacosMenuState()
   void syncMacosOnboardingState()
+  void syncWindowsTrayState()
 }
 
 async function listRewriteModels() {
@@ -6190,7 +6369,7 @@ function stopHotkeyBridge() {
 }
 
 function registerPressOnlyHotkey() {
-  if (MACOS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
+  if (MACOS_HEADLESS_HOST || WINDOWS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
     return false
   }
 
@@ -6212,7 +6391,7 @@ function registerPressOnlyHotkey() {
 }
 
 function registerPromptShortcut() {
-  if (MACOS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
+  if (MACOS_HEADLESS_HOST || WINDOWS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
     return true
   }
 
@@ -6260,7 +6439,9 @@ function startHotkeyBridge() {
   stopHotkeyBridge()
   const bridgeArgs = process.platform === 'darwin'
     ? [trayHotkey, promptTrayHotkey, MACOS_OVERLAY_STATE_PATH]
-    : [trayHotkey]
+    : process.platform === 'win32'
+      ? [trayHotkey, promptTrayHotkey]
+      : [trayHotkey]
   const bridge = spawn(HOTKEY_BRIDGE, bridgeArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
@@ -6376,7 +6557,7 @@ async function registerHotkey() {
     } catch {
       const platformLabel = process.platform === 'darwin' ? 'macOS' : 'Windows'
       console.error(`[dictray] Missing ${platformLabel} hotkey helper: ${HOTKEY_BRIDGE}`)
-      if (MACOS_HEADLESS_HOST) {
+      if (MACOS_HEADLESS_HOST || WINDOWS_HEADLESS_HOST) {
         showNotification(APP_NAME, `${platformLabel} hotkey helper is missing. Global shortcut is unavailable.`)
         return
       }
@@ -6837,6 +7018,7 @@ async function performQuitCleanup() {
   stopGnomePanelBridge()
   stopLinuxNativeUiBridge()
   stopMacosMenuBarBridge()
+  stopWindowsTrayBridge()
   clearSttKeepWarmTimer()
   stopHotkeyBridge()
   globalShortcut.unregisterAll()
@@ -6892,6 +7074,9 @@ if (!shouldExitEarly) {
     await initLinuxNativeUiBridge().catch(() => {})
     await initMacosMenuBarBridge().catch((error) => {
       console.error('[dictray] macOS menu bar setup failed:', error?.message || error)
+    })
+    await initWindowsTrayBridge().catch((error) => {
+      console.error('[dictray] Windows tray setup failed:', error?.message || error)
     })
     await createTray()
     await ensureVoiceWindow()

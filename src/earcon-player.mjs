@@ -59,6 +59,17 @@ const PLAYER_CANDIDATES = [
     command: 'canberra-gtk-play',
     platforms: ['linux'],
     args: (filePath) => ['-f', filePath]
+  },
+  {
+    command: 'powershell.exe',
+    platforms: ['win32'],
+    args: (filePath) => [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      `$player = New-Object System.Media.SoundPlayer ${powershellSingleQuoted(filePath)}; $player.PlaySync()`
+    ]
   }
 ]
 
@@ -66,9 +77,23 @@ function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`
 }
 
+function powershellSingleQuoted(value) {
+  return `'${String(value || '').replace(/'/g, "''")}'`
+}
+
 function commandAvailable(command) {
   if (!command) {
     return false
+  }
+  if (path.isAbsolute(command)) {
+    return existsSync(command)
+  }
+  if (process.platform === 'win32') {
+    const result = spawnSync('where.exe', [command], {
+      stdio: 'ignore',
+      windowsHide: true
+    })
+    return result.status === 0
   }
   const result = spawnSync('sh', ['-lc', `command -v ${shellQuote(command)} >/dev/null 2>&1`], {
     stdio: 'ignore',
@@ -225,14 +250,16 @@ export function createEarconPlayer({ logger = null } = {}) {
         cachedFiles.set(kind, assetPath)
         return assetPath
       }
-      await mkdir(EARCON_CACHE_DIR, { recursive: true })
-      const convertedPath = path.join(EARCON_CACHE_DIR, `${kind}-asset.wav`)
-      try {
-        await convertAudioToWav(assetPath, convertedPath)
-        cachedFiles.set(kind, convertedPath)
-        return convertedPath
-      } catch (error) {
-        log(`[dictray] Failed to convert earcon asset ${path.basename(assetPath)}: ${String(error?.message || error)}`)
+      if (commandAvailable(FFMPEG_BIN)) {
+        await mkdir(EARCON_CACHE_DIR, { recursive: true })
+        const convertedPath = path.join(EARCON_CACHE_DIR, `${kind}-asset.wav`)
+        try {
+          await convertAudioToWav(assetPath, convertedPath)
+          cachedFiles.set(kind, convertedPath)
+          return convertedPath
+        } catch (error) {
+          log(`[dictray] Failed to convert earcon asset ${path.basename(assetPath)}: ${String(error?.message || error)}`)
+        }
       }
     }
     await mkdir(EARCON_CACHE_DIR, { recursive: true })
@@ -255,7 +282,7 @@ export function createEarconPlayer({ logger = null } = {}) {
 
   async function play(kind) {
     const normalizedKind = normalizeKind(kind)
-    if (!normalizedKind || !['linux', 'darwin'].includes(process.platform)) {
+    if (!normalizedKind || !['linux', 'darwin', 'win32'].includes(process.platform)) {
       return { ok: false, skipped: true, reason: 'unsupported' }
     }
 

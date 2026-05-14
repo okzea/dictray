@@ -23,6 +23,16 @@ const helperProjects = [
     name: 'windows-system-volume',
     projectPath: path.join(rootDir, 'scripts', 'windows-system-volume', 'WindowsSystemVolume.csproj'),
     exeName: 'WindowsSystemVolume.exe'
+  },
+  {
+    name: 'windows-native-capture',
+    projectPath: path.join(rootDir, 'scripts', 'windows-native-capture', 'WindowsNativeCapture.csproj'),
+    exeName: 'WindowsNativeCapture.exe'
+  },
+  {
+    name: 'windows-tray-host',
+    projectPath: path.join(rootDir, 'scripts', 'windows-tray-host', 'WindowsTrayHost.csproj'),
+    exeName: 'WindowsTrayHost.exe'
   }
 ]
 

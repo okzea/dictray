@@ -1,12 +1,22 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 
-var shortcut = args.Length > 0 ? args[0] : "CommandOrControl+Space";
-
 try
 {
-    var definition = HotkeyDefinition.Parse(shortcut);
-    var exitCode = KeyboardHookBridge.Run(definition);
+    var primaryShortcut = args.Length > 0 ? args[0] : "CommandOrControl+Space";
+    var registrations = new List<HotkeyRegistration>
+    {
+        new(HotkeyDefinition.Parse(primaryShortcut), "down", "up")
+    };
+
+    var promptShortcut = args.Length > 1 ? args[1] : "";
+    if (!string.IsNullOrWhiteSpace(promptShortcut)
+        && !string.Equals(primaryShortcut.Trim(), promptShortcut.Trim(), StringComparison.OrdinalIgnoreCase))
+    {
+        registrations.Add(new HotkeyRegistration(HotkeyDefinition.Parse(promptShortcut), "prompt-down", "prompt-up"));
+    }
+
+    var exitCode = KeyboardHookBridge.Run(registrations);
     Environment.ExitCode = exitCode;
 }
 catch (Exception error)
@@ -14,6 +24,8 @@ catch (Exception error)
     Console.Error.WriteLine(error.Message);
     Environment.ExitCode = 1;
 }
+
+internal sealed record HotkeyRegistration(HotkeyDefinition Definition, string DownEvent, string UpEvent);
 
 internal sealed record HotkeyDefinition(bool Ctrl, bool Alt, bool Shift, bool Win, int Key)
 {
@@ -133,13 +145,19 @@ internal static class KeyboardHookBridge
 
     private static IntPtr _hookId = IntPtr.Zero;
     private static HookProc? _proc;
-    private static HotkeyDefinition? _definition;
-    private static bool _active;
+    private static IReadOnlyList<HotkeyRegistration> _registrations = Array.Empty<HotkeyRegistration>();
+    private static bool[] _active = [];
 
-    public static int Run(HotkeyDefinition definition)
+    public static int Run(IReadOnlyList<HotkeyRegistration> registrations)
     {
-        _definition = definition;
-        _active = false;
+        if (registrations.Count == 0)
+        {
+            Console.Error.WriteLine("No hotkeys were provided.");
+            return 1;
+        }
+
+        _registrations = registrations;
+        _active = new bool[registrations.Count];
         _proc = HookCallback;
         _hookId = SetHook(_proc);
 
@@ -189,9 +207,8 @@ internal static class KeyboardHookBridge
     private static bool IsShiftKey(int vkCode) => vkCode is VkShift or VkLShift or VkRShift;
     private static bool IsWinKey(int vkCode) => vkCode is VkLWin or VkRWin;
 
-    private static bool IsRelevantKey(int vkCode)
+    private static bool IsRelevantKey(HotkeyDefinition definition, int vkCode)
     {
-        var definition = _definition!;
         return vkCode == definition.Key
             || (definition.Ctrl && IsCtrlKey(vkCode))
             || (definition.Alt && IsAltKey(vkCode))
@@ -199,9 +216,8 @@ internal static class KeyboardHookBridge
             || (definition.Win && IsWinKey(vkCode));
     }
 
-    private static bool ComboActiveForEvent(int vkCode, bool isKeyDown)
+    private static bool ComboActiveForEvent(HotkeyDefinition definition, int vkCode, bool isKeyDown)
     {
-        var definition = _definition!;
         var ctrlDown = IsDown(VkControl) || IsDown(VkLControl) || IsDown(VkRControl);
         var altDown = IsDown(VkMenu) || IsDown(VkLMenu) || IsDown(VkRMenu);
         var shiftDown = IsDown(VkShift) || IsDown(VkLShift) || IsDown(VkRShift);
@@ -248,20 +264,27 @@ internal static class KeyboardHookBridge
             {
                 var data = Marshal.PtrToStructure<KbdLlHookStruct>(lParam);
                 var vkCode = unchecked((int)data.vkCode);
-                if (IsRelevantKey(vkCode))
+                var swallow = false;
+                for (var index = 0; index < _registrations.Count; index++)
                 {
-                    var wasActive = _active;
-                    var nextActive = ComboActiveForEvent(vkCode, isKeyDown);
-                    if (nextActive && !_active)
+                    var registration = _registrations[index];
+                    if (!IsRelevantKey(registration.Definition, vkCode))
                     {
-                        _active = true;
-                        Console.Out.WriteLine("down");
+                        continue;
+                    }
+
+                    var wasActive = _active[index];
+                    var nextActive = ComboActiveForEvent(registration.Definition, vkCode, isKeyDown);
+                    if (nextActive && !wasActive)
+                    {
+                        _active[index] = true;
+                        Console.Out.WriteLine(registration.DownEvent);
                         Console.Out.Flush();
                     }
-                    else if (!nextActive && _active)
+                    else if (!nextActive && wasActive)
                     {
-                        _active = false;
-                        Console.Out.WriteLine("up");
+                        _active[index] = false;
+                        Console.Out.WriteLine(registration.UpEvent);
                         Console.Out.Flush();
                     }
 
@@ -270,8 +293,13 @@ internal static class KeyboardHookBridge
                     // the target app when dictation later restores focus and pastes text.
                     if (nextActive || wasActive)
                     {
-                        return (IntPtr)1;
+                        swallow = true;
                     }
+                }
+
+                if (swallow)
+                {
+                    return (IntPtr)1;
                 }
             }
         }

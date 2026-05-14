@@ -3,6 +3,7 @@ import path from 'node:path'
 import { spawn } from 'node:child_process'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { resolveBundledHelperExecutable } from './runtime-paths.mjs'
 import {
   CAPTURE_BACKEND_NATIVE,
   CAPTURE_COMMAND_CANCEL_RECORDING,
@@ -20,11 +21,15 @@ import {
 } from './capture-protocol.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
-const DEFAULT_NATIVE_CAPTURE_HELPER = path.join(
-  __dirname,
-  process.platform === 'darwin' ? 'macos-native-capture-helper.mjs' : 'native-capture-helper.mjs'
-)
+const DEFAULT_NATIVE_CAPTURE_HELPER = process.platform === 'win32'
+  ? resolveBundledHelperExecutable('windows-native-capture', 'WindowsNativeCapture.exe')
+    || path.join(__dirname, '..', 'scripts', 'windows-native-capture', 'bin', 'Release', 'net10.0-windows', 'WindowsNativeCapture.exe')
+  : path.join(
+      __dirname,
+      process.platform === 'darwin' ? 'macos-native-capture-helper.mjs' : 'native-capture-helper.mjs'
+    )
 const NATIVE_CAPTURE_HELPER = String(process.env.DICTATION_TRAY_NATIVE_CAPTURE_HELPER || '').trim() || DEFAULT_NATIVE_CAPTURE_HELPER
+const NODE_HELPER_EXEC = String(process.env.DICTATION_TRAY_NODE_BIN || process.env.npm_node_execpath || '').trim() || process.execPath
 const NATIVE_CAPTURE_COMMAND_TIMEOUT_MS = 30000
 
 function errorMessage(error, fallback = 'Native capture helper failed.') {
@@ -108,7 +113,8 @@ class NativeCaptureBridge {
         return
       }
 
-      const child = spawn(process.execPath, [NATIVE_CAPTURE_HELPER], {
+      const helperIsExecutable = process.platform === 'win32' && /\.exe$/i.test(NATIVE_CAPTURE_HELPER)
+      const child = spawn(helperIsExecutable ? NATIVE_CAPTURE_HELPER : NODE_HELPER_EXEC, helperIsExecutable ? [] : [NATIVE_CAPTURE_HELPER], {
         env: process.env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true

@@ -1,4 +1,5 @@
 import { mkdir, readFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
@@ -12,6 +13,21 @@ const rootDir = path.resolve(__dirname, '..')
 
 function log(message) {
   console.log(`[dictray-start] ${message}`)
+}
+
+function trayLaunchCommand() {
+  return process.execPath
+}
+
+function localDotnetEnv() {
+  const dotnetRoot = path.join(rootDir, '.dotnet-cli')
+  if (!existsSync(path.join(dotnetRoot, 'dotnet.exe'))) {
+    return {}
+  }
+  return {
+    DOTNET_ROOT: dotnetRoot,
+    PATH: `${dotnetRoot}${path.delimiter}${process.env.PATH || ''}`
+  }
 }
 
 function run(command, args, options = {}) {
@@ -69,6 +85,10 @@ function existingTrayLockPath() {
   if (process.platform === 'darwin') {
     return path.join(os.homedir(), 'Library', 'Application Support', 'DicTray', 'dictray.lock')
   }
+  if (process.platform === 'win32') {
+    const appData = String(process.env.APPDATA || '').trim() || path.join(os.homedir(), 'AppData', 'Roaming')
+    return path.join(appData, 'DicTray', 'dictray.lock')
+  }
   return ''
 }
 
@@ -113,6 +133,15 @@ function commandLineReferencesTrayMain(value) {
   return String(value || '').replace(/\\/g, '/').includes('tray/main.mjs')
 }
 
+function readWindowsProcessCommand(pid) {
+  const script = [
+    '$ErrorActionPreference = "SilentlyContinue"',
+    `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${Number(pid) || 0}"`,
+    'if ($p) { [Console]::Out.Write($p.CommandLine) }'
+  ].join('; ')
+  return readProcessOutput('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script])
+}
+
 async function isExistingTrayOwner(pid) {
   if (!isPidRunning(pid)) {
     return false
@@ -137,6 +166,10 @@ async function isExistingTrayOwner(pid) {
       return true
     }
     return commandLineReferencesTrayMain(readProcessOutput('ps', ['-p', String(pid), '-o', 'args=']))
+  }
+
+  if (process.platform === 'win32') {
+    return commandLineReferencesTrayMain(readWindowsProcessCommand(pid))
   }
 
   return false
@@ -242,7 +275,7 @@ async function requestExistingTrayExit(childEnv) {
   log('Checking for an already running tray instance.')
   const existingPid = await readExistingTrayPid()
   const shouldWaitForExit = await isExistingTrayOwner(existingPid)
-  await run(process.execPath, ['tray/main.mjs', '--dictray-exit-existing'], {
+  await run(trayLaunchCommand(), ['tray/main.mjs', '--dictray-exit-existing'], {
     env: process.platform === 'linux'
       ? {
           ...childEnv,
@@ -297,8 +330,8 @@ async function prepareStartupSttRuntime(config, childEnv) {
 }
 
 async function main() {
-  if (!['linux', 'darwin'].includes(process.platform)) {
-    throw new Error('This branch supports Linux and macOS.')
+  if (!['linux', 'darwin', 'win32'].includes(process.platform)) {
+    throw new Error('This branch supports Linux, macOS, and Windows.')
   }
 
   const dotnetHome = path.join(rootDir, '.dotnet-cli')
@@ -308,6 +341,7 @@ async function main() {
     ...process.env,
     DOTNET_CLI_HOME: dotnetHome,
     DOTNET_SKIP_FIRST_TIME_EXPERIENCE: '1',
+    ...(process.platform === 'win32' ? { DICTATION_TRAY_NODE_BIN: process.execPath, ...localDotnetEnv() } : {}),
     ...(process.platform === 'linux' ? { DICTATION_TRAY_LINUX_HEADLESS: '1' } : {})
   }
 
@@ -337,7 +371,7 @@ async function main() {
   await warmSttRuntime(sttProvider)
 
   log('Launching tray.')
-  await run(process.execPath, ['tray/main.mjs'], {
+  await run(trayLaunchCommand(), ['tray/main.mjs'], {
     env: {
       ...childEnv,
       DICTATION_TRAY_BUNDLED_RUNTIME_DIR: childEnv.DICTATION_TRAY_BUNDLED_RUNTIME_DIR || ''
