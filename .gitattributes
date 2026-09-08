@@ -1,0 +1,17 @@
+# Keep line endings stable across platforms. The repository stores LF; git checks
+# files out with native endings on Windows when core.autocrlf is enabled.
+* text=auto eol=lf
+
+# Windows batch files are the one format that genuinely requires CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never be normalised.
+*.png binary
+*.ico binary
+*.icns binary
+*.mp3 binary
+*.wav binary
+*.dmg binary
+*.zip binary
+*.tar.gz binary
