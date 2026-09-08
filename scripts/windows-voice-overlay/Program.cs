@@ -65,6 +65,8 @@ internal sealed class OverlayBounds
 
 internal sealed class OverlayForm : Form
 {
+    private const double VisibleOpacity = 0.88;
+
     private const int WsExTransparent = 0x20;
     private const int WsExNoActivate = 0x8000000;
     private const int WsExToolWindow = 0x80;
@@ -78,11 +80,18 @@ internal sealed class OverlayForm : Form
     private static readonly Color AccentGreen = Color.FromArgb(52, 199, 89);
     private static readonly Color AccentBlue = Color.FromArgb(0, 122, 255);
     private static readonly Color AccentTeal = Color.FromArgb(90, 200, 250);
+    private static readonly Color AccentGray = Color.FromArgb(142, 142, 147);
+    private static readonly Color AccentOrange = Color.FromArgb(255, 149, 0);
+    private static readonly Color AccentPurple = Color.FromArgb(175, 82, 222);
 
     private readonly string _statePath;
     private readonly System.Windows.Forms.Timer _pollTimer;
     private readonly Font _titleFont;
     private readonly Font _detailFont;
+
+    private Color _accent = AccentTeal;
+    private Color _accentTarget = AccentTeal;
+    private readonly System.Windows.Forms.Timer _accentTimer;
 
     private OverlayPayload _payload = new() { Visible = false, Phase = "idle" };
     private string _lastRaw = "";
@@ -96,13 +105,15 @@ internal sealed class OverlayForm : Form
         TopMost = true;
         StartPosition = FormStartPosition.Manual;
         BackColor = BackgroundColor;
-        Opacity = 0.88;
+        Opacity = 0d;
         DoubleBuffered = true;
         Size = new Size(292, 78);
-        Visible = false;
 
         _titleFont = new Font("Segoe UI", 15f, FontStyle.Bold, GraphicsUnit.Pixel);
         _detailFont = new Font("Segoe UI", 12f, FontStyle.Regular, GraphicsUnit.Pixel);
+
+        _accentTimer = new System.Windows.Forms.Timer { Interval = 16 };
+        _accentTimer.Tick += (_, _) => StepAccent();
 
         _pollTimer = new System.Windows.Forms.Timer { Interval = 120 };
         _pollTimer.Tick += (_, _) => ReloadState();
@@ -112,6 +123,7 @@ internal sealed class OverlayForm : Form
     }
 
     protected override bool ShowWithoutActivation => true;
+
 
     protected override CreateParams CreateParams
     {
@@ -178,12 +190,32 @@ internal sealed class OverlayForm : Form
 
         UpdateRegion();
 
-        if (_payload.Visible != Visible)
+        // Application.Run(form) forces the form visible, so the overlay cannot rely
+        // on Visible alone: it would sit on screen from launch until the first
+        // dictation. Keep the window alive and drive presence through opacity.
+        var opacity = _payload.Visible ? VisibleOpacity : 0d;
+        if (Math.Abs(Opacity - opacity) > 0.001)
         {
-            Visible = _payload.Visible;
+            Opacity = opacity;
         }
 
-        if (Visible)
+        var nextAccent = AccentColor();
+        if (nextAccent != _accentTarget)
+        {
+            _accentTarget = nextAccent;
+            // A hidden overlay has nothing to animate from, so snap instead of
+            // fading in from whatever the previous turn ended on.
+            if (_payload.Visible && Opacity > 0)
+            {
+                _accentTimer.Start();
+            }
+            else
+            {
+                _accent = nextAccent;
+            }
+        }
+
+        if (_payload.Visible)
         {
             Invalidate();
         }
@@ -215,6 +247,31 @@ internal sealed class OverlayForm : Form
         var x = area.X + ((area.Width - width) / 2);
         var y = area.Y + area.Height - height - margin;
         return new Rectangle(x, y, width, height);
+    }
+
+    private void StepAccent()
+    {
+        _accent = LerpColor(_accent, _accentTarget, 0.22);
+        if (IsNear(_accent, _accentTarget))
+        {
+            _accent = _accentTarget;
+            _accentTimer.Stop();
+        }
+
+        Invalidate();
+    }
+
+    private static Color LerpColor(Color from, Color to, double amount)
+    {
+        return Color.FromArgb(
+            (int)Math.Round(from.R + ((to.R - from.R) * amount)),
+            (int)Math.Round(from.G + ((to.G - from.G) * amount)),
+            (int)Math.Round(from.B + ((to.B - from.B) * amount)));
+    }
+
+    private static bool IsNear(Color a, Color b)
+    {
+        return Math.Abs(a.R - b.R) <= 2 && Math.Abs(a.G - b.G) <= 2 && Math.Abs(a.B - b.B) <= 2;
     }
 
     private void UpdateRegion()
@@ -298,9 +355,26 @@ internal sealed class OverlayForm : Form
             return AccentGreen;
         }
 
-        if (phase is "inserting" or "rewriting" or "transcribing")
+        if (phase == "transcribing")
         {
             return AccentBlue;
+        }
+
+        if (phase == "rewriting")
+        {
+            return AccentOrange;
+        }
+
+        if (phase == "inserting")
+        {
+            return AccentPurple;
+        }
+
+        // A finished turn that left a note rather than an error is a cancellation
+        // or similar notice, not the idle "ready" state, so it gets its own colour.
+        if (phase is "idle" or "" && !string.IsNullOrWhiteSpace(_payload.Note))
+        {
+            return AccentGray;
         }
 
         return AccentTeal;
@@ -319,7 +393,7 @@ internal sealed class OverlayForm : Form
             g.DrawPath(border, path);
         }
 
-        var accent = AccentColor();
+        var accent = _accent;
 
         // A pulse ring scaled by input level gives visible feedback while recording.
         var level = Math.Clamp(_payload.InputLevel ?? 0, 0, 1);
@@ -353,6 +427,7 @@ internal sealed class OverlayForm : Form
         if (disposing)
         {
             _pollTimer.Dispose();
+            _accentTimer.Dispose();
             _titleFont.Dispose();
             _detailFont.Dispose();
         }

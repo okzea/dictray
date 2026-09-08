@@ -2511,6 +2511,11 @@ function cancelActiveSubmission(reason = 'Dictation was cancelled by a new push-
 }
 
 async function cancelDictationCapture(reason = 'Dictation was cancelled.') {
+  void appendDiagnosticsLog('cancel-requested', {
+    reason: String(reason || ''),
+    phase: voiceState.phase,
+    captureRecordingPhase
+  })
   let cancelled = cancelActiveSubmission(reason)
 
   if (
@@ -2968,11 +2973,29 @@ async function syncMacosOverlayState({ force = false } = {}) {
   }
 }
 
+// Windows apps routinely put document content in the window title - an unsaved
+// Notepad buffer is titled with its own first line - so the overlay shows just
+// the owning process instead of echoing the text back at the speaker.
+function windowsOverlayTargetLabel(value) {
+  const text = String(value || '').trim()
+  if (text.endsWith(')')) {
+    const open = text.lastIndexOf(' (')
+    if (open > 0) {
+      const processName = text.slice(open + 2, -1).trim()
+      if (processName) {
+        return processName
+      }
+    }
+  }
+  return text
+}
+
 function buildWindowsOverlayPayload() {
   const payload = buildVoiceOverlayPayload()
   const windowBounds = resolveVoiceOverlayWindowBounds()
   return {
     ...payload,
+    targetWindow: compactText(windowsOverlayTargetLabel(payload.targetWindow), 70),
     platform: 'win32',
     inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
     // The host-runtime screen shim reports a fixed 1920x1080 display, so overlay
@@ -6573,7 +6596,7 @@ function startHotkeyBridge() {
   const bridgeArgs = process.platform === 'darwin'
     ? [trayHotkey, promptTrayHotkey, MACOS_OVERLAY_STATE_PATH]
     : process.platform === 'win32'
-      ? [trayHotkey, promptTrayHotkey]
+      ? [trayHotkey, promptTrayHotkey, WINDOWS_OVERLAY_STATE_PATH]
       : [trayHotkey]
   const bridge = spawn(HOTKEY_BRIDGE, bridgeArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
