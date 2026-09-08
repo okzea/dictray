@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 
 try
 {
@@ -16,7 +17,8 @@ try
         registrations.Add(new HotkeyRegistration(HotkeyDefinition.Parse(promptShortcut), "prompt-down", "prompt-up"));
     }
 
-    var exitCode = KeyboardHookBridge.Run(registrations);
+    var cancelStatePath = args.Length > 2 ? args[2] : "";
+    var exitCode = KeyboardHookBridge.Run(registrations, cancelStatePath);
     Environment.ExitCode = exitCode;
 }
 catch (Exception error)
@@ -142,13 +144,22 @@ internal static class KeyboardHookBridge
     private const int VkRShift = 0xA1;
     private const int VkLWin = 0x5B;
     private const int VkRWin = 0x5C;
+    private const int VkEscape = 0x1B;
+
+    private const ushort VkNoName = 0xFC;
+    private const uint KeyeventfKeyup = 0x0002;
+
+    [DllImport("user32.dll")]
+    private static extern void keybd_event(ushort bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
     private static IntPtr _hookId = IntPtr.Zero;
     private static HookProc? _proc;
     private static IReadOnlyList<HotkeyRegistration> _registrations = Array.Empty<HotkeyRegistration>();
     private static bool[] _active = [];
+    private static bool _escapeIsDown;
+    private static string _cancelStatePath = "";
 
-    public static int Run(IReadOnlyList<HotkeyRegistration> registrations)
+    public static int Run(IReadOnlyList<HotkeyRegistration> registrations, string cancelStatePath = "")
     {
         if (registrations.Count == 0)
         {
@@ -156,6 +167,7 @@ internal static class KeyboardHookBridge
             return 1;
         }
 
+        _cancelStatePath = (cancelStatePath ?? "").Trim();
         _registrations = registrations;
         _active = new bool[registrations.Count];
         _proc = HookCallback;
@@ -245,11 +257,92 @@ internal static class KeyboardHookBridge
             keyDown = isKeyDown;
         }
 
+        // Modifiers must match exactly. Testing only that required modifiers are
+        // down makes a shortcut fire for any superset of itself, so pressing
+        // Ctrl+Shift+Space also triggered a Ctrl+Space registration. Matches
+        // eventMatches() in macos-hotkey-hook.swift.
         return keyDown
-            && (!definition.Ctrl || ctrlDown)
-            && (!definition.Alt || altDown)
-            && (!definition.Shift || shiftDown)
-            && (!definition.Win || winDown);
+            && definition.Ctrl == ctrlDown
+            && definition.Alt == altDown
+            && definition.Shift == shiftDown
+            && definition.Win == winDown;
+    }
+
+    /// <summary>
+    /// Windows toggles the keyboard layout when Ctrl+Shift is pressed and released
+    /// with no key in between. Swallowing the combo key hides it from the system as
+    /// well as the target app, so a Ctrl+Shift+&lt;key&gt; shortcut looks like a bare
+    /// Ctrl+Shift chord and flips the layout. Injecting an unassigned key counts as
+    /// an intervening keystroke without producing input of its own.
+    /// </summary>
+    private static void BreakModifierChord(int vkCode, bool isKeyDown)
+    {
+        if (!isKeyDown)
+        {
+            return;
+        }
+
+        var ctrlDown = IsDown(VkControl) || IsDown(VkLControl) || IsDown(VkRControl);
+        var shiftDown = IsDown(VkShift) || IsDown(VkLShift) || IsDown(VkRShift);
+        if (!ctrlDown || !shiftDown)
+        {
+            return;
+        }
+
+        keybd_event(VkNoName, 0, 0, UIntPtr.Zero);
+        keybd_event(VkNoName, 0, KeyeventfKeyup, UIntPtr.Zero);
+    }
+
+    private static bool AnyComboActive()
+    {
+        foreach (var active in _active)
+        {
+            if (active)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Escape only cancels while a dictation turn is on screen, so the hook does
+    /// not swallow Escape system-wide. Mirrors overlayStateAllowsCancel() in
+    /// macos-hotkey-hook.swift.
+    /// </summary>
+    private static bool OverlayStateAllowsCancel()
+    {
+        if (_cancelStatePath.Length == 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            using var stream = new FileStream(_cancelStatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var document = JsonDocument.Parse(stream);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("visible", out var visible) || visible.ValueKind != JsonValueKind.True)
+            {
+                return false;
+            }
+
+            if (!root.TryGetProperty("phase", out var phase) || phase.ValueKind != JsonValueKind.String)
+            {
+                return false;
+            }
+
+            return (phase.GetString() ?? "").Trim().ToLowerInvariant() switch
+            {
+                "listening" or "processing" or "transcribing" or "rewriting" or "inserting" or "pending_insert" => true,
+                _ => false
+            };
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
@@ -264,6 +357,25 @@ internal static class KeyboardHookBridge
             {
                 var data = Marshal.PtrToStructure<KbdLlHookStruct>(lParam);
                 var vkCode = unchecked((int)data.vkCode);
+
+                if (vkCode == VkEscape)
+                {
+                    if (isKeyDown && !_escapeIsDown && (AnyComboActive() || OverlayStateAllowsCancel()))
+                    {
+                        _escapeIsDown = true;
+                        Array.Clear(_active);
+                        Console.Out.WriteLine("cancel");
+                        Console.Out.Flush();
+                        return (IntPtr)1;
+                    }
+
+                    if (isKeyUp && _escapeIsDown)
+                    {
+                        _escapeIsDown = false;
+                        return (IntPtr)1;
+                    }
+                }
+
                 var swallow = false;
                 for (var index = 0; index < _registrations.Count; index++)
                 {
@@ -291,7 +403,11 @@ internal static class KeyboardHookBridge
                     // Swallow both the active combo events and the final release event that ends the combo.
                     // This prevents hotkeys like Alt+Space from leaking a trailing system-menu keyup into
                     // the target app when dictation later restores focus and pastes text.
-                    if (nextActive || wasActive)
+                    //
+                    // Only the combo's own key is swallowed. Swallowing a modifier release instead left
+                    // that modifier latched in the target app: releasing Ctrl before Space ends the combo
+                    // on the Ctrl keyup, and eating that keyup means the app never sees Ctrl come back up.
+                    if ((nextActive || wasActive) && vkCode == registration.Definition.Key)
                     {
                         swallow = true;
                     }
@@ -299,6 +415,7 @@ internal static class KeyboardHookBridge
 
                 if (swallow)
                 {
+                    BreakModifierChord(vkCode, isKeyDown);
                     return (IntPtr)1;
                 }
             }
