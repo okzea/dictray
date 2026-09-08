@@ -146,6 +146,7 @@ internal static class KeyboardHookBridge
     private const int VkRWin = 0x5C;
     private const int VkEscape = 0x1B;
 
+    private const long CancelStateMaxAgeMs = 5000;
     private const ushort VkNoName = 0xFC;
     private const uint KeyeventfKeyup = 0x0002;
 
@@ -158,6 +159,9 @@ internal static class KeyboardHookBridge
     private static bool[] _active = [];
     private static bool _escapeIsDown;
     private static string _cancelStatePath = "";
+    private static volatile bool _cancelAllowed;
+    private static readonly HashSet<int> _swallowNextKeyUp = [];
+    private static Thread? _cancelStateThread;
 
     public static int Run(IReadOnlyList<HotkeyRegistration> registrations, string cancelStatePath = "")
     {
@@ -168,6 +172,7 @@ internal static class KeyboardHookBridge
         }
 
         _cancelStatePath = (cancelStatePath ?? "").Trim();
+        StartCancelStateWatcher();
         _registrations = registrations;
         _active = new bool[registrations.Count];
         _proc = HookCallback;
@@ -275,13 +280,8 @@ internal static class KeyboardHookBridge
     /// Ctrl+Shift chord and flips the layout. Injecting an unassigned key counts as
     /// an intervening keystroke without producing input of its own.
     /// </summary>
-    private static void BreakModifierChord(int vkCode, bool isKeyDown)
+    private static void BreakModifierChord()
     {
-        if (!isKeyDown)
-        {
-            return;
-        }
-
         var ctrlDown = IsDown(VkControl) || IsDown(VkLControl) || IsDown(VkRControl);
         var shiftDown = IsDown(VkShift) || IsDown(VkLShift) || IsDown(VkRShift);
         if (!ctrlDown || !shiftDown)
@@ -291,6 +291,28 @@ internal static class KeyboardHookBridge
 
         keybd_event(VkNoName, 0, 0, UIntPtr.Zero);
         keybd_event(VkNoName, 0, KeyeventfKeyup, UIntPtr.Zero);
+    }
+
+    /// <summary>
+    /// Ends every active combo as if the key had been released: the tray still needs
+    /// its up event, and the physical release has to stay swallowed so it does not
+    /// leak into the focused app (an Alt+Space release would reopen the system menu).
+    /// </summary>
+    private static void DeactivateAllCombos()
+    {
+        for (var index = 0; index < _registrations.Count; index++)
+        {
+            if (!_active[index])
+            {
+                continue;
+            }
+
+            _active[index] = false;
+            _swallowNextKeyUp.Add(_registrations[index].Definition.Key);
+            Console.Out.WriteLine(_registrations[index].UpEvent);
+        }
+
+        Console.Out.Flush();
     }
 
     private static bool AnyComboActive()
@@ -307,11 +329,39 @@ internal static class KeyboardHookBridge
     }
 
     /// <summary>
+    /// Polls the overlay state off the hook thread. A WH_KEYBOARD_LL callback that
+    /// exceeds LowLevelHooksTimeout (300ms by default) has its result discarded and
+    /// can be removed by Windows outright, so the callback must never touch the
+    /// filesystem: it reads the cached flag instead.
+    /// </summary>
+    private static void StartCancelStateWatcher()
+    {
+        if (_cancelStatePath.Length == 0 || _cancelStateThread is not null)
+        {
+            return;
+        }
+
+        _cancelStateThread = new Thread(() =>
+        {
+            while (true)
+            {
+                _cancelAllowed = ReadCancelState();
+                Thread.Sleep(100);
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "dictray-cancel-state"
+        };
+        _cancelStateThread.Start();
+    }
+
+    /// <summary>
     /// Escape only cancels while a dictation turn is on screen, so the hook does
     /// not swallow Escape system-wide. Mirrors overlayStateAllowsCancel() in
     /// macos-hotkey-hook.swift.
     /// </summary>
-    private static bool OverlayStateAllowsCancel()
+    private static bool ReadCancelState()
     {
         if (_cancelStatePath.Length == 0)
         {
@@ -331,6 +381,19 @@ internal static class KeyboardHookBridge
             if (!root.TryGetProperty("phase", out var phase) || phase.ValueKind != JsonValueKind.String)
             {
                 return false;
+            }
+
+            // A wedged tray would otherwise leave a stale "transcribing" payload on
+            // disk and make Escape a system-wide black hole.
+            if (root.TryGetProperty("updatedAt", out var updatedAt)
+                && updatedAt.ValueKind == JsonValueKind.Number
+                && updatedAt.TryGetInt64(out var updatedAtMs))
+            {
+                var ageMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - updatedAtMs;
+                if (ageMs > CancelStateMaxAgeMs)
+                {
+                    return false;
+                }
             }
 
             return (phase.GetString() ?? "").Trim().ToLowerInvariant() switch
@@ -360,13 +423,20 @@ internal static class KeyboardHookBridge
 
                 if (vkCode == VkEscape)
                 {
-                    if (isKeyDown && !_escapeIsDown && (AnyComboActive() || OverlayStateAllowsCancel()))
+                    if (isKeyDown)
                     {
-                        _escapeIsDown = true;
-                        Array.Clear(_active);
-                        Console.Out.WriteLine("cancel");
-                        Console.Out.Flush();
-                        return (IntPtr)1;
+                        if (!_escapeIsDown && (AnyComboActive() || _cancelAllowed))
+                        {
+                            _escapeIsDown = true;
+                            DeactivateAllCombos();
+                            Console.Out.WriteLine("cancel");
+                            Console.Out.Flush();
+                            return (IntPtr)1;
+                        }
+
+                        // Never leave the latch set for an Escape that was passed
+                        // through, or the following press would be swallowed too.
+                        _escapeIsDown = false;
                     }
 
                     if (isKeyUp && _escapeIsDown)
@@ -377,6 +447,13 @@ internal static class KeyboardHookBridge
                 }
 
                 var swallow = false;
+                var breakChord = false;
+
+                if (isKeyUp && _swallowNextKeyUp.Remove(vkCode))
+                {
+                    return (IntPtr)1;
+                }
+
                 for (var index = 0; index < _registrations.Count; index++)
                 {
                     var registration = _registrations[index];
@@ -410,12 +487,22 @@ internal static class KeyboardHookBridge
                     if ((nextActive || wasActive) && vkCode == registration.Definition.Key)
                     {
                         swallow = true;
+                        if (nextActive && !wasActive)
+                        {
+                            // Only on the activating press: auto-repeat would otherwise
+                            // inject dozens of synthetic events per second while held.
+                            breakChord = true;
+                        }
                     }
                 }
 
                 if (swallow)
                 {
-                    BreakModifierChord(vkCode, isKeyDown);
+                    if (breakChord)
+                    {
+                        BreakModifierChord();
+                    }
+
                     return (IntPtr)1;
                 }
             }
