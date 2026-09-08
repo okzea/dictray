@@ -10,6 +10,7 @@ const SAMPLE_RATE = 44100
 const TARGET_PEAK = 0.36
 const FFMPEG_BIN = String(process.env.DICTATION_TRAY_FFMPEG_BIN || process.env.STT_FFMPEG_BIN || 'ffmpeg').trim() || 'ffmpeg'
 const EARCON_CACHE_DIR = path.join(os.tmpdir(), 'dictray-earcons')
+const EARCON_PLAYBACK_TIMEOUT_MS = 5000
 const EARCON_ASSET_DIR = path.join(__dirname, '..', 'assets', 'earcons')
 const EARCON_DEFINITIONS = {
   listen: {
@@ -313,6 +314,18 @@ export function createEarconPlayer({ logger = null } = {}) {
       })
       if (detachPlayer) {
         child.unref()
+      } else {
+        // The attached child holds the event loop, so bound how long a wedged
+        // player (audio device enumeration stalling, say) can keep it alive.
+        const killTimer = setTimeout(() => {
+          try {
+            child.kill()
+          } catch {
+            // already gone
+          }
+        }, EARCON_PLAYBACK_TIMEOUT_MS)
+        killTimer.unref?.()
+        child.once('exit', () => clearTimeout(killTimer))
       }
       return {
         ok: true,

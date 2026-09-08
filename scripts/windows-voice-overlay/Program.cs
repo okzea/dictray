@@ -119,6 +119,8 @@ internal sealed class OverlayForm : Form
         _pollTimer.Tick += (_, _) => ReloadState();
         _pollTimer.Start();
 
+        WatchParentProcess();
+
         ReloadState();
     }
 
@@ -133,6 +135,42 @@ internal sealed class OverlayForm : Form
             cp.ExStyle |= WsExTransparent | WsExNoActivate | WsExToolWindow;
             return cp;
         }
+    }
+
+    /// <summary>
+    /// A killed tray never writes the quit payload, and Windows does not reap a
+    /// child with its parent, so an orphan would keep polling forever behind an
+    /// always-on-top window. Standard input closing is the parent-death signal.
+    /// </summary>
+    private void WatchParentProcess()
+    {
+        var stdin = Console.OpenStandardInput();
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var buffer = new byte[1];
+                while (stdin.Read(buffer, 0, 1) > 0)
+                {
+                    // The tray does not send anything; only EOF matters.
+                }
+            }
+            catch
+            {
+                // treat a broken pipe as parent death
+            }
+
+            BeginInvoke(() =>
+            {
+                _pollTimer.Stop();
+                Close();
+            });
+        })
+        {
+            IsBackground = true,
+            Name = "parent-watch"
+        };
+        thread.Start();
     }
 
     private void ReloadState()
@@ -350,7 +388,7 @@ internal sealed class OverlayForm : Form
         }
 
         var phase = (_payload.Phase ?? "idle").Trim();
-        if (phase == "listening")
+        if (phase is "listening" or "processing")
         {
             return AccentGreen;
         }

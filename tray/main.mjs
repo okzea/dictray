@@ -1696,6 +1696,7 @@ function stopMacosMenuBarBridge() {
   }
   macosOverlayProcess = null
   macosOverlayEnabled = false
+  stopWindowsVoiceOverlayBridge()
   macosOverlayLastPayload = ''
   macosMenuBridgeEnabled = false
 
@@ -1710,8 +1711,14 @@ function stopMacosMenuBarBridge() {
     // best-effort — the process is exiting
   }
   try {
-    writeFileSync(WINDOWS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
     writeFileSync(MACOS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+  try {
+    if (process.platform === 'win32') {
+      writeFileSync(WINDOWS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+    }
   } catch {
     // best-effort — the process is exiting
   }
@@ -2368,11 +2375,6 @@ function maybePlayCaptureEarcon(kind) {
   if (process.platform === 'darwin' && ['listen', 'submit'].includes(normalizedKind)) {
     return
   }
-  void appendDiagnosticsLog('earcon-attempt', {
-    kind: normalizedKind,
-    backend: captureBackendId(),
-    hasPlayer: Boolean(earconPlayer)
-  })
   if (captureBackendId() !== 'native' || !earconPlayer) {
     return
   }
@@ -2997,6 +2999,19 @@ function windowsOverlayTargetLabel(value) {
   return text
 }
 
+function stopWindowsVoiceOverlayBridge() {
+  if (windowsOverlayProcess && !windowsOverlayProcess.killed) {
+    try {
+      windowsOverlayProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  windowsOverlayProcess = null
+  windowsOverlayEnabled = false
+  windowsOverlayLastPayload = ''
+}
+
 function buildWindowsOverlayPayload() {
   const payload = buildVoiceOverlayPayload()
   const windowBounds = resolveVoiceOverlayWindowBounds()
@@ -3027,10 +3042,13 @@ async function syncWindowsOverlayState({ force = false } = {}) {
   }
   const payload = buildWindowsOverlayPayload()
   const serialized = JSON.stringify(payload)
-  if (!force && serialized === windowsOverlayLastPayload) {
+  // updatedAt changes on every build, so the dedup key ignores it.
+  const { updatedAt: _updatedAt, ...dedupPayload } = payload
+  const dedupKey = JSON.stringify(dedupPayload)
+  if (!force && dedupKey === windowsOverlayLastPayload) {
     return
   }
-  windowsOverlayLastPayload = serialized
+  windowsOverlayLastPayload = dedupKey
   try {
     await writeFile(WINDOWS_OVERLAY_STATE_PATH, serialized, { encoding: 'utf8' })
   } catch (error) {
@@ -3062,8 +3080,11 @@ async function initWindowsVoiceOverlayBridge() {
   }
 
   try {
+    // stdin stays open so the helper exits on EOF if the tray dies without
+    // writing a quit payload; a Node child is not reaped with its parent on
+    // Windows, and an orphan would keep an always-on-top window alive.
     windowsOverlayProcess = spawn(WINDOWS_OVERLAY_HELPER, [WINDOWS_OVERLAY_STATE_PATH], {
-      stdio: ['ignore', 'ignore', 'pipe'],
+      stdio: ['pipe', 'ignore', 'pipe'],
       windowsHide: true
     })
     const stderr = readline.createInterface({ input: windowsOverlayProcess.stderr })
@@ -6265,9 +6286,7 @@ async function processAudioSubmission(payload = {}) {
       }
     }
 
-    await appendDiagnosticsLog('submission-awaiting-context', {})
     const windowContext = await contextPromise.catch(() => null)
-    await appendDiagnosticsLog('submission-context-ready', { hasContext: Boolean(windowContext) })
     throwIfSubmissionCancelled(submission)
     updateVoiceState({
       phase: rewriteEnabled ? 'rewriting' : (process.platform === 'darwin' ? 'transcribing' : 'inserting'),
@@ -6495,9 +6514,13 @@ async function startDictationCapture({
   // Let the start earcon open at full volume and duck partway through it, so the
   // cue reads as a fade rather than arriving already dimmed. The session check
   // inside the duck call makes a late duck a no-op if capture already ended.
-  setTimeout(() => {
+  if (process.platform === 'win32') {
+    setTimeout(() => {
+      void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
+    }, VOLUME_DUCK_DELAY_MS)
+  } else {
     void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
-  }, VOLUME_DUCK_DELAY_MS)
+  }
   try {
     const bridge = await ensureCaptureBackend()
     await bridge.startRecording({
