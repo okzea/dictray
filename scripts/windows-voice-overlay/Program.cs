@@ -178,7 +178,16 @@ internal sealed class OverlayForm : Form
         string raw;
         try
         {
-            raw = File.ReadAllText(_statePath);
+            // File.ReadAllText opens with FileShare.Read, which denies writers: the
+            // tray rewrites this file about ten times a second during a turn and its
+            // writes were failing with EBUSY, leaving the overlay on a stale payload.
+            using var stream = new FileStream(
+                _statePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream);
+            raw = reader.ReadToEnd();
         }
         catch
         {

@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, watch as fsWatch, writeFileSync } from 'node:fs'
-import { access, appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { access, appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
@@ -3050,9 +3050,16 @@ async function syncWindowsOverlayState({ force = false } = {}) {
   }
   windowsOverlayLastPayload = dedupKey
   try {
-    await writeFile(WINDOWS_OVERLAY_STATE_PATH, serialized, { encoding: 'utf8' })
+    // Write through a temporary file and rename over the target. A plain write is
+    // not atomic, so the helper polling this path could observe a truncated
+    // payload, and its read would collide with the next write during a turn.
+    const tempPath = `${WINDOWS_OVERLAY_STATE_PATH}.tmp`
+    await writeFile(tempPath, serialized, { encoding: 'utf8' })
+    await rename(tempPath, WINDOWS_OVERLAY_STATE_PATH)
   } catch (error) {
-    console.error('[dictray] Failed to sync Windows overlay state:', error?.message || error)
+    void appendDiagnosticsLog('overlay-sync-error', {
+      error: String(error?.message || error)
+    })
   }
 }
 
