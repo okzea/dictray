@@ -160,6 +160,7 @@ const STT_DEVICE_GPU = 'gpu'
 const STT_MODEL_TINY = 'tiny'
 const STT_MODEL_MIDDLE = 'middle'
 const STT_MODEL_ADVANCED = 'advanced'
+const STT_MODEL_PRECISE = 'precise'
 const SPEECH_EFFORT_LOW = 'low'
 const SPEECH_EFFORT_MID = 'mid'
 const SPEECH_EFFORT_HIGH = 'high'
@@ -2169,11 +2170,14 @@ function normalizeSttModelPreference(value) {
   if (lowered === STT_MODEL_ADVANCED || lowered === 'small' || lowered === 'small.en') {
     return STT_MODEL_ADVANCED
   }
+  if (lowered === STT_MODEL_PRECISE || lowered === 'distil' || lowered === 'distil-large-v3.5') {
+    return STT_MODEL_PRECISE
+  }
   return ''
 }
 
 function sttModelPreferenceOptions() {
-  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED]
+  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED, STT_MODEL_PRECISE]
 }
 
 function sttModelNameForPreference(value) {
@@ -2184,6 +2188,8 @@ function sttModelNameForPreference(value) {
       return 'base.en'
     case STT_MODEL_ADVANCED:
       return 'small.en'
+    case STT_MODEL_PRECISE:
+      return 'distil-large-v3.5'
     default:
       return ''
   }
@@ -2225,6 +2231,7 @@ function speechEffortForModel(value) {
     case STT_MODEL_TINY:
       return SPEECH_EFFORT_LOW
     case STT_MODEL_ADVANCED:
+    case STT_MODEL_PRECISE:
       return SPEECH_EFFORT_HIGH
     case STT_MODEL_MIDDLE:
     default:
@@ -4130,6 +4137,8 @@ function sttModelMenuLabel(value) {
       return 'Middle (base.en)'
     case STT_MODEL_ADVANCED:
       return 'Advanced (small.en)'
+    case STT_MODEL_PRECISE:
+      return 'Precise (distil-large-v3.5)'
     default:
       return String(value || 'Unknown')
   }
@@ -4142,6 +4151,9 @@ function sttModelMenuOptionLabel(value) {
   }
   if (normalized === STT_MODEL_MIDDLE) {
     return 'middle (base.en) - balanced speed and accuracy'
+  }
+  if (normalized === STT_MODEL_PRECISE) {
+    return `${sttModelMenuLabel(normalized)} - most accurate, heavier on CPU`
   }
   if (normalized === STT_MODEL_ADVANCED || normalized.includes('small') || normalized.includes('large')) {
     return `${sttModelMenuLabel(normalized)} - highest quality, slower`
