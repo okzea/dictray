@@ -300,15 +300,20 @@ export function createEarconPlayer({ logger = null } = {}) {
 
     const filePath = await ensureEarconFile(normalizedKind)
     try {
+      // Windows: a detached+unref'd child is torn down before SoundPlayer
+      // finishes, so playback is silent. Keep it attached for its short life.
+      const detachPlayer = process.platform !== 'win32'
       const child = spawn(player.command, player.args(filePath), {
-        detached: true,
+        detached: detachPlayer,
         stdio: 'ignore',
         windowsHide: true
       })
       child.once('error', (error) => {
         log(`[dictray] Earcon playback failed: ${String(error?.message || error)}`)
       })
-      child.unref()
+      if (detachPlayer) {
+        child.unref()
+      }
       return {
         ok: true,
         kind: normalizedKind,
