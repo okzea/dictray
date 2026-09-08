@@ -15,6 +15,7 @@ const EARCON_ASSET_DIR = path.join(__dirname, '..', 'assets', 'earcons')
 const EARCON_DEFINITIONS = {
   listen: {
     asset: 'listen.mp3',
+    wavAsset: 'listen.wav',
     pulses: [
       { wave: 'sine', fromHz: 520, toHz: 650, startMs: 0, durationMs: 110, level: 0.62 },
       { wave: 'sine', fromHz: 650, toHz: 760, startMs: 46, durationMs: 120, level: 0.28 }
@@ -28,6 +29,7 @@ const EARCON_DEFINITIONS = {
   },
   submit: {
     asset: 'submit.mp3',
+    wavAsset: 'submit.wav',
     pulses: [
       { wave: 'sine', fromHz: 640, toHz: 520, startMs: 0, durationMs: 130, level: 0.54 },
       { wave: 'sine', fromHz: 520, toHz: 390, startMs: 62, durationMs: 150, level: 0.34 }
@@ -245,6 +247,16 @@ export function createEarconPlayer({ logger = null } = {}) {
       return cachedFiles.get(kind)
     }
     const definition = EARCON_DEFINITIONS[kind]
+
+    // A ready-made WAV needs no decoding, so the designed cue plays everywhere.
+    // Without this, any platform lacking ffmpeg silently fell back to the
+    // synthesised tone below and never played the shipped asset at all.
+    const wavAssetPath = definition?.wavAsset ? path.join(EARCON_ASSET_DIR, definition.wavAsset) : ''
+    if (wavAssetPath && existsSync(wavAssetPath)) {
+      cachedFiles.set(kind, wavAssetPath)
+      return wavAssetPath
+    }
+
     const assetPath = definition?.asset ? path.join(EARCON_ASSET_DIR, definition.asset) : ''
     if (assetPath && existsSync(assetPath)) {
       if (process.platform === 'darwin') {
