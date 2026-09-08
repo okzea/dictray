@@ -14,7 +14,7 @@ import tempfile
 import threading
 import time
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -180,6 +180,7 @@ def decode_audio_to_wav(raw_path: Path, wav_path: Path) -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
 
@@ -647,7 +648,8 @@ def main() -> int:
     parser.add_argument("--port", default="4591")
     args = parser.parse_args()
 
-    server = HTTPServer((args.host, int(args.port)), Handler)
+    server = ThreadingHTTPServer((args.host, int(args.port)), Handler)
+    server.daemon_threads = True
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:  # pragma: no cover - manual shutdown path
