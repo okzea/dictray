@@ -33,6 +33,11 @@ const helperProjects = [
     name: 'windows-tray-host',
     projectPath: path.join(rootDir, 'scripts', 'windows-tray-host', 'WindowsTrayHost.csproj'),
     exeName: 'WindowsTrayHost.exe'
+  },
+  {
+    name: 'windows-voice-overlay',
+    projectPath: path.join(rootDir, 'scripts', 'windows-voice-overlay', 'WindowsVoiceOverlay.csproj'),
+    exeName: 'WindowsVoiceOverlay.exe'
   }
 ]
 

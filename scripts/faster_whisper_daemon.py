@@ -20,14 +20,14 @@ from urllib.parse import urlparse
 
 
 def _register_bundled_cuda_libraries() -> None:
-    """Make pip-installed NVIDIA runtime libraries loadable on Windows.
+    """Make pip-installed NVIDIA runtime libraries loadable.
 
-    CTranslate2 resolves cuBLAS/cuDNN through its own LoadLibrary call, which
-    honours PATH but not os.add_dll_directory, so the wheel bin directories have
-    to be pushed onto PATH before ctranslate2 is imported.
+    CTranslate2 resolves cuBLAS/cuDNN through its own loader call, which honours
+    PATH (Windows) or LD_LIBRARY_PATH (Linux) but not os.add_dll_directory, so
+    the wheel library directories have to be registered before ctranslate2 is
+    imported. The wheels ship them under nvidia/*/bin on Windows and
+    nvidia/*/lib elsewhere.
     """
-    if os.name != "nt":
-        return
     try:
         import sysconfig
 
@@ -41,21 +41,26 @@ def _register_bundled_cuda_libraries() -> None:
     if not os.path.isdir(nvidia_root):
         return
 
+    is_windows = os.name == "nt"
+    lib_subdir = "bin" if is_windows else "lib"
+    path_var = "PATH" if is_windows else "LD_LIBRARY_PATH"
+
     discovered = []
     try:
         for entry in sorted(os.listdir(nvidia_root)):
-            bin_dir = os.path.join(nvidia_root, entry, "bin")
-            if os.path.isdir(bin_dir):
-                discovered.append(bin_dir)
-                try:
-                    os.add_dll_directory(bin_dir)
-                except Exception:
-                    pass
+            lib_dir = os.path.join(nvidia_root, entry, lib_subdir)
+            if os.path.isdir(lib_dir):
+                discovered.append(lib_dir)
+                if is_windows:
+                    try:
+                        os.add_dll_directory(lib_dir)
+                    except Exception:
+                        pass
     except Exception:
         return
 
     if discovered:
-        os.environ["PATH"] = os.pathsep.join(discovered + [os.environ.get("PATH", "")])
+        os.environ[path_var] = os.pathsep.join(discovered + [os.environ.get(path_var, "")])
 
 
 _register_bundled_cuda_libraries()
@@ -671,8 +676,14 @@ class Handler(BaseHTTPRequestHandler):
                 next_key = resolved_runtime_cache_key(command)
                 current_key = runtime_cache_key(current) if current else None
                 if current_key != next_key:
-                    clear_model_cache()
-                    set_active_runtime(None)
+                    # Under ThreadingHTTPServer this can now run while another
+                    # thread is inside model.transcribe(). Dropping the last
+                    # reference to a WhisperModel finalises the native
+                    # CTranslate2 translator mid-inference, so evict only while
+                    # holding the same lock the transcribe path takes.
+                    with TRANSCRIBE_LOCK:
+                        clear_model_cache()
+                        set_active_runtime(None)
                 # Apply the requested runtime settings by warming with the new config
                 payload = warm_runtime(command)
                 payload["availableDevices"] = ["cpu", "cuda"] if cuda_device_count() > 0 else ["cpu"]

@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
 const configPath = path.join(rootDir, 'dictation-tray.config.json')
+const speechPreferencesPath = path.join(rootDir, 'local', 'state', 'speech-preferences.json')
 
 // CTranslate2 4.x links against the CUDA 12 runtime and cuDNN 9.
 const CUDA_PACKAGES = ['nvidia-cublas-cu12', 'nvidia-cudnn-cu12']
@@ -84,28 +85,29 @@ async function detectGpu() {
   return name ? { vendor: 'nvidia', name, driver } : { vendor: 'none' }
 }
 
-async function probeCuda(pythonBin) {
+async function probeCuda(pythonBin, { runInference = true } = {}) {
   // Mirrors _register_bundled_cuda_libraries() in faster_whisper_daemon.py:
   // CTranslate2 finds cuBLAS/cuDNN via PATH, not os.add_dll_directory.
   const script = [
     'import json, os, sysconfig',
-    'if os.name == "nt":',
-    '    _root = os.path.join(sysconfig.get_paths().get("purelib") or "", "nvidia")',
-    '    _dirs = []',
-    '    if os.path.isdir(_root):',
-    '        for _entry in sorted(os.listdir(_root)):',
-    '            _bin = os.path.join(_root, _entry, "bin")',
-    '            if os.path.isdir(_bin):',
-    '                _dirs.append(_bin)',
-    '    if _dirs:',
-    '        os.environ["PATH"] = os.pathsep.join(_dirs + [os.environ.get("PATH", "")])',
-    'out = {"cudaDevices": 0, "inference": False, "error": ""}',
+    '_root = os.path.join(sysconfig.get_paths().get("purelib") or "", "nvidia")',
+    '_sub = "bin" if os.name == "nt" else "lib"',
+    '_var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"',
+    '_dirs = []',
+    'if os.path.isdir(_root):',
+    '    for _entry in sorted(os.listdir(_root)):',
+    '        _d = os.path.join(_root, _entry, _sub)',
+    '        if os.path.isdir(_d):',
+    '            _dirs.append(_d)',
+    'if _dirs:',
+    '    os.environ[_var] = os.pathsep.join(_dirs + [os.environ.get(_var, "")])',
+    'out = {"cudaDevices": 0, "inference": False, "libraries": bool(_dirs), "error": ""}',
     'try:',
     '    import ctranslate2',
     '    out["cudaDevices"] = ctranslate2.get_cuda_device_count()',
     'except Exception as error:',
     '    out["error"] = str(error)',
-    'if out["cudaDevices"] > 0:',
+    'if out["cudaDevices"] > 0 and ' + (runInference ? 'True' : 'False') + ':',
     '    try:',
     '        import numpy as np',
     '        from faster_whisper import WhisperModel',
@@ -146,6 +148,34 @@ async function setConfigDevice(device, computeType) {
   return true
 }
 
+/// A device chosen from the tray menu is persisted separately and reapplied on
+/// startup, which would override whatever this script writes to the config. Clear
+/// it so the config selection is the one that takes effect.
+async function clearStoredDevicePreference() {
+  let raw
+  try {
+    raw = await readFile(speechPreferencesPath, 'utf8')
+  } catch {
+    return false
+  }
+
+  let preferences
+  try {
+    preferences = JSON.parse(raw)
+  } catch {
+    return false
+  }
+
+  if (!preferences || preferences.sttDevice === undefined || preferences.sttDevice === '') {
+    return false
+  }
+
+  delete preferences.sttDevice
+  await writeFile(speechPreferencesPath, `${JSON.stringify(preferences, null, 2)}
+`, 'utf8')
+  return true
+}
+
 async function main() {
   const pythonBin = bundledPythonPath()
   try {
@@ -173,17 +203,28 @@ async function main() {
     return
   }
 
-  let probe = await probeCuda(pythonBin)
+  // Check mode must not download a Whisper model just to answer a question, so it
+  // reports on library availability instead of running a real inference.
+  let probe = await probeCuda(pythonBin, { runInference: !checkOnly })
   log(`CUDA devices visible to CTranslate2: ${probe.cudaDevices}`)
+
+  if (checkOnly) {
+    // Inference is not exercised in check mode: constructing a model would
+    // download one. Report on what is installed instead.
+    if (probe.cudaDevices > 0 && probe.libraries) {
+      log('CUDA libraries are installed and a device is visible. Nothing to do.')
+    } else if (probe.cudaDevices > 0) {
+      log('CUDA device visible but the runtime libraries are missing.')
+      log(`Would install: ${CUDA_PACKAGES.join(', ')}`)
+    } else {
+      log(`CTranslate2 reports no CUDA device${probe.error ? `: ${probe.error}` : '.'}`)
+    }
+    return
+  }
 
   if (probe.inference) {
     log('CUDA inference already works. No install needed.')
   } else {
-    if (checkOnly) {
-      log(`CUDA inference unavailable: ${probe.error || 'unknown error'}`)
-      log(`Would install: ${CUDA_PACKAGES.join(', ')}`)
-      return
-    }
 
     const targets = await existingPythons()
     log(`Installing CUDA runtime libraries: ${CUDA_PACKAGES.join(', ')}`)
@@ -210,6 +251,9 @@ async function main() {
     log('CUDA inference verified.')
   }
 
+  if (await clearStoredDevicePreference()) {
+    log('Cleared the stored per-user device preference so the config selection applies.')
+  }
   const changed = await setConfigDevice('auto', 'auto')
   log(changed
     ? 'Config set to device "auto" — DicTray will use the GPU.'
