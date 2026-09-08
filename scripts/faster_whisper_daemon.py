@@ -18,6 +18,48 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+
+def _register_bundled_cuda_libraries() -> None:
+    """Make pip-installed NVIDIA runtime libraries loadable on Windows.
+
+    CTranslate2 resolves cuBLAS/cuDNN through its own LoadLibrary call, which
+    honours PATH but not os.add_dll_directory, so the wheel bin directories have
+    to be pushed onto PATH before ctranslate2 is imported.
+    """
+    if os.name != "nt":
+        return
+    try:
+        import sysconfig
+
+        site_dir = sysconfig.get_paths().get("purelib") or ""
+    except Exception:
+        return
+    if not site_dir:
+        return
+
+    nvidia_root = os.path.join(site_dir, "nvidia")
+    if not os.path.isdir(nvidia_root):
+        return
+
+    discovered = []
+    try:
+        for entry in sorted(os.listdir(nvidia_root)):
+            bin_dir = os.path.join(nvidia_root, entry, "bin")
+            if os.path.isdir(bin_dir):
+                discovered.append(bin_dir)
+                try:
+                    os.add_dll_directory(bin_dir)
+                except Exception:
+                    pass
+    except Exception:
+        return
+
+    if discovered:
+        os.environ["PATH"] = os.pathsep.join(discovered + [os.environ.get("PATH", "")])
+
+
+_register_bundled_cuda_libraries()
+
 try:
     import ctranslate2
 except Exception:  # pragma: no cover - optional import surface
