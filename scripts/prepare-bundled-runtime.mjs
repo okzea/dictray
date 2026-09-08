@@ -78,7 +78,10 @@ function dedupe(values) {
 }
 
 function hasCommand(command) {
-  const result = spawnSync('which', [command], {
+  // `which` does not exist on Windows, so the dotnet probe reported no SDK and
+  // silently skipped every helper build while still declaring the bundle ready.
+  const finder = process.platform === 'win32' ? 'where.exe' : 'which'
+  const result = spawnSync(finder, [command], {
     encoding: 'utf8',
     stdio: ['ignore', 'ignore', 'ignore']
   })
