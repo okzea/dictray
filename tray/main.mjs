@@ -94,6 +94,10 @@ const MACOS_OVERLAY_HELPER = path.join(__dirname, '..', 'scripts', 'macos-voice-
 const MACOS_MENU_POLL_INTERVAL_MS = 500
 const WINDOWS_APPDATA_HOME = String(process.env.APPDATA || '').trim() || path.join(os.homedir(), 'AppData', 'Roaming')
 const WINDOWS_TRAY_DIR = path.join(WINDOWS_APPDATA_HOME, 'DicTray', 'tray')
+const WINDOWS_OVERLAY_DIR = path.join(WINDOWS_APPDATA_HOME, 'DicTray', 'overlay')
+const WINDOWS_OVERLAY_STATE_PATH = path.join(WINDOWS_OVERLAY_DIR, 'status.json')
+const WINDOWS_OVERLAY_HELPER = resolveBundledHelperExecutable('windows-voice-overlay', 'WindowsVoiceOverlay.exe')
+  || path.join(__dirname, '..', 'scripts', 'windows-voice-overlay', 'bin', 'Release', 'net10.0-windows', 'WindowsVoiceOverlay.exe')
 const WINDOWS_TRAY_STATE_PATH = path.join(WINDOWS_TRAY_DIR, 'status.json')
 const WINDOWS_TRAY_COMMAND_PATH = path.join(WINDOWS_TRAY_DIR, 'command.json')
 const WINDOWS_TRAY_HELPER = resolveBundledHelperExecutable('windows-tray-host', 'WindowsTrayHost.exe')
@@ -171,6 +175,7 @@ const HOTKEY_BRIDGE_MAX_RESTARTS = 20
 const VOICE_OVERLAY_WIDTH = 292
 const VOICE_OVERLAY_HEIGHT = 78
 const VOICE_OVERLAY_MARGIN = 18
+const VOLUME_DUCK_DELAY_MS = 260
 const VOICE_OVERLAY_GAP = 14
 const VOICE_OVERLAY_IDLE_HIDE_DELAY_MS = 1800
 const VOICE_STATE_NOTICE_CLEAR_DELAY_MS = 2200
@@ -244,6 +249,9 @@ let macosOnboardingUiError = ''
 let macosOverlayProcess = null
 let macosOverlayEnabled = false
 let macosOverlayLastPayload = ''
+let windowsOverlayProcess = null
+let windowsOverlayEnabled = false
+let windowsOverlayLastPayload = ''
 let windowsTrayProcess = null
 let windowsTrayPollTimer = null
 let windowsTrayCommandWatcher = null
@@ -1701,6 +1709,7 @@ function stopMacosMenuBarBridge() {
     // best-effort — the process is exiting
   }
   try {
+    writeFileSync(WINDOWS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
     writeFileSync(MACOS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
   } catch {
     // best-effort — the process is exiting
@@ -2352,10 +2361,18 @@ function maybePlayCaptureEarcon(kind) {
   if (process.platform === 'darwin' && ['listen', 'submit'].includes(normalizedKind)) {
     return
   }
+  void appendDiagnosticsLog('earcon-attempt', {
+    kind: normalizedKind,
+    backend: captureBackendId(),
+    hasPlayer: Boolean(earconPlayer)
+  })
   if (captureBackendId() !== 'native' || !earconPlayer) {
     return
   }
-  void earconPlayer.play(normalizedKind).catch((error) => {
+  void earconPlayer.play(normalizedKind).then((result) => {
+    void appendDiagnosticsLog('earcon-result', { kind: normalizedKind, result: result || null })
+  }).catch((error) => {
+    void appendDiagnosticsLog('earcon-error', { kind: normalizedKind, error: String(error?.message || error) })
     console.error('[dictray] Failed to play earcon:', error?.message || error)
   })
 }
@@ -2677,10 +2694,6 @@ function computeVoiceOverlayBounds(state = voiceState) {
 
   let x = workArea.x + Math.round((workArea.width - VOICE_OVERLAY_WIDTH) / 2)
   let y = workArea.y + workArea.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
-  if (windowBounds && process.platform === 'win32') {
-    x = windowBounds.left + Math.round((windowBounds.width - VOICE_OVERLAY_WIDTH) / 2)
-    y = windowBounds.top + windowBounds.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
-  }
 
   return {
     x: clampOverlayAxis(x, workArea.x, workArea.width, VOICE_OVERLAY_WIDTH),
@@ -2798,6 +2811,7 @@ function syncVoiceInputLevel(level = 0) {
     scheduleGnomePanelStateSync(GNOME_PANEL_LEVEL_SYNC_MS)
   }
   void syncMacosOverlayState()
+  void syncWindowsOverlayState()
 
   if (!voiceWindow || voiceWindow.isDestroyed() || voiceWindow.webContents.isDestroyed()) {
     return
@@ -2809,6 +2823,13 @@ function syncVoiceInputLevel(level = 0) {
 }
 
 function syncVoiceOverlay() {
+  if (process.platform === 'win32') {
+    clearVoiceOverlayHideTimer()
+    void refreshVoiceOverlayFocusedBounds()
+    void syncWindowsOverlayState({ force: true })
+    return
+  }
+
   if (process.platform === 'darwin') {
     clearVoiceOverlayHideTimer()
     void refreshVoiceOverlayFocusedBounds()
@@ -2944,6 +2965,101 @@ async function syncMacosOverlayState({ force = false } = {}) {
     await writeFile(MACOS_OVERLAY_STATE_PATH, serialized, { encoding: 'utf8' })
   } catch (error) {
     console.error('[dictray] Failed to sync macOS overlay state:', error?.message || error)
+  }
+}
+
+function buildWindowsOverlayPayload() {
+  const payload = buildVoiceOverlayPayload()
+  const windowBounds = resolveVoiceOverlayWindowBounds()
+  return {
+    ...payload,
+    platform: 'win32',
+    inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
+    // The host-runtime screen shim reports a fixed 1920x1080 display, so overlay
+    // placement is resolved by the helper against real screen metrics instead.
+    windowBounds: windowBounds
+      ? {
+          left: Math.round(windowBounds.left),
+          top: Math.round(windowBounds.top),
+          width: Math.round(windowBounds.width),
+          height: Math.round(windowBounds.height)
+        }
+      : null,
+    size: { width: VOICE_OVERLAY_WIDTH, height: VOICE_OVERLAY_HEIGHT },
+    margin: VOICE_OVERLAY_MARGIN,
+    updatedAt: Date.now()
+  }
+}
+
+async function syncWindowsOverlayState({ force = false } = {}) {
+  if (process.platform !== 'win32' || !windowsOverlayEnabled) {
+    return
+  }
+  const payload = buildWindowsOverlayPayload()
+  const serialized = JSON.stringify(payload)
+  if (!force && serialized === windowsOverlayLastPayload) {
+    return
+  }
+  windowsOverlayLastPayload = serialized
+  try {
+    await writeFile(WINDOWS_OVERLAY_STATE_PATH, serialized, { encoding: 'utf8' })
+  } catch (error) {
+    console.error('[dictray] Failed to sync Windows overlay state:', error?.message || error)
+  }
+}
+
+async function initWindowsVoiceOverlayBridge() {
+  if (process.platform !== 'win32') {
+    return false
+  }
+  try {
+    await access(WINDOWS_OVERLAY_HELPER)
+  } catch {
+    console.error(`[dictray] Missing Windows overlay helper: ${WINDOWS_OVERLAY_HELPER}`)
+    return false
+  }
+  try {
+    await mkdir(WINDOWS_OVERLAY_DIR, { recursive: true })
+  } catch (error) {
+    console.error('[dictray] Failed to prepare Windows overlay state directory:', error?.message || error)
+    return false
+  }
+
+  windowsOverlayEnabled = true
+  await syncWindowsOverlayState({ force: true })
+  if (windowsOverlayProcess && !windowsOverlayProcess.killed) {
+    return true
+  }
+
+  try {
+    windowsOverlayProcess = spawn(WINDOWS_OVERLAY_HELPER, [WINDOWS_OVERLAY_STATE_PATH], {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: true
+    })
+    const stderr = readline.createInterface({ input: windowsOverlayProcess.stderr })
+    stderr.on('line', (line) => {
+      const message = String(line || '').trim()
+      if (message) {
+        console.error(`[dictray] Windows overlay: ${message}`)
+      }
+    })
+    const helper = windowsOverlayProcess
+    helper.on('exit', () => {
+      if (windowsOverlayProcess === helper) {
+        windowsOverlayProcess = null
+      }
+    })
+    helper.on('error', (error) => {
+      console.error('[dictray] Windows overlay helper failed:', error?.message || error)
+      if (windowsOverlayProcess === helper) {
+        windowsOverlayProcess = null
+      }
+    })
+    return true
+  } catch (error) {
+    console.error('[dictray] Failed to launch Windows overlay helper:', error?.message || error)
+    windowsOverlayProcess = null
+    return false
   }
 }
 
@@ -3713,6 +3829,11 @@ async function ensureVoiceWindow() {
   if (process.platform === 'darwin') {
     await initMacosVoiceOverlayBridge().catch((error) => {
       console.error('[dictray] macOS overlay setup failed:', error?.message || error)
+    })
+  }
+  if (process.platform === 'win32') {
+    await initWindowsVoiceOverlayBridge().catch((error) => {
+      console.error('[dictray] Windows overlay setup failed:', error?.message || error)
     })
   }
   return null
@@ -6054,6 +6175,11 @@ async function processAudioSubmission(payload = {}) {
     throwIfSubmissionCancelled(submission)
 
     const sttMs = nowMs(sttStartedAt)
+    await appendDiagnosticsLog('submission-transcribed', {
+      sttMs,
+      transcriptLength: String(transcribePayload?.transcript || '').trim().length,
+      timingsMs: transcribePayload?.timingsMs || null
+    })
     const rawTranscript = String(transcribePayload?.transcript || '').trim()
     const transcript = normalizeSpeechTranscript(rawTranscript)
     throwIfSubmissionCancelled(submission)
@@ -6104,7 +6230,9 @@ async function processAudioSubmission(payload = {}) {
       }
     }
 
+    await appendDiagnosticsLog('submission-awaiting-context', {})
     const windowContext = await contextPromise.catch(() => null)
+    await appendDiagnosticsLog('submission-context-ready', { hasContext: Boolean(windowContext) })
     throwIfSubmissionCancelled(submission)
     updateVoiceState({
       phase: rewriteEnabled ? 'rewriting' : (process.platform === 'darwin' ? 'transcribing' : 'inserting'),
@@ -6329,7 +6457,12 @@ async function startDictationCapture({
   })
 
   const volumeDuckSession = beginVolumeDuckSession()
-  void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
+  // Let the start earcon open at full volume and duck partway through it, so the
+  // cue reads as a fade rather than arriving already dimmed. The session check
+  // inside the duck call makes a late duck a no-op if capture already ended.
+  setTimeout(() => {
+    void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
+  }, VOLUME_DUCK_DELAY_MS)
   try {
     const bridge = await ensureCaptureBackend()
     await bridge.startRecording({
