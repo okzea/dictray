@@ -115,7 +115,16 @@ internal sealed class TrayHostContext : ApplicationContext
         string stateJson;
         try
         {
-            stateJson = File.ReadAllText(_statePath, Encoding.UTF8);
+            // File.ReadAllText opens with FileShare.Read, which denies writers. The
+            // tray rewrites this file whenever menu state changes, and a collision
+            // with this poll left the write rejected and the menu on stale state.
+            using var stream = new FileStream(
+                _statePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            using var reader = new StreamReader(stream, Encoding.UTF8);
+            stateJson = reader.ReadToEnd();
         }
         catch
         {

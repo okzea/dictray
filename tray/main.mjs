@@ -1754,9 +1754,14 @@ async function syncWindowsTrayState() {
     return
   }
   try {
-    await writeFile(WINDOWS_TRAY_STATE_PATH, JSON.stringify(buildWindowsTrayPayload()), { encoding: 'utf8' })
+    // Write and rename so the polling helper never reads a partial payload.
+    const tempPath = `${WINDOWS_TRAY_STATE_PATH}.tmp`
+    await writeFile(tempPath, JSON.stringify(buildWindowsTrayPayload()), { encoding: 'utf8' })
+    await rename(tempPath, WINDOWS_TRAY_STATE_PATH)
   } catch (error) {
-    console.error('[dictray] Failed to sync Windows tray state:', error?.message || error)
+    void appendDiagnosticsLog('tray-sync-error', {
+      error: String(error?.message || error)
+    })
   }
 }
 
