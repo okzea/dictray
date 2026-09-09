@@ -46,7 +46,9 @@ if (!['linux', 'darwin', 'win32'].includes(process.platform)) {
   process.exit(1)
 }
 
-spawnWithExit(process.execPath, ['tray/main.mjs', ...process.argv.slice(2)], process.platform === 'linux'
+// Resolve against this script rather than the working directory: a packaged
+// build launches from the package root, where 'tray/main.mjs' does not exist.
+spawnWithExit(process.execPath, [path.join(rootDir, 'tray', 'main.mjs'), ...process.argv.slice(2)], process.platform === 'linux'
   ? {
       ...process.env,
       DICTATION_TRAY_LINUX_HEADLESS: '1'

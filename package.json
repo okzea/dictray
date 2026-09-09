@@ -11,6 +11,8 @@
     "bundle:runtime": "node scripts/prepare-bundled-runtime.mjs",
     "gpu:setup": "node scripts/setup-gpu-acceleration.mjs",
     "gpu:check": "node scripts/setup-gpu-acceleration.mjs --check",
+    "pack:windows": "node scripts/build-windows-package.mjs --dir",
+    "dist:windows": "node scripts/build-windows-package.mjs --archive",
     "pack:linux": "node scripts/build-linux-package.mjs --dir",
     "dist:linux": "node scripts/build-linux-package.mjs --archive",
     "pack:mac": "node scripts/build-macos-dmg.mjs --dir",

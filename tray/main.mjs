@@ -23,6 +23,7 @@ import { buildLinuxLauncherManifest, ensureLinuxProductSetup } from '../src/linu
 import { launchLinuxNativeUi } from '../src/linux-native-ui.mjs'
 import { NearbyDuckingService } from '../src/nearby-ducking.mjs'
 import { isWindowsAutostartEnabled, setWindowsAutostart } from '../src/windows-autostart.mjs'
+import { checkForUpdate, releasesPageUrl } from '../src/update-check.mjs'
 import { createRewriteProvider } from '../src/rewrite-provider.mjs'
 import { resolveBundledHelperExecutable, resolveBundledSttConfig } from '../src/runtime-paths.mjs'
 import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
@@ -178,6 +179,7 @@ const VOICE_OVERLAY_WIDTH = 292
 const VOICE_OVERLAY_HEIGHT = 78
 const VOICE_OVERLAY_MARGIN = 18
 const VOLUME_DUCK_DELAY_MS = 260
+const UPDATE_CHECK_STARTUP_DELAY_MS = 15000
 const VOICE_OVERLAY_GAP = 14
 const VOICE_OVERLAY_IDLE_HIDE_DELAY_MS = 1800
 const VOICE_STATE_NOTICE_CLEAR_DELAY_MS = 2200
@@ -252,6 +254,7 @@ let macosOverlayProcess = null
 let macosOverlayEnabled = false
 let macosOverlayLastPayload = ''
 let windowsAutostartEnabled = false
+let availableUpdateVersion = ''
 let windowsOverlayProcess = null
 let windowsOverlayEnabled = false
 let windowsOverlayLastPayload = ''
@@ -1064,6 +1067,14 @@ function buildDetailedControlMenu(options = {}) {
         action: 'open_quick_start'
       }
     },
+    {
+      label: availableUpdateVersion
+        ? `Update Available (${availableUpdateVersion})`
+        : 'Check for Updates',
+      command: {
+        action: 'check_for_updates'
+      }
+    },
     { type: 'separator' },
     {
       label: 'Quit',
@@ -1364,6 +1375,9 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_windows_autostart':
       void updateWindowsAutostart(Boolean(command?.value))
+      break
+    case 'check_for_updates':
+      void runUpdateCheck({ announce: true })
       break
     case 'set_press_enter_after_insert':
       void updatePressEnterAfterInsert(Boolean(command?.value))
@@ -5135,6 +5149,38 @@ async function refreshRuntimeState(notify = false) {
   rebuildMenu()
 }
 
+/**
+ * With announce set the result is always reported, because the user asked. The
+ * startup check stays silent unless there is genuinely something newer, so it
+ * cannot become noise on every launch.
+ */
+async function runUpdateCheck({ announce = false } = {}) {
+  const currentVersion = String(app.getVersion?.() || '').trim()
+  const result = await checkForUpdate(currentVersion)
+
+  if (result?.updateAvailable && result.latestVersion) {
+    availableUpdateVersion = result.latestVersion
+    rebuildMenu()
+    showNotification(APP_NAME, `DicTray ${result.latestVersion} is available.`)
+    if (announce) {
+      void shell.openExternal(String(result.url || releasesPageUrl())).catch(() => {})
+    }
+    return
+  }
+
+  availableUpdateVersion = ''
+  if (!announce) {
+    return
+  }
+
+  showNotification(APP_NAME, result?.ok
+    ? `DicTray ${currentVersion} is up to date.`
+    : 'Could not check for updates.')
+  if (!result?.ok) {
+    void appendDiagnosticsLog('update-check-error', { reason: String(result?.reason || 'unknown') })
+  }
+}
+
 async function refreshWindowsAutostartState() {
   if (process.platform !== 'win32') {
     return
@@ -7324,6 +7370,10 @@ if (!shouldExitEarly) {
       console.error('[dictray] Linux product setup failed:', error?.message || error)
     })
     await refreshWindowsAutostartState().catch(() => {})
+    // Deferred so a slow or unreachable network cannot hold up startup.
+    setTimeout(() => {
+      void runUpdateCheck().catch(() => {})
+    }, UPDATE_CHECK_STARTUP_DELAY_MS)
     await initGnomePanelBridge().catch(() => {})
     await initLinuxNativeUiBridge().catch(() => {})
     await initMacosMenuBarBridge().catch((error) => {

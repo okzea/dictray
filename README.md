@@ -83,6 +83,12 @@ pnpm bundle:runtime
 
 That stages bundle resources under `build/bundled-runtime/`, including the local STT runtime, the Linux headless core, and the Linux Node runtime when run on Linux. When packaged resources or a local staged runtime are present, DicTray automatically prefers those bundled assets over the user's global `python`.
 
+Build a portable Windows package (`dist/DicTray-windows-x64.zip`, extract and run `DicTray.cmd`):
+
+```bash
+pnpm dist:windows
+```
+
 Build Linux distributables:
 
 ```bash
@@ -104,6 +110,41 @@ pnpm icon:export
 ```
 
 The brand mark variants live under `assets/brand/`: `dictray-logo-dark.*` is white for dark surfaces, `dictray-logo-light.*` is black for light surfaces, `dictray-logo-active.*` is green for active states, and `dictray-logo-template.png` is used where the OS handles menu-bar tinting.
+
+### Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which packages all three
+platforms on their own runners and publishes the artifacts to a GitHub release:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The CUDA libraries are excluded from every package. They are around 2 GB, which
+alone exceeds the 2 GB GitHub release asset limit, and they are of no use without
+an NVIDIA GPU. Users enable GPU acceleration after installing:
+
+```bash
+node scripts/setup-gpu-acceleration.mjs
+```
+
+Speech models download on first use rather than shipping in the package.
+
+Builds are unsigned, so users see a SmartScreen prompt on Windows (**More info ->
+Run anyway**) and must right-click-Open on macOS the first time. Signing needs an
+Apple Developer Program membership and a Windows code-signing certificate; the
+workflow is structured so signing can be added without rework.
+
+### Updates
+
+DicTray checks GitHub Releases for a newer version 15 seconds after startup and
+from **Check for Updates** in the tray menu. When one is found the menu item
+becomes **Update Available (x.y.z)** and a notification appears; choosing it opens
+the release page.
+
+It never downloads or installs anything by itself. Replacing a running app in
+place is only safe with signed builds, so the update path stops at telling the
+user. The startup check is silent unless there is genuinely something newer.
 
 ## Advanced Config
 
