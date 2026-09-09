@@ -22,6 +22,7 @@ import {
 import { buildLinuxLauncherManifest, ensureLinuxProductSetup } from '../src/linux-product-integration.mjs'
 import { launchLinuxNativeUi } from '../src/linux-native-ui.mjs'
 import { NearbyDuckingService } from '../src/nearby-ducking.mjs'
+import { isWindowsAutostartEnabled, setWindowsAutostart } from '../src/windows-autostart.mjs'
 import { createRewriteProvider } from '../src/rewrite-provider.mjs'
 import { resolveBundledHelperExecutable, resolveBundledSttConfig } from '../src/runtime-paths.mjs'
 import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
@@ -250,6 +251,7 @@ let macosOnboardingUiError = ''
 let macosOverlayProcess = null
 let macosOverlayEnabled = false
 let macosOverlayLastPayload = ''
+let windowsAutostartEnabled = false
 let windowsOverlayProcess = null
 let windowsOverlayEnabled = false
 let windowsOverlayLastPayload = ''
@@ -966,6 +968,17 @@ function buildDetailedControlMenu(options = {}) {
       submenu: sttPromptTemplateMenu
     },
     { type: 'separator' },
+    ...(process.platform === 'win32'
+      ? [{
+          label: 'Start at Login',
+          type: 'checkbox',
+          checked: windowsAutostartEnabled,
+          command: {
+            action: 'set_windows_autostart',
+            value: !windowsAutostartEnabled
+          }
+        }]
+      : []),
     {
       label: 'Improve Text',
       type: 'checkbox',
@@ -1348,6 +1361,9 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_rewrite_enabled':
       void updateRewriteEnabled(Boolean(command?.value))
+      break
+    case 'set_windows_autostart':
+      void updateWindowsAutostart(Boolean(command?.value))
       break
     case 'set_press_enter_after_insert':
       void updatePressEnterAfterInsert(Boolean(command?.value))
@@ -5114,6 +5130,40 @@ async function refreshRuntimeState(notify = false) {
   rebuildMenu()
 }
 
+async function refreshWindowsAutostartState() {
+  if (process.platform !== 'win32') {
+    return
+  }
+  windowsAutostartEnabled = await isWindowsAutostartEnabled().catch(() => false)
+}
+
+async function updateWindowsAutostart(value) {
+  if (process.platform !== 'win32') {
+    return
+  }
+
+  const enabled = Boolean(value)
+  const result = await setWindowsAutostart(enabled, {
+    packaged: app.isPackaged,
+    rootDir: path.resolve(__dirname, '..'),
+    execPath: process.execPath
+  }).catch((error) => ({ ok: false, reason: String(error?.message || error) }))
+
+  await refreshWindowsAutostartState()
+  rebuildMenu()
+
+  if (!result?.ok) {
+    void appendDiagnosticsLog('windows-autostart-error', {
+      requested: enabled,
+      reason: String(result?.reason || 'unknown')
+    })
+    showNotification(APP_NAME, `Could not ${enabled ? 'enable' : 'disable'} Start at Login.`)
+    return
+  }
+
+  showNotification(APP_NAME, `Start at Login is ${windowsAutostartEnabled ? 'enabled' : 'disabled'}.`)
+}
+
 async function updateRewriteEnabled(value) {
   if (Boolean(value) && rewriteProviderId() === 'none') {
     runtimeConfig.rewrite.provider = 'ollama'
@@ -7268,6 +7318,7 @@ if (!shouldExitEarly) {
     await setupLinuxProductIntegration().catch((error) => {
       console.error('[dictray] Linux product setup failed:', error?.message || error)
     })
+    await refreshWindowsAutostartState().catch(() => {})
     await initGnomePanelBridge().catch(() => {})
     await initLinuxNativeUiBridge().catch(() => {})
     await initMacosMenuBarBridge().catch((error) => {
