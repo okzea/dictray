@@ -29,6 +29,18 @@ function macosHeadlessLockPath() {
   return path.join(macosConfigHome(), 'dictray.lock')
 }
 
+function windowsAppDataHome() {
+  return String(process.env.APPDATA || '').trim() || path.join(os.homedir(), 'AppData', 'Roaming')
+}
+
+function windowsConfigHome() {
+  return path.join(windowsAppDataHome(), 'DicTray')
+}
+
+function windowsHeadlessLockPath() {
+  return path.join(windowsConfigHome(), 'dictray.lock')
+}
+
 function normalizeBooleanEnv(name) {
   return /^(1|true|yes)$/i.test(String(process.env[name] || '').trim())
 }
@@ -184,7 +196,38 @@ function isMacosHeadlessLockOwner(pid) {
   return commandLineReferencesDictrayMain(args)
 }
 
+function readWindowsProcessCommand(pid) {
+  if (process.platform !== 'win32') {
+    return ''
+  }
+  try {
+    const script = [
+      '$ErrorActionPreference = "SilentlyContinue"',
+      `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${Number(pid) || 0}"`,
+      'if ($p) { [Console]::Out.Write($p.CommandLine) }'
+    ].join('; ')
+    return readProcessOutput('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script])
+  } catch {
+    return ''
+  }
+}
+
+function isWindowsHeadlessLockOwner(pid) {
+  if (pid === process.pid) {
+    return true
+  }
+  if (process.platform !== 'win32') {
+    return false
+  }
+
+  const args = readWindowsProcessCommand(pid)
+  return commandLineReferencesDictrayMain(args)
+}
+
 function notifyExistingHeadlessInstance(pid) {
+  if (process.platform === 'win32') {
+    return
+  }
   try {
     process.kill(pid, 'SIGUSR1')
   } catch {
@@ -365,8 +408,31 @@ function copyTextToMacosClipboard(text) {
   }
 }
 
+function copyTextToWindowsClipboard(text) {
+  const value = String(text || '')
+  if (!value) {
+    return
+  }
+
+  try {
+    const child = ignoreSpawnAndStdinErrors(spawn('clip.exe', [], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      detached: true,
+      windowsHide: true
+    }))
+    child.stdin.end(value)
+    child.unref()
+  } catch {
+    // ignore clipboard fallback failure
+  }
+}
+
 function appleScriptString(value) {
   return `"${String(value || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+}
+
+function powershellSingleQuoted(value) {
+  return `'${String(value || '').replace(/'/g, "''")}'`
 }
 
 class HeadlessNotification {
@@ -404,6 +470,35 @@ class MacosNotification {
         '-e',
         `display notification ${appleScriptString(this.body || '')} with title ${appleScriptString(this.title)}`
       ])
+    } catch {
+      // ignore notification failures
+    }
+  }
+}
+
+class WindowsNotification {
+  constructor({ title = '', body = '' } = {}) {
+    this.title = String(title || '').trim() || 'DicTray'
+    this.body = String(body || '').trim()
+  }
+
+  static isSupported() {
+    return true
+  }
+
+  show() {
+    try {
+      const script = [
+        'Add-Type -AssemblyName System.Windows.Forms',
+        'Add-Type -AssemblyName System.Drawing',
+        '$n = New-Object System.Windows.Forms.NotifyIcon',
+        '$n.Icon = [System.Drawing.SystemIcons]::Application',
+        '$n.Visible = $true',
+        `$n.ShowBalloonTip(3500, ${powershellSingleQuoted(this.title)}, ${powershellSingleQuoted(this.body || '')}, [System.Windows.Forms.ToolTipIcon]::Info)`,
+        'Start-Sleep -Milliseconds 4200',
+        '$n.Dispose()'
+      ].join('; ')
+      spawnDetached('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script])
     } catch {
       // ignore notification failures
     }
@@ -728,12 +823,91 @@ function createMacosHeadlessApp() {
   return app
 }
 
+function createWindowsHeadlessApp() {
+  const emitter = new EventEmitter()
+  const lockPath = windowsHeadlessLockPath()
+  let exitRequested = false
+
+  const app = {
+    isPackaged: normalizeBooleanEnv('DICTATION_TRAY_PACKAGED'),
+    commandLine: {
+      appendSwitch() {}
+    },
+    setAppUserModelId() {},
+    requestSingleInstanceLock() {
+      return acquirePidLock(lockPath, {
+        requestExit: process.argv.includes('--dictray-exit-existing'),
+        isLockOwner: isWindowsHeadlessLockOwner
+      })
+    },
+    whenReady() {
+      return Promise.resolve()
+    },
+    on(eventName, listener) {
+      emitter.on(eventName, listener)
+      return app
+    },
+    once(eventName, listener) {
+      emitter.once(eventName, listener)
+      return app
+    },
+    emit(eventName, ...args) {
+      return emitter.emit(eventName, ...args)
+    },
+    quit() {
+      if (exitRequested) {
+        return
+      }
+      const event = {
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true
+        }
+      }
+      emitter.emit('before-quit', event)
+      if (event.defaultPrevented) {
+        return
+      }
+      exitRequested = true
+      releasePidLock(lockPath)
+      setImmediate(() => {
+        process.exit(0)
+      })
+    },
+    getPath(name) {
+      if (name === 'userData') {
+        return windowsConfigHome()
+      }
+      return windowsAppDataHome()
+    },
+    getVersion() {
+      return readPackageVersion()
+    }
+  }
+
+  process.on('exit', () => {
+    releasePidLock(lockPath)
+  })
+  process.on('SIGTERM', () => {
+    app.quit()
+  })
+  process.on('SIGINT', () => {
+    app.quit()
+  })
+
+  return app
+}
+
 export function isLinuxHeadlessHost() {
   return process.platform === 'linux'
 }
 
 export function isMacosHeadlessHost() {
   return process.platform === 'darwin'
+}
+
+export function isWindowsHeadlessHost() {
+  return process.platform === 'win32'
 }
 
 function createHeadlessRuntime({
@@ -799,6 +973,18 @@ function createHeadlessRuntime({
           } catch {
             // ignore
           }
+        } else if (process.platform === 'win32') {
+          try {
+            spawnDetached('powershell.exe', [
+              '-NoProfile',
+              '-ExecutionPolicy',
+              'Bypass',
+              '-Command',
+              `Start-Process -FilePath ${powershellSingleQuoted(String(targetPath || ''))}`
+            ])
+          } catch {
+            // ignore
+          }
         }
         return Promise.resolve('')
       }
@@ -810,6 +996,15 @@ function createHeadlessRuntime({
 }
 
 export async function loadHostRuntime() {
+  if (process.platform === 'win32') {
+    return createHeadlessRuntime({
+      app: createWindowsHeadlessApp(),
+      clipboardWriter: copyTextToWindowsClipboard,
+      NotificationClass: WindowsNotification,
+      mode: 'windows-headless'
+    })
+  }
+
   if (isLinuxHeadlessHost()) {
     return createHeadlessRuntime({
       app: createHeadlessApp(),

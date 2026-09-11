@@ -33,5 +33,11 @@
     "rewriteEnabled": false,
     "duckingEnabled": true,
     "duckingLevel": 0.3
+  },
+  "nearbyDucking": {
+    "enabled": false,
+    "sendEvents": true,
+    "receiveEvents": true,
+    "sharedSecret": ""
   }
 }

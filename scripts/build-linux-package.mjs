@@ -104,7 +104,14 @@ async function stagePackage(outputDir, version) {
   log('Copying packaged resources.')
   await cp(path.join(rootDir, 'gnome-panel-extension'), path.join(resourcesDir, 'gnome-panel-extension'), { recursive: true, force: true, dereference: true })
   await cp(path.join(rootDir, 'linux-native-ui'), path.join(resourcesDir, 'linux-native-ui'), { recursive: true, force: true, dereference: true })
-  await cp(bundledRuntimeRoot, path.join(resourcesDir, 'runtime'), { recursive: true, force: true, dereference: true })
+  await cp(bundledRuntimeRoot, path.join(resourcesDir, 'runtime'), {
+    recursive: true,
+    force: true,
+    dereference: true,
+    // The CUDA wheels are ~2GB and useless without an NVIDIA GPU;
+    // scripts/setup-gpu-acceleration.mjs installs them on demand.
+    filter: (entry) => !path.relative(bundledRuntimeRoot, entry).split(path.sep).includes('nvidia')
+  })
 
   await writeFile(path.join(binDir, 'dictray'), launcherScript(), 'utf8')
   await chmod(path.join(binDir, 'dictray'), 0o755)

@@ -262,6 +262,9 @@ export async function ensureBundledSttRuntime(options = {}) {
   }
 
   function standalonePythonTriplet() {
+    if (process.platform === 'win32') {
+      return process.arch === 'x64' ? 'x86_64-pc-windows-msvc' : ''
+    }
     if (process.platform !== 'darwin') {
       return ''
     }
@@ -272,6 +275,10 @@ export async function ensureBundledSttRuntime(options = {}) {
       return 'x86_64-apple-darwin'
     }
     return ''
+  }
+
+  function standalonePythonRelativeBin() {
+    return IS_WIN ? VENV_PYTHON_NAME : VENV_PYTHON_REL
   }
 
   function standalonePythonUrl() {
@@ -319,13 +326,14 @@ export async function ensureBundledSttRuntime(options = {}) {
       env
     })
 
+    const pythonRelativeBin = standalonePythonRelativeBin()
     const installRootCandidates = [
       path.join(extractRoot, 'python', 'install'),
       path.join(extractRoot, 'python')
     ]
-    const installRoot = installRootCandidates.find((candidate) => existsSync(path.join(candidate, VENV_PYTHON_REL))) || ''
+    const installRoot = installRootCandidates.find((candidate) => existsSync(path.join(candidate, pythonRelativeBin))) || ''
     if (!installRoot) {
-      throw new Error(`Standalone Python archive did not contain ${VENV_PYTHON_REL}.`)
+      throw new Error(`Standalone Python archive did not contain ${pythonRelativeBin}.`)
     }
 
     await rm(autoPythonRoot, { recursive: true, force: true })
@@ -337,7 +345,7 @@ export async function ensureBundledSttRuntime(options = {}) {
     await rm(extractRoot, { recursive: true, force: true })
     await assertPortableRuntime(autoPythonRoot)
 
-    const pythonExe = path.join(autoPythonRoot, VENV_PYTHON_REL)
+    const pythonExe = path.join(autoPythonRoot, pythonRelativeBin)
     log('Installing bundled STT Python dependencies.')
     await run(pythonExe, ['-m', 'pip', 'install', '--upgrade', 'pip', 'setuptools', 'wheel'], {
       cwd: rootDir,
@@ -350,7 +358,7 @@ export async function ensureBundledSttRuntime(options = {}) {
 
     return {
       sourceRoot: autoPythonRoot,
-      relativePythonBin: VENV_PYTHON_REL,
+      relativePythonBin: pythonRelativeBin,
       sourceType: 'standalone-python'
     }
   }

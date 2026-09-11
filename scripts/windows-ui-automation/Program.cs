@@ -982,8 +982,37 @@ internal static class UiAutomationActions
 
         SetFocus(window, target);
         System.Threading.Thread.Sleep(FocusSettleDelayMs);
+
+        // SendKeys.SendWait drives a journal playback hook that only completes
+        // when the calling thread pumps messages. This helper is a console STA
+        // host with no message loop, so SendWait blocks until the caller times
+        // out. Tap well-known keys directly instead, the way PasteText already
+        // synthesises Ctrl+V.
+        var trimmed = text.Trim();
+        if (SpecialKeyCodes.TryGetValue(trimmed, out var virtualKey))
+        {
+            keybd_event(virtualKey, 0, 0, UIntPtr.Zero);
+            keybd_event(virtualKey, 0, KeyeventfKeyup, UIntPtr.Zero);
+            return;
+        }
+
         System.Windows.Forms.SendKeys.SendWait(text);
     }
+
+    private static readonly Dictionary<string, ushort> SpecialKeyCodes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["{ENTER}"] = 0x0D,
+        ["{RETURN}"] = 0x0D,
+        ["{TAB}"] = 0x09,
+        ["{ESC}"] = 0x1B,
+        ["{ESCAPE}"] = 0x1B,
+        ["{BACKSPACE}"] = 0x08,
+        ["{DELETE}"] = 0x2E,
+        ["{UP}"] = 0x26,
+        ["{DOWN}"] = 0x28,
+        ["{LEFT}"] = 0x25,
+        ["{RIGHT}"] = 0x27
+    };
 
     private static void ExpandCollapse(WindowMatch window, AutomationElement target, bool expand)
     {

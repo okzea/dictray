@@ -14,9 +14,56 @@ import tempfile
 import threading
 import time
 import wave
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
+
+
+def _register_bundled_cuda_libraries() -> None:
+    """Make pip-installed NVIDIA runtime libraries loadable.
+
+    CTranslate2 resolves cuBLAS/cuDNN through its own loader call, which honours
+    PATH (Windows) or LD_LIBRARY_PATH (Linux) but not os.add_dll_directory, so
+    the wheel library directories have to be registered before ctranslate2 is
+    imported. The wheels ship them under nvidia/*/bin on Windows and
+    nvidia/*/lib elsewhere.
+    """
+    try:
+        import sysconfig
+
+        site_dir = sysconfig.get_paths().get("purelib") or ""
+    except Exception:
+        return
+    if not site_dir:
+        return
+
+    nvidia_root = os.path.join(site_dir, "nvidia")
+    if not os.path.isdir(nvidia_root):
+        return
+
+    is_windows = os.name == "nt"
+    lib_subdir = "bin" if is_windows else "lib"
+    path_var = "PATH" if is_windows else "LD_LIBRARY_PATH"
+
+    discovered = []
+    try:
+        for entry in sorted(os.listdir(nvidia_root)):
+            lib_dir = os.path.join(nvidia_root, entry, lib_subdir)
+            if os.path.isdir(lib_dir):
+                discovered.append(lib_dir)
+                if is_windows:
+                    try:
+                        os.add_dll_directory(lib_dir)
+                    except Exception:
+                        pass
+    except Exception:
+        return
+
+    if discovered:
+        os.environ[path_var] = os.pathsep.join(discovered + [os.environ.get(path_var, "")])
+
+
+_register_bundled_cuda_libraries()
 
 try:
     import ctranslate2
@@ -180,6 +227,7 @@ def decode_audio_to_wav(raw_path: Path, wav_path: Path) -> None:
         check=True,
         capture_output=True,
         text=True,
+        timeout=60,
     )
 
 
@@ -628,8 +676,14 @@ class Handler(BaseHTTPRequestHandler):
                 next_key = resolved_runtime_cache_key(command)
                 current_key = runtime_cache_key(current) if current else None
                 if current_key != next_key:
-                    clear_model_cache()
-                    set_active_runtime(None)
+                    # Under ThreadingHTTPServer this can now run while another
+                    # thread is inside model.transcribe(). Dropping the last
+                    # reference to a WhisperModel finalises the native
+                    # CTranslate2 translator mid-inference, so evict only while
+                    # holding the same lock the transcribe path takes.
+                    with TRANSCRIBE_LOCK:
+                        clear_model_cache()
+                        set_active_runtime(None)
                 # Apply the requested runtime settings by warming with the new config
                 payload = warm_runtime(command)
                 payload["availableDevices"] = ["cpu", "cuda"] if cuda_device_count() > 0 else ["cpu"]
@@ -647,7 +701,8 @@ def main() -> int:
     parser.add_argument("--port", default="4591")
     args = parser.parse_args()
 
-    server = HTTPServer((args.host, int(args.port)), Handler)
+    server = ThreadingHTTPServer((args.host, int(args.port)), Handler)
+    server.daemon_threads = True
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:  # pragma: no cover - manual shutdown path

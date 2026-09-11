@@ -23,6 +23,21 @@ const helperProjects = [
     name: 'windows-system-volume',
     projectPath: path.join(rootDir, 'scripts', 'windows-system-volume', 'WindowsSystemVolume.csproj'),
     exeName: 'WindowsSystemVolume.exe'
+  },
+  {
+    name: 'windows-native-capture',
+    projectPath: path.join(rootDir, 'scripts', 'windows-native-capture', 'WindowsNativeCapture.csproj'),
+    exeName: 'WindowsNativeCapture.exe'
+  },
+  {
+    name: 'windows-tray-host',
+    projectPath: path.join(rootDir, 'scripts', 'windows-tray-host', 'WindowsTrayHost.csproj'),
+    exeName: 'WindowsTrayHost.exe'
+  },
+  {
+    name: 'windows-voice-overlay',
+    projectPath: path.join(rootDir, 'scripts', 'windows-voice-overlay', 'WindowsVoiceOverlay.csproj'),
+    exeName: 'WindowsVoiceOverlay.exe'
   }
 ]
 
@@ -63,7 +78,10 @@ function dedupe(values) {
 }
 
 function hasCommand(command) {
-  const result = spawnSync('which', [command], {
+  // `which` does not exist on Windows, so the dotnet probe reported no SDK and
+  // silently skipped every helper build while still declaring the bundle ready.
+  const finder = process.platform === 'win32' ? 'where.exe' : 'which'
+  const result = spawnSync(finder, [command], {
     encoding: 'utf8',
     stdio: ['ignore', 'ignore', 'ignore']
   })

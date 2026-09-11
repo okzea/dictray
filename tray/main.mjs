@@ -1,11 +1,11 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync, watch as fsWatch, writeFileSync } from 'node:fs'
-import { access, appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises'
+import { access, appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
-import { isLinuxHeadlessHost, loadHostRuntime } from '../src/host-runtime.mjs'
+import { isLinuxHeadlessHost, isWindowsHeadlessHost, loadHostRuntime } from '../src/host-runtime.mjs'
 import { loadConfig, normalizeRewriteProviderId } from '../src/config.mjs'
 import { createCaptureBridge } from '../src/capture-bridge.mjs'
 import { createEarconPlayer } from '../src/earcon-player.mjs'
@@ -21,6 +21,9 @@ import {
 } from '../src/capture-protocol.mjs'
 import { buildLinuxLauncherManifest, ensureLinuxProductSetup } from '../src/linux-product-integration.mjs'
 import { launchLinuxNativeUi } from '../src/linux-native-ui.mjs'
+import { NearbyDuckingService } from '../src/nearby-ducking.mjs'
+import { isWindowsAutostartEnabled, setWindowsAutostart } from '../src/windows-autostart.mjs'
+import { checkForUpdate, releasesPageUrl } from '../src/update-check.mjs'
 import { createRewriteProvider } from '../src/rewrite-provider.mjs'
 import { resolveBundledHelperExecutable, resolveBundledSttConfig } from '../src/runtime-paths.mjs'
 import { normalizeSpeechTranscript } from '../src/speech-lexicon.mjs'
@@ -53,6 +56,7 @@ const {
 } = HOST_RUNTIME
 const LINUX_HEADLESS_HOST = HOST_RUNTIME.headless === true && isLinuxHeadlessHost()
 const MACOS_HEADLESS_HOST = HOST_RUNTIME.headless === true && process.platform === 'darwin'
+const WINDOWS_HEADLESS_HOST = HOST_RUNTIME.headless === true && isWindowsHeadlessHost()
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 if (process.platform === 'linux') {
@@ -90,6 +94,17 @@ const MACOS_OVERLAY_DIR = path.join(os.homedir(), 'Library', 'Application Suppor
 const MACOS_OVERLAY_STATE_PATH = path.join(MACOS_OVERLAY_DIR, 'status.json')
 const MACOS_OVERLAY_HELPER = path.join(__dirname, '..', 'scripts', 'macos-voice-overlay')
 const MACOS_MENU_POLL_INTERVAL_MS = 500
+const WINDOWS_APPDATA_HOME = String(process.env.APPDATA || '').trim() || path.join(os.homedir(), 'AppData', 'Roaming')
+const WINDOWS_TRAY_DIR = path.join(WINDOWS_APPDATA_HOME, 'DicTray', 'tray')
+const WINDOWS_OVERLAY_DIR = path.join(WINDOWS_APPDATA_HOME, 'DicTray', 'overlay')
+const WINDOWS_OVERLAY_STATE_PATH = path.join(WINDOWS_OVERLAY_DIR, 'status.json')
+const WINDOWS_OVERLAY_HELPER = resolveBundledHelperExecutable('windows-voice-overlay', 'WindowsVoiceOverlay.exe')
+  || path.join(__dirname, '..', 'scripts', 'windows-voice-overlay', 'bin', 'Release', 'net10.0-windows', 'WindowsVoiceOverlay.exe')
+const WINDOWS_TRAY_STATE_PATH = path.join(WINDOWS_TRAY_DIR, 'status.json')
+const WINDOWS_TRAY_COMMAND_PATH = path.join(WINDOWS_TRAY_DIR, 'command.json')
+const WINDOWS_TRAY_HELPER = resolveBundledHelperExecutable('windows-tray-host', 'WindowsTrayHost.exe')
+  || path.join(__dirname, '..', 'scripts', 'windows-tray-host', 'bin', 'Release', 'net10.0-windows', 'WindowsTrayHost.exe')
+const WINDOWS_TRAY_POLL_INTERVAL_MS = 500
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const SHORTCUT_MODE_TOGGLE = 'toggle'
@@ -147,6 +162,7 @@ const STT_DEVICE_GPU = 'gpu'
 const STT_MODEL_TINY = 'tiny'
 const STT_MODEL_MIDDLE = 'middle'
 const STT_MODEL_ADVANCED = 'advanced'
+const STT_MODEL_PRECISE = 'precise'
 const SPEECH_EFFORT_LOW = 'low'
 const SPEECH_EFFORT_MID = 'mid'
 const SPEECH_EFFORT_HIGH = 'high'
@@ -162,6 +178,8 @@ const HOTKEY_BRIDGE_MAX_RESTARTS = 20
 const VOICE_OVERLAY_WIDTH = 292
 const VOICE_OVERLAY_HEIGHT = 78
 const VOICE_OVERLAY_MARGIN = 18
+const VOLUME_DUCK_DELAY_MS = 260
+const UPDATE_CHECK_STARTUP_DELAY_MS = 15000
 const VOICE_OVERLAY_GAP = 14
 const VOICE_OVERLAY_IDLE_HIDE_DELAY_MS = 1800
 const VOICE_STATE_NOTICE_CLEAR_DELAY_MS = 2200
@@ -177,6 +195,7 @@ let runtimeConfig = null
 let speech = null
 let rewriteProvider = null
 let systemVolume = null
+let nearbyDucking = null
 let uiAutomation = null
 let captureBridge = null
 let earconPlayer = null
@@ -234,11 +253,23 @@ let macosOnboardingUiError = ''
 let macosOverlayProcess = null
 let macosOverlayEnabled = false
 let macosOverlayLastPayload = ''
+let windowsAutostartEnabled = false
+let availableUpdateVersion = ''
+let windowsOverlayProcess = null
+let windowsOverlayEnabled = false
+let windowsOverlayLastPayload = ''
+let windowsTrayProcess = null
+let windowsTrayPollTimer = null
+let windowsTrayCommandWatcher = null
+let windowsTrayCommandProcessing = false
+let windowsTrayBridgeEnabled = false
 let trayHotkey = DEFAULT_HOTKEY
 let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
 let duckingEnabled = true
 let duckingLevel = 0.3
+let nearbyDuckingEnabled = false
+let nearbyDuckingSharedSecret = ''
 let pressEnterAfterInsert = false
 let activePressEnterAfterInsert = false
 let shortcutMode = SHORTCUT_MODE_TOGGLE
@@ -297,6 +328,8 @@ let lastSttDiagnosticSignature = ''
 let lastSttHealthLogSignature = ''
 let volumeDuckState = null
 let volumeDuckSessionId = 0
+let nearbyRemoteDuckState = null
+let nearbyRemoteRestoreTimer = null
 let dailyCharacterStats = {
   days: {}
 }
@@ -879,6 +912,47 @@ function buildDetailedControlMenu(options = {}) {
         ...duckingLevelMenu
       ]
     },
+    {
+      label: 'Nearby Ducking',
+      submenu: [
+        {
+          label: nearbyDuckingStatusLabel(),
+          enabled: false
+        },
+        {
+          label: 'Enable Nearby Ducking',
+          type: 'checkbox',
+          checked: nearbyDuckingEnabled,
+          command: {
+            action: 'set_nearby_ducking_enabled',
+            value: !nearbyDuckingEnabled
+          }
+        },
+        { type: 'separator' },
+        {
+          label: 'Show Pairing Code',
+          command: {
+            action: 'start_nearby_pairing'
+          }
+        },
+        {
+          label: 'Connect with Code',
+          command: {
+            action: 'connect_nearby_pairing'
+          }
+        },
+        ...(nearbyDuckingSharedSecret
+          ? [{
+              type: 'separator'
+            }, {
+              label: 'Forget Paired Device',
+              command: {
+                action: 'forget_nearby_pairing'
+              }
+            }]
+          : [])
+      ]
+    },
     { type: 'separator' },
     {
       label: 'Input Source',
@@ -897,6 +971,17 @@ function buildDetailedControlMenu(options = {}) {
       submenu: sttPromptTemplateMenu
     },
     { type: 'separator' },
+    ...(process.platform === 'win32'
+      ? [{
+          label: 'Start at Login',
+          type: 'checkbox',
+          checked: windowsAutostartEnabled,
+          command: {
+            action: 'set_windows_autostart',
+            value: !windowsAutostartEnabled
+          }
+        }]
+      : []),
     {
       label: 'Improve Text',
       type: 'checkbox',
@@ -980,6 +1065,14 @@ function buildDetailedControlMenu(options = {}) {
       label: quickStartMenuLabel,
       command: {
         action: 'open_quick_start'
+      }
+    },
+    {
+      label: availableUpdateVersion
+        ? `Update Available (${availableUpdateVersion})`
+        : 'Check for Updates',
+      command: {
+        action: 'check_for_updates'
       }
     },
     { type: 'separator' },
@@ -1068,6 +1161,26 @@ function buildGnomePanelPreferencesPayload() {
         action: 'set_ducking_enabled',
         value: !duckingEnabled
       }
+    },
+    nearbyDucking: {
+      enabled: nearbyDuckingEnabled,
+      paired: Boolean(nearbyDuckingSharedSecret),
+      status: nearbyDuckingStatusLabel(),
+      enabledCommand: {
+        action: 'set_nearby_ducking_enabled',
+        value: !nearbyDuckingEnabled
+      },
+      hostCommand: {
+        action: 'start_nearby_pairing'
+      },
+      connectCommand: {
+        action: 'connect_nearby_pairing'
+      },
+      forgetCommand: nearbyDuckingSharedSecret
+        ? {
+            action: 'forget_nearby_pairing'
+          }
+        : null
     },
     stt: {
       supported: sttPreferences.supported,
@@ -1224,6 +1337,10 @@ let gnomePanelCommandProcessing = false
 
 async function handleExternalMenuCommand(command = {}) {
   const action = String(command?.action || '').trim()
+  void appendDiagnosticsLog('external-menu-command', {
+    action,
+    hasValue: command?.value !== undefined
+  })
 
   switch (action) {
     case 'toggle': {
@@ -1256,6 +1373,12 @@ async function handleExternalMenuCommand(command = {}) {
     case 'set_rewrite_enabled':
       void updateRewriteEnabled(Boolean(command?.value))
       break
+    case 'set_windows_autostart':
+      void updateWindowsAutostart(Boolean(command?.value))
+      break
+    case 'check_for_updates':
+      void runUpdateCheck({ announce: true })
+      break
     case 'set_press_enter_after_insert':
       void updatePressEnterAfterInsert(Boolean(command?.value))
       break
@@ -1270,6 +1393,18 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_ducking_level':
       void updateDuckingLevel(command?.value)
+      break
+    case 'set_nearby_ducking_enabled':
+      void updateNearbyDuckingEnabled(Boolean(command?.value))
+      break
+    case 'start_nearby_pairing':
+      void startNearbyDuckingPairingHost()
+      break
+    case 'connect_nearby_pairing':
+      void connectNearbyDuckingPairing()
+      break
+    case 'forget_nearby_pairing':
+      void forgetNearbyDuckingPairing()
       break
     case 'switch_rewrite_model':
       if (String(command?.value || '').trim()) {
@@ -1591,6 +1726,7 @@ function stopMacosMenuBarBridge() {
   }
   macosOverlayProcess = null
   macosOverlayEnabled = false
+  stopWindowsVoiceOverlayBridge()
   macosOverlayLastPayload = ''
   macosMenuBridgeEnabled = false
 
@@ -1606,6 +1742,171 @@ function stopMacosMenuBarBridge() {
   }
   try {
     writeFileSync(MACOS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+  try {
+    if (process.platform === 'win32') {
+      writeFileSync(WINDOWS_OVERLAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+    }
+  } catch {
+    // best-effort — the process is exiting
+  }
+}
+
+function buildWindowsTrayPayload() {
+  const payload = buildGnomePanelPayload()
+  return {
+    ...payload,
+    platform: 'win32',
+    menu: buildDetailedControlMenu()
+  }
+}
+
+async function syncWindowsTrayState() {
+  if (!windowsTrayBridgeEnabled) {
+    return
+  }
+  try {
+    // Write and rename so the polling helper never reads a partial payload.
+    const tempPath = `${WINDOWS_TRAY_STATE_PATH}.tmp`
+    await writeFile(tempPath, JSON.stringify(buildWindowsTrayPayload()), { encoding: 'utf8' })
+    await rename(tempPath, WINDOWS_TRAY_STATE_PATH)
+  } catch (error) {
+    void appendDiagnosticsLog('tray-sync-error', {
+      error: String(error?.message || error)
+    })
+  }
+}
+
+async function processWindowsTrayCommand() {
+  if (!windowsTrayBridgeEnabled || windowsTrayCommandProcessing) {
+    return
+  }
+  windowsTrayCommandProcessing = true
+  try {
+    let rawCommand = ''
+    try {
+      rawCommand = await readFile(WINDOWS_TRAY_COMMAND_PATH, 'utf8')
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        console.error('[dictray] Failed to read Windows tray command file:', error?.message || error)
+      }
+      return
+    }
+    await unlink(WINDOWS_TRAY_COMMAND_PATH).catch(() => {})
+    if (!String(rawCommand || '').trim()) {
+      return
+    }
+
+    let command = {}
+    try {
+      command = JSON.parse(String(rawCommand || '').trim())
+    } catch {
+      return
+    }
+    await handleExternalMenuCommand(command)
+  } finally {
+    windowsTrayCommandProcessing = false
+  }
+}
+
+async function initWindowsTrayBridge() {
+  if (process.platform !== 'win32') {
+    return false
+  }
+
+  try {
+    await mkdir(WINDOWS_TRAY_DIR, { recursive: true })
+    await access(WINDOWS_TRAY_HELPER)
+  } catch (error) {
+    console.error('[dictray] Windows tray helper is unavailable:', error?.message || error)
+    return false
+  }
+
+  windowsTrayBridgeEnabled = true
+  await syncWindowsTrayState()
+
+  if (!windowsTrayProcess || windowsTrayProcess.killed) {
+    try {
+      windowsTrayProcess = spawn(WINDOWS_TRAY_HELPER, [WINDOWS_TRAY_STATE_PATH, WINDOWS_TRAY_COMMAND_PATH, APP_ICON_ICO_PATH], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        windowsHide: true
+      })
+      if (windowsTrayProcess.stderr) {
+        const stderr = readline.createInterface({ input: windowsTrayProcess.stderr })
+        stderr.on('line', (line) => {
+          const message = String(line || '').trim()
+          if (message) {
+            console.error(`[dictray] Windows tray helper: ${message}`)
+          }
+        })
+      }
+      const helper = windowsTrayProcess
+      helper.on('exit', (code) => {
+        if (windowsTrayProcess === helper) {
+          windowsTrayProcess = null
+        }
+        if (!isQuitting) {
+          console.error(`[dictray] Windows tray helper exited with code ${code ?? 0}.`)
+        }
+      })
+      helper.on('error', (error) => {
+        if (windowsTrayProcess === helper) {
+          windowsTrayProcess = null
+        }
+        console.error('[dictray] Failed to start Windows tray helper:', error?.message || error)
+      })
+    } catch (error) {
+      console.error('[dictray] Failed to launch Windows tray helper:', error?.message || error)
+      windowsTrayBridgeEnabled = false
+      return false
+    }
+  }
+
+  if (!windowsTrayPollTimer) {
+    windowsTrayPollTimer = setInterval(() => {
+      void processWindowsTrayCommand().catch(() => {})
+    }, WINDOWS_TRAY_POLL_INTERVAL_MS)
+  }
+
+  if (!windowsTrayCommandWatcher) {
+    try {
+      windowsTrayCommandWatcher = fsWatch(WINDOWS_TRAY_DIR, { persistent: false }, (_eventType, filename) => {
+        if (filename === path.basename(WINDOWS_TRAY_COMMAND_PATH)) {
+          void processWindowsTrayCommand().catch(() => {})
+        }
+      })
+      windowsTrayCommandWatcher.on('error', () => {})
+    } catch {
+      windowsTrayCommandWatcher = null
+    }
+  }
+
+  return true
+}
+
+function stopWindowsTrayBridge() {
+  if (windowsTrayPollTimer) {
+    clearInterval(windowsTrayPollTimer)
+    windowsTrayPollTimer = null
+  }
+  if (windowsTrayCommandWatcher) {
+    windowsTrayCommandWatcher.close()
+    windowsTrayCommandWatcher = null
+  }
+  if (windowsTrayProcess && !windowsTrayProcess.killed) {
+    try {
+      windowsTrayProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  windowsTrayProcess = null
+  windowsTrayBridgeEnabled = false
+
+  try {
+    writeFileSync(WINDOWS_TRAY_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
   } catch {
     // best-effort — the process is exiting
   }
@@ -1911,11 +2212,14 @@ function normalizeSttModelPreference(value) {
   if (lowered === STT_MODEL_ADVANCED || lowered === 'small' || lowered === 'small.en') {
     return STT_MODEL_ADVANCED
   }
+  if (lowered === STT_MODEL_PRECISE || lowered === 'distil' || lowered === 'distil-large-v3.5') {
+    return STT_MODEL_PRECISE
+  }
   return ''
 }
 
 function sttModelPreferenceOptions() {
-  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED]
+  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED, STT_MODEL_PRECISE]
 }
 
 function sttModelNameForPreference(value) {
@@ -1926,6 +2230,8 @@ function sttModelNameForPreference(value) {
       return 'base.en'
     case STT_MODEL_ADVANCED:
       return 'small.en'
+    case STT_MODEL_PRECISE:
+      return 'distil-large-v3.5'
     default:
       return ''
   }
@@ -1967,6 +2273,7 @@ function speechEffortForModel(value) {
     case STT_MODEL_TINY:
       return SPEECH_EFFORT_LOW
     case STT_MODEL_ADVANCED:
+    case STT_MODEL_PRECISE:
       return SPEECH_EFFORT_HIGH
     case STT_MODEL_MIDDLE:
     default:
@@ -2106,7 +2413,10 @@ function maybePlayCaptureEarcon(kind) {
   if (captureBackendId() !== 'native' || !earconPlayer) {
     return
   }
-  void earconPlayer.play(normalizedKind).catch((error) => {
+  void earconPlayer.play(normalizedKind).then((result) => {
+    void appendDiagnosticsLog('earcon-result', { kind: normalizedKind, result: result || null })
+  }).catch((error) => {
+    void appendDiagnosticsLog('earcon-error', { kind: normalizedKind, error: String(error?.message || error) })
     console.error('[dictray] Failed to play earcon:', error?.message || error)
   })
 }
@@ -2245,6 +2555,11 @@ function cancelActiveSubmission(reason = 'Dictation was cancelled by a new push-
 }
 
 async function cancelDictationCapture(reason = 'Dictation was cancelled.') {
+  void appendDiagnosticsLog('cancel-requested', {
+    reason: String(reason || ''),
+    phase: voiceState.phase,
+    captureRecordingPhase
+  })
   let cancelled = cancelActiveSubmission(reason)
 
   if (
@@ -2428,10 +2743,6 @@ function computeVoiceOverlayBounds(state = voiceState) {
 
   let x = workArea.x + Math.round((workArea.width - VOICE_OVERLAY_WIDTH) / 2)
   let y = workArea.y + workArea.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
-  if (windowBounds && process.platform === 'win32') {
-    x = windowBounds.left + Math.round((windowBounds.width - VOICE_OVERLAY_WIDTH) / 2)
-    y = windowBounds.top + windowBounds.height - VOICE_OVERLAY_HEIGHT - VOICE_OVERLAY_MARGIN
-  }
 
   return {
     x: clampOverlayAxis(x, workArea.x, workArea.width, VOICE_OVERLAY_WIDTH),
@@ -2549,6 +2860,7 @@ function syncVoiceInputLevel(level = 0) {
     scheduleGnomePanelStateSync(GNOME_PANEL_LEVEL_SYNC_MS)
   }
   void syncMacosOverlayState()
+  void syncWindowsOverlayState()
 
   if (!voiceWindow || voiceWindow.isDestroyed() || voiceWindow.webContents.isDestroyed()) {
     return
@@ -2560,6 +2872,13 @@ function syncVoiceInputLevel(level = 0) {
 }
 
 function syncVoiceOverlay() {
+  if (process.platform === 'win32') {
+    clearVoiceOverlayHideTimer()
+    void refreshVoiceOverlayFocusedBounds()
+    void syncWindowsOverlayState({ force: true })
+    return
+  }
+
   if (process.platform === 'darwin') {
     clearVoiceOverlayHideTimer()
     void refreshVoiceOverlayFocusedBounds()
@@ -2695,6 +3014,145 @@ async function syncMacosOverlayState({ force = false } = {}) {
     await writeFile(MACOS_OVERLAY_STATE_PATH, serialized, { encoding: 'utf8' })
   } catch (error) {
     console.error('[dictray] Failed to sync macOS overlay state:', error?.message || error)
+  }
+}
+
+// Windows apps routinely put document content in the window title - an unsaved
+// Notepad buffer is titled with its own first line - so the overlay shows just
+// the owning process instead of echoing the text back at the speaker.
+function windowsOverlayTargetLabel(value) {
+  const text = String(value || '').trim()
+  if (text.endsWith(')')) {
+    const open = text.lastIndexOf(' (')
+    if (open > 0) {
+      const processName = text.slice(open + 2, -1).trim()
+      if (processName) {
+        return processName
+      }
+    }
+  }
+  return text
+}
+
+function stopWindowsVoiceOverlayBridge() {
+  if (windowsOverlayProcess && !windowsOverlayProcess.killed) {
+    try {
+      windowsOverlayProcess.kill()
+    } catch {
+      // ignore
+    }
+  }
+  windowsOverlayProcess = null
+  windowsOverlayEnabled = false
+  windowsOverlayLastPayload = ''
+}
+
+function buildWindowsOverlayPayload() {
+  const payload = buildVoiceOverlayPayload()
+  const windowBounds = resolveVoiceOverlayWindowBounds()
+  return {
+    ...payload,
+    targetWindow: compactText(windowsOverlayTargetLabel(payload.targetWindow), 70),
+    platform: 'win32',
+    inputLevel: Number(gnomePanelInputLevel.toFixed(3)),
+    // The host-runtime screen shim reports a fixed 1920x1080 display, so overlay
+    // placement is resolved by the helper against real screen metrics instead.
+    windowBounds: windowBounds
+      ? {
+          left: Math.round(windowBounds.left),
+          top: Math.round(windowBounds.top),
+          width: Math.round(windowBounds.width),
+          height: Math.round(windowBounds.height)
+        }
+      : null,
+    size: { width: VOICE_OVERLAY_WIDTH, height: VOICE_OVERLAY_HEIGHT },
+    margin: VOICE_OVERLAY_MARGIN,
+    updatedAt: Date.now()
+  }
+}
+
+async function syncWindowsOverlayState({ force = false } = {}) {
+  if (process.platform !== 'win32' || !windowsOverlayEnabled) {
+    return
+  }
+  const payload = buildWindowsOverlayPayload()
+  const serialized = JSON.stringify(payload)
+  // updatedAt changes on every build, so the dedup key ignores it.
+  const { updatedAt: _updatedAt, ...dedupPayload } = payload
+  const dedupKey = JSON.stringify(dedupPayload)
+  if (!force && dedupKey === windowsOverlayLastPayload) {
+    return
+  }
+  windowsOverlayLastPayload = dedupKey
+  try {
+    // Write through a temporary file and rename over the target. A plain write is
+    // not atomic, so the helper polling this path could observe a truncated
+    // payload, and its read would collide with the next write during a turn.
+    const tempPath = `${WINDOWS_OVERLAY_STATE_PATH}.tmp`
+    await writeFile(tempPath, serialized, { encoding: 'utf8' })
+    await rename(tempPath, WINDOWS_OVERLAY_STATE_PATH)
+  } catch (error) {
+    void appendDiagnosticsLog('overlay-sync-error', {
+      error: String(error?.message || error)
+    })
+  }
+}
+
+async function initWindowsVoiceOverlayBridge() {
+  if (process.platform !== 'win32') {
+    return false
+  }
+  try {
+    await access(WINDOWS_OVERLAY_HELPER)
+  } catch {
+    console.error(`[dictray] Missing Windows overlay helper: ${WINDOWS_OVERLAY_HELPER}`)
+    return false
+  }
+  try {
+    await mkdir(WINDOWS_OVERLAY_DIR, { recursive: true })
+  } catch (error) {
+    console.error('[dictray] Failed to prepare Windows overlay state directory:', error?.message || error)
+    return false
+  }
+
+  windowsOverlayEnabled = true
+  await syncWindowsOverlayState({ force: true })
+  if (windowsOverlayProcess && !windowsOverlayProcess.killed) {
+    return true
+  }
+
+  try {
+    // stdin stays open so the helper exits on EOF if the tray dies without
+    // writing a quit payload; a Node child is not reaped with its parent on
+    // Windows, and an orphan would keep an always-on-top window alive.
+    windowsOverlayProcess = spawn(WINDOWS_OVERLAY_HELPER, [WINDOWS_OVERLAY_STATE_PATH], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+      windowsHide: true
+    })
+    const stderr = readline.createInterface({ input: windowsOverlayProcess.stderr })
+    stderr.on('line', (line) => {
+      const message = String(line || '').trim()
+      if (message) {
+        console.error(`[dictray] Windows overlay: ${message}`)
+      }
+    })
+    const helper = windowsOverlayProcess
+    helper.on('exit', () => {
+      if (windowsOverlayProcess === helper) {
+        windowsOverlayProcess = null
+      }
+    })
+    helper.on('error', (error) => {
+      console.error('[dictray] Windows overlay helper failed:', error?.message || error)
+      if (windowsOverlayProcess === helper) {
+        windowsOverlayProcess = null
+      }
+    })
+    return true
+  } catch (error) {
+    console.error('[dictray] Failed to launch Windows overlay helper:', error?.message || error)
+    windowsOverlayProcess = null
+    return false
   }
 }
 
@@ -3275,6 +3733,8 @@ async function loadTraySettings() {
   rewriteEnabled = normalizeRewriteEnabled(runtimeConfig?.dictation?.rewriteEnabled)
   duckingEnabled = normalizeDuckingEnabled(runtimeConfig?.dictation?.duckingEnabled)
   duckingLevel = normalizeDuckingLevel(runtimeConfig?.dictation?.duckingLevel)
+  nearbyDuckingEnabled = Boolean(runtimeConfig?.nearbyDucking?.enabled)
+  nearbyDuckingSharedSecret = String(runtimeConfig?.nearbyDucking?.sharedSecret || '').trim()
   if (!hotkeyManagedByEnv()) {
     trayHotkey = normalizeTrayHotkey(parsed?.hotkey)
   }
@@ -3289,6 +3749,12 @@ async function loadTraySettings() {
   }
   if (parsed?.duckingLevel !== undefined) {
     duckingLevel = normalizeDuckingLevel(parsed?.duckingLevel)
+  }
+  if (parsed?.nearbyDuckingEnabled !== undefined) {
+    nearbyDuckingEnabled = Boolean(parsed?.nearbyDuckingEnabled)
+  }
+  if (parsed?.nearbyDuckingSharedSecret !== undefined) {
+    nearbyDuckingSharedSecret = String(parsed?.nearbyDuckingSharedSecret || '').trim()
   }
   if (parsed?.pressEnterAfterInsert !== undefined) {
     pressEnterAfterInsert = Boolean(parsed?.pressEnterAfterInsert)
@@ -3309,6 +3775,8 @@ async function saveTraySettings() {
     rewriteEnabled,
     duckingEnabled,
     duckingLevel,
+    nearbyDuckingEnabled,
+    nearbyDuckingSharedSecret: nearbyDuckingSharedSecret || undefined,
     pressEnterAfterInsert,
     shortcutMode,
     promptHotkey: promptTrayHotkey,
@@ -3456,6 +3924,11 @@ async function ensureVoiceWindow() {
       console.error('[dictray] macOS overlay setup failed:', error?.message || error)
     })
   }
+  if (process.platform === 'win32') {
+    await initWindowsVoiceOverlayBridge().catch((error) => {
+      console.error('[dictray] Windows overlay setup failed:', error?.message || error)
+    })
+  }
   return null
 }
 
@@ -3467,6 +3940,12 @@ async function openInputSourceWindow() {
   if (process.platform === 'darwin') {
     await refreshInputSources()
     showNotification(APP_NAME, 'Microphone list refreshed from macOS audio devices.')
+    return null
+  }
+
+  if (process.platform === 'win32') {
+    await refreshInputSources()
+    showNotification(APP_NAME, 'Microphone list refreshed from Windows input devices.')
     return null
   }
 
@@ -3503,6 +3982,11 @@ async function openOnboardingWindow({ markSeen = false } = {}) {
       console.error('[dictray] Failed to open native macOS Quick Start window:', error?.message || error)
       showNotification(APP_NAME, compactText(error?.message || error || 'Failed to open Quick Start.', 180))
     }
+    return null
+  }
+
+  if (process.platform === 'win32') {
+    showNotification(APP_NAME, 'Quick Start is not available in the native Windows tray yet.')
     return null
   }
 
@@ -3645,6 +4129,7 @@ function updateVoiceState(patch = {}) {
   syncVoiceOverlay()
   scheduleGnomePanelStateSync()
   void syncMacosMenuState()
+  void syncWindowsTrayState()
 }
 
 function clearVoiceState(error = '') {
@@ -3715,6 +4200,8 @@ function sttModelMenuLabel(value) {
       return 'Middle (base.en)'
     case STT_MODEL_ADVANCED:
       return 'Advanced (small.en)'
+    case STT_MODEL_PRECISE:
+      return 'Precise (distil-large-v3.5)'
     default:
       return String(value || 'Unknown')
   }
@@ -3727,6 +4214,9 @@ function sttModelMenuOptionLabel(value) {
   }
   if (normalized === STT_MODEL_MIDDLE) {
     return 'middle (base.en) - balanced speed and accuracy'
+  }
+  if (normalized === STT_MODEL_PRECISE) {
+    return `${sttModelMenuLabel(normalized)} - most accurate, heavier on CPU`
   }
   if (normalized === STT_MODEL_ADVANCED || normalized.includes('small') || normalized.includes('large')) {
     return `${sttModelMenuLabel(normalized)} - highest quality, slower`
@@ -3768,6 +4258,58 @@ function rewriteStatusLabel() {
 
 function rewriteThinkSetting() {
   return normalizeRewriteThink(currentRewriteThink || runtimeConfig?.rewrite?.ollama?.think || 'off')
+}
+
+function nearbyDuckingStatusLabel() {
+  if (!nearbyDuckingEnabled) {
+    return 'Disabled'
+  }
+  if (nearbyDuckingSharedSecret) {
+    return 'Enabled and paired'
+  }
+  return runtimeConfig?.nearbyDucking?.allowUnsigned === true
+    ? 'Enabled, unsigned LAN mode'
+    : 'Enabled, pairing required'
+}
+
+function buildNearbyDuckingMenuTemplate() {
+  return [
+    {
+      label: nearbyDuckingStatusLabel(),
+      enabled: false
+    },
+    {
+      label: 'Enable Nearby Ducking',
+      type: 'checkbox',
+      checked: nearbyDuckingEnabled,
+      click: (item) => {
+        void updateNearbyDuckingEnabled(Boolean(item.checked))
+      }
+    },
+    { type: 'separator' },
+    {
+      label: 'Show Pairing Code',
+      click: () => {
+        void startNearbyDuckingPairingHost()
+      }
+    },
+    {
+      label: 'Connect with Code',
+      click: () => {
+        void connectNearbyDuckingPairing()
+      }
+    },
+    ...(nearbyDuckingSharedSecret
+      ? [{
+          type: 'separator'
+        }, {
+          label: 'Forget Paired Device',
+          click: () => {
+            void forgetNearbyDuckingPairing()
+          }
+        }]
+      : [])
+  ]
 }
 
 function rebuildMenu() {
@@ -4000,6 +4542,10 @@ function rebuildMenu() {
         ...duckingLevelMenu
       ]
     },
+    {
+      label: 'Nearby Ducking',
+      submenu: buildNearbyDuckingMenuTemplate()
+    },
     { type: 'separator' },
     {
       label: 'Input Source',
@@ -4111,6 +4657,7 @@ function rebuildMenu() {
   void syncGnomePanelState()
   void syncMacosMenuState()
   void syncMacosOnboardingState()
+  void syncWindowsTrayState()
 }
 
 async function listRewriteModels() {
@@ -4302,8 +4849,130 @@ async function duckSystemVolumeForPushToTalk(input = {}) {
   }
 }
 
+function notifyNearbyDuckingStart() {
+  try {
+    nearbyDucking?.sendStart?.(duckingLevel)
+  } catch (error) {
+    console.error(`[dictray] Failed to send nearby ducking start: ${error?.message || error}`)
+  }
+}
+
+function notifyNearbyDuckingStop() {
+  try {
+    nearbyDucking?.sendStop?.(duckingLevel)
+  } catch (error) {
+    console.error(`[dictray] Failed to send nearby ducking stop: ${error?.message || error}`)
+  }
+}
+
+function clearNearbyRemoteRestoreTimer() {
+  if (nearbyRemoteRestoreTimer) {
+    clearTimeout(nearbyRemoteRestoreTimer)
+    nearbyRemoteRestoreTimer = null
+  }
+}
+
+function scheduleNearbyRemoteRestore(event = {}) {
+  clearNearbyRemoteRestoreTimer()
+  const timeoutMs = Math.max(3000, Number(event?.staleTimeoutMs || runtimeConfig?.nearbyDucking?.staleTimeoutMs || 12000))
+  nearbyRemoteRestoreTimer = setTimeout(() => {
+    void restoreSystemVolumeAfterNearbyDucking(event).catch(() => null)
+  }, timeoutMs)
+}
+
+async function duckSystemVolumeForNearbyPeer(event = {}) {
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !duckingEnabled) {
+    return
+  }
+
+  const level = normalizeDuckingLevel(event?.level ?? duckingLevel)
+  try {
+    if (nearbyRemoteDuckState) {
+      nearbyRemoteDuckState = {
+        ...nearbyRemoteDuckState,
+        eventId: String(event?.eventId || nearbyRemoteDuckState.eventId || '').trim(),
+        deviceId: String(event?.deviceId || nearbyRemoteDuckState.deviceId || '').trim(),
+        deviceName: String(event?.deviceName || nearbyRemoteDuckState.deviceName || '').trim(),
+        targetLevel: level
+      }
+      await systemVolume.setState({
+        level,
+        muted: false
+      })
+      scheduleNearbyRemoteRestore(event)
+      return
+    }
+
+    if (volumeDuckState) {
+      scheduleNearbyRemoteRestore(event)
+      return
+    }
+
+    const state = await systemVolume.getState()
+    const currentLevel = clampUnitInterval(Number(state?.level))
+    const currentMuted = Boolean(state?.muted)
+    if (currentMuted || currentLevel <= level) {
+      return
+    }
+
+    nearbyRemoteDuckState = {
+      eventId: String(event?.eventId || '').trim(),
+      deviceId: String(event?.deviceId || '').trim(),
+      deviceName: String(event?.deviceName || '').trim(),
+      previousLevel: currentLevel,
+      muted: currentMuted,
+      targetLevel: level
+    }
+    await systemVolume.setState({
+      level,
+      muted: false
+    })
+    scheduleNearbyRemoteRestore(event)
+  } catch (error) {
+    nearbyRemoteDuckState = null
+    clearNearbyRemoteRestoreTimer()
+    console.error(`[dictray] Failed to duck system volume for nearby peer: ${error?.message || error}`)
+  }
+}
+
+async function refreshNearbyDuckingHeartbeat(event = {}) {
+  if (!nearbyRemoteDuckState) {
+    await duckSystemVolumeForNearbyPeer(event)
+    return
+  }
+  scheduleNearbyRemoteRestore(event)
+}
+
+async function restoreSystemVolumeAfterNearbyDucking(event = {}) {
+  if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !nearbyRemoteDuckState) {
+    return
+  }
+
+  const expectedEventId = String(event?.eventId || '').trim()
+  if (expectedEventId && nearbyRemoteDuckState.eventId && expectedEventId !== nearbyRemoteDuckState.eventId) {
+    return
+  }
+
+  const previous = nearbyRemoteDuckState
+  nearbyRemoteDuckState = null
+  clearNearbyRemoteRestoreTimer()
+  if (volumeDuckState) {
+    return
+  }
+
+  try {
+    await systemVolume.setState({
+      level: previous.previousLevel,
+      muted: previous.muted
+    })
+  } catch (error) {
+    console.error(`[dictray] Failed to restore system volume after nearby ducking: ${error?.message || error}`)
+  }
+}
+
 async function restoreSystemVolumeAfterPushToTalk() {
   volumeDuckSessionId += 1
+  notifyNearbyDuckingStop()
   if (!['win32', 'linux', 'darwin'].includes(process.platform) || !systemVolume || !volumeDuckState) {
     return
   }
@@ -4480,6 +5149,72 @@ async function refreshRuntimeState(notify = false) {
   rebuildMenu()
 }
 
+/**
+ * With announce set the result is always reported, because the user asked. The
+ * startup check stays silent unless there is genuinely something newer, so it
+ * cannot become noise on every launch.
+ */
+async function runUpdateCheck({ announce = false } = {}) {
+  const currentVersion = String(app.getVersion?.() || '').trim()
+  const result = await checkForUpdate(currentVersion)
+
+  if (result?.updateAvailable && result.latestVersion) {
+    availableUpdateVersion = result.latestVersion
+    rebuildMenu()
+    showNotification(APP_NAME, `DicTray ${result.latestVersion} is available.`)
+    if (announce) {
+      void shell.openExternal(String(result.url || releasesPageUrl())).catch(() => {})
+    }
+    return
+  }
+
+  availableUpdateVersion = ''
+  if (!announce) {
+    return
+  }
+
+  showNotification(APP_NAME, result?.ok
+    ? `DicTray ${currentVersion} is up to date.`
+    : 'Could not check for updates.')
+  if (!result?.ok) {
+    void appendDiagnosticsLog('update-check-error', { reason: String(result?.reason || 'unknown') })
+  }
+}
+
+async function refreshWindowsAutostartState() {
+  if (process.platform !== 'win32') {
+    return
+  }
+  windowsAutostartEnabled = await isWindowsAutostartEnabled().catch(() => false)
+}
+
+async function updateWindowsAutostart(value) {
+  if (process.platform !== 'win32') {
+    return
+  }
+
+  const enabled = Boolean(value)
+  const result = await setWindowsAutostart(enabled, {
+    packaged: app.isPackaged,
+    rootDir: path.resolve(__dirname, '..'),
+    execPath: process.execPath
+  }).catch((error) => ({ ok: false, reason: String(error?.message || error) }))
+
+  await refreshWindowsAutostartState()
+  rebuildMenu()
+
+  if (!result?.ok) {
+    void appendDiagnosticsLog('windows-autostart-error', {
+      requested: enabled,
+      reason: String(result?.reason || 'unknown')
+    })
+    showNotification(APP_NAME, `Could not ${enabled ? 'enable' : 'disable'} Start at Login.`)
+    return
+  }
+
+  showNotification(APP_NAME, `Start at Login is ${windowsAutostartEnabled ? 'enabled' : 'disabled'}.`)
+}
+
 async function updateRewriteEnabled(value) {
   if (Boolean(value) && rewriteProviderId() === 'none') {
     runtimeConfig.rewrite.provider = 'ollama'
@@ -4555,6 +5290,7 @@ async function updateDuckingEnabled(value) {
   rebuildMenu()
   if (!duckingEnabled) {
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
+    void restoreSystemVolumeAfterNearbyDucking().catch(() => {})
     showNotification(APP_NAME, 'Output ducking disabled.')
     return
   }
@@ -4578,6 +5314,139 @@ async function updateDuckingLevel(value) {
   if (voiceState.phase === 'listening') {
     await duckSystemVolumeForPushToTalk(Boolean(volumeDuckState)).catch(() => null)
   }
+}
+
+async function updateNearbyDuckingEnabled(value) {
+  nearbyDuckingEnabled = Boolean(value)
+  await saveTraySettings()
+  await restartNearbyDucking()
+  rebuildMenu()
+  showNotification(APP_NAME, nearbyDuckingEnabled ? 'Nearby ducking enabled.' : 'Nearby ducking disabled.')
+}
+
+async function completeNearbyDuckingPairing(result = {}) {
+  const secret = String(result?.sharedSecret || '').trim()
+  if (!secret) {
+    return
+  }
+  nearbyDuckingEnabled = true
+  nearbyDuckingSharedSecret = secret
+  await saveTraySettings()
+  await restartNearbyDucking()
+  rebuildMenu()
+  const peerName = String(result?.peerDeviceName || result?.peerDeviceId || 'nearby device').trim()
+  showNotification(APP_NAME, `Nearby ducking paired with ${compactText(peerName, 48)}.`)
+}
+
+async function startNearbyDuckingPairingHost() {
+  if (!nearbyDuckingEnabled) {
+    nearbyDuckingEnabled = true
+    await saveTraySettings()
+    await restartNearbyDucking()
+  }
+  if (!nearbyDucking) {
+    showNotification(APP_NAME, 'Nearby ducking could not start on this device.')
+    return
+  }
+  const pairing = nearbyDucking.beginPairingHost({ ttlMs: 120000 })
+  clipboard.writeText(pairing.code)
+  rebuildMenu()
+  showNotification(APP_NAME, `Nearby ducking code: ${pairing.code}. It was copied and expires in 2 minutes.`)
+}
+
+async function connectNearbyDuckingPairing() {
+  if (!nearbyDuckingEnabled) {
+    nearbyDuckingEnabled = true
+    await saveTraySettings()
+    await restartNearbyDucking()
+  }
+  if (!nearbyDucking) {
+    showNotification(APP_NAME, 'Nearby ducking could not start on this device.')
+    return
+  }
+
+  const code = await promptNearbyPairingCode().catch((error) => {
+    showNotification(APP_NAME, compactText(error?.message || error || 'Could not open pairing prompt.', 140))
+    return ''
+  })
+  if (!code) {
+    return
+  }
+
+  showNotification(APP_NAME, 'Looking for the nearby DicTray pairing host...')
+  await nearbyDucking.joinPairingCode(code, { timeoutMs: 120000 }).catch((error) => {
+    showNotification(APP_NAME, compactText(error?.message || error || 'Nearby ducking pairing failed.', 160))
+  })
+}
+
+async function forgetNearbyDuckingPairing() {
+  nearbyDuckingSharedSecret = ''
+  await saveTraySettings()
+  await restartNearbyDucking()
+  rebuildMenu()
+  showNotification(APP_NAME, 'Nearby ducking paired device forgotten.')
+}
+
+function runTextPrompt(command, args = []) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (chunk) => {
+      stdout += String(chunk || '')
+    })
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk || '')
+    })
+    child.on('error', reject)
+    child.on('exit', (code) => {
+      if (code === 0) {
+        resolve(String(stdout || '').trim())
+        return
+      }
+      if (code === 1) {
+        resolve('')
+        return
+      }
+      reject(new Error(stderr.trim() || `${command} exited with code ${code ?? 1}`))
+    })
+  })
+}
+
+async function promptNearbyPairingCode() {
+  if (process.platform === 'darwin') {
+    return runTextPrompt('osascript', [
+      '-e',
+      'text returned of (display dialog "Enter the DicTray nearby ducking code from the other device." default answer "" with title "DicTray Nearby Ducking" buttons {"Cancel", "Connect"} default button "Connect")'
+    ])
+  }
+
+  if (process.platform === 'linux') {
+    if (commandAvailable('zenity')) {
+      return runTextPrompt('zenity', [
+        '--entry',
+        '--title',
+        'DicTray Nearby Ducking',
+        '--text',
+        'Enter the pairing code from the other DicTray device:',
+        '--entry-text',
+        ''
+      ])
+    }
+    if (commandAvailable('kdialog')) {
+      return runTextPrompt('kdialog', [
+        '--title',
+        'DicTray Nearby Ducking',
+        '--inputbox',
+        'Enter the pairing code from the other DicTray device:'
+      ])
+    }
+  }
+
+  throw new Error('No pairing prompt is available. Install zenity/kdialog or use the tray on a desktop session.')
 }
 
 async function updatePressEnterAfterInsert(value) {
@@ -5470,6 +6339,11 @@ async function processAudioSubmission(payload = {}) {
     throwIfSubmissionCancelled(submission)
 
     const sttMs = nowMs(sttStartedAt)
+    await appendDiagnosticsLog('submission-transcribed', {
+      sttMs,
+      transcriptLength: String(transcribePayload?.transcript || '').trim().length,
+      timingsMs: transcribePayload?.timingsMs || null
+    })
     const rawTranscript = String(transcribePayload?.transcript || '').trim()
     const transcript = normalizeSpeechTranscript(rawTranscript)
     throwIfSubmissionCancelled(submission)
@@ -5745,12 +6619,22 @@ async function startDictationCapture({
   })
 
   const volumeDuckSession = beginVolumeDuckSession()
-  void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
+  // Let the start earcon open at full volume and duck partway through it, so the
+  // cue reads as a fade rather than arriving already dimmed. The session check
+  // inside the duck call makes a late duck a no-op if capture already ended.
+  if (process.platform === 'win32') {
+    setTimeout(() => {
+      void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
+    }, VOLUME_DUCK_DELAY_MS)
+  } else {
+    void duckSystemVolumeForPushToTalk({ sessionId: volumeDuckSession }).catch(() => {})
+  }
   try {
     const bridge = await ensureCaptureBackend()
     await bridge.startRecording({
       preferredInputDeviceId
     })
+    notifyNearbyDuckingStart()
   } catch (error) {
     clearVoiceState(String(error?.message || error || 'Failed to start recording.'))
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
@@ -5784,7 +6668,7 @@ function stopHotkeyBridge() {
 }
 
 function registerPressOnlyHotkey() {
-  if (MACOS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
+  if (MACOS_HEADLESS_HOST || WINDOWS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
     return false
   }
 
@@ -5806,7 +6690,7 @@ function registerPressOnlyHotkey() {
 }
 
 function registerPromptShortcut() {
-  if (MACOS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
+  if (MACOS_HEADLESS_HOST || WINDOWS_HEADLESS_HOST || (LINUX_HEADLESS_HOST && gnomePanelBridgeEnabled)) {
     return true
   }
 
@@ -5854,7 +6738,9 @@ function startHotkeyBridge() {
   stopHotkeyBridge()
   const bridgeArgs = process.platform === 'darwin'
     ? [trayHotkey, promptTrayHotkey, MACOS_OVERLAY_STATE_PATH]
-    : [trayHotkey]
+    : process.platform === 'win32'
+      ? [trayHotkey, promptTrayHotkey, WINDOWS_OVERLAY_STATE_PATH]
+      : [trayHotkey]
   const bridge = spawn(HOTKEY_BRIDGE, bridgeArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true
@@ -5970,7 +6856,7 @@ async function registerHotkey() {
     } catch {
       const platformLabel = process.platform === 'darwin' ? 'macOS' : 'Windows'
       console.error(`[dictray] Missing ${platformLabel} hotkey helper: ${HOTKEY_BRIDGE}`)
-      if (MACOS_HEADLESS_HOST) {
+      if (MACOS_HEADLESS_HOST || WINDOWS_HEADLESS_HOST) {
         showNotification(APP_NAME, `${platformLabel} hotkey helper is missing. Global shortcut is unavailable.`)
         return
       }
@@ -6212,6 +7098,70 @@ async function replaceSpeechProvider(sttConfig) {
   }, stateDir)
 }
 
+function effectiveNearbyDuckingConfig({ enabled = nearbyDuckingEnabled } = {}) {
+  return {
+    ...(runtimeConfig?.nearbyDucking || {}),
+    enabled: Boolean(enabled),
+    sharedSecret: String(nearbyDuckingSharedSecret || runtimeConfig?.nearbyDucking?.sharedSecret || '').trim()
+  }
+}
+
+async function logNearbyDuckingPairingEvent(event = {}) {
+  const type = String(event?.type || '').trim()
+  const peer = String(event?.peerDeviceName || event?.peerDeviceId || event?.address || '').trim()
+  await appendDiagnosticsLog('nearby-ducking-pairing', {
+    type,
+    peer,
+    address: String(event?.address || '').trim(),
+    reason: String(event?.reason || '').trim()
+  })
+
+  if (type === 'offer-received') {
+    console.log(`[dictray] Nearby ducking pairing offer received${peer ? ` from ${peer}` : ''}.`)
+  } else if (type === 'request-received') {
+    console.log(`[dictray] Nearby ducking pairing request received${peer ? ` from ${peer}` : ''}.`)
+  } else if (type === 'request-rejected') {
+    showNotification(APP_NAME, 'Nearby ducking pairing request received, but the code did not match.')
+  } else if (type === 'accept-received') {
+    console.log(`[dictray] Nearby ducking pairing accept received${peer ? ` from ${peer}` : ''}.`)
+  } else if (type === 'join-timeout') {
+    console.log('[dictray] Nearby ducking pairing timed out.')
+  }
+}
+
+async function restartNearbyDucking() {
+  const previous = nearbyDucking
+  nearbyDucking = null
+  if (previous) {
+    await previous.dispose().catch((error) => {
+      console.error('[dictray] Failed to stop nearby ducking:', error?.message || error)
+    })
+  }
+
+  clearNearbyRemoteRestoreTimer()
+  nearbyRemoteDuckState = null
+
+  const config = effectiveNearbyDuckingConfig()
+  if (!config.enabled) {
+    return
+  }
+
+  nearbyDucking = new NearbyDuckingService({
+    config,
+    getDuckingLevel: () => duckingLevel,
+    onRemoteStart: duckSystemVolumeForNearbyPeer,
+    onRemoteHeartbeat: refreshNearbyDuckingHeartbeat,
+    onRemoteStop: restoreSystemVolumeAfterNearbyDucking,
+    onPairingComplete: completeNearbyDuckingPairing,
+    onPairingEvent: logNearbyDuckingPairingEvent,
+    logger: (message) => {
+      console.log(message)
+    }
+  })
+  await nearbyDucking.start()
+  console.log(`[dictray] Nearby ducking enabled on UDP port ${config.port}.`)
+}
+
 async function applyRuntimeConfig(nextConfig, { loadPersistentState = false } = {}) {
   runtimeConfig = nextConfig
   applyStatePaths(runtimeConfig)
@@ -6264,6 +7214,7 @@ async function reloadRuntimeConfig() {
 
   runtimeReloadInFlight = (async () => {
     await applyRuntimeConfig(await loadConfig(), { loadPersistentState: false })
+    await restartNearbyDucking()
     sttReadyForDictation = false
     sttReadyNotificationAttached = false
     clearSttKeepWarmTimer()
@@ -6285,6 +7236,7 @@ async function bootstrap() {
   }
   await applyRuntimeConfig(await loadConfig(), { loadPersistentState: true })
   systemVolume = new SystemVolumeBridge()
+  await restartNearbyDucking()
   uiAutomation = new UiAutomationBridge()
   earconPlayer = createEarconPlayer({
     logger: (message) => {
@@ -6365,6 +7317,7 @@ async function performQuitCleanup() {
   stopGnomePanelBridge()
   stopLinuxNativeUiBridge()
   stopMacosMenuBarBridge()
+  stopWindowsTrayBridge()
   clearSttKeepWarmTimer()
   stopHotkeyBridge()
   globalShortcut.unregisterAll()
@@ -6376,11 +7329,18 @@ async function performQuitCleanup() {
     await speech?.dispose?.().catch((error) => {
       console.error('[dictray] Failed to dispose speech runtime during quit:', error?.message || error)
     })
+    await nearbyDucking?.dispose?.().catch((error) => {
+      console.error('[dictray] Failed to dispose nearby ducking during quit:', error?.message || error)
+    })
+    nearbyDucking = null
 
     if (volumeDuckState) {
       isRestoringVolumeForQuit = true
       await restoreSystemVolumeAfterPushToTalk().catch(() => null)
       isRestoringVolumeForQuit = false
+    }
+    if (nearbyRemoteDuckState) {
+      await restoreSystemVolumeAfterNearbyDucking().catch(() => null)
     }
   })().finally(() => {
     quitCleanupComplete = true
@@ -6409,10 +7369,18 @@ if (!shouldExitEarly) {
     await setupLinuxProductIntegration().catch((error) => {
       console.error('[dictray] Linux product setup failed:', error?.message || error)
     })
+    await refreshWindowsAutostartState().catch(() => {})
+    // Deferred so a slow or unreachable network cannot hold up startup.
+    setTimeout(() => {
+      void runUpdateCheck().catch(() => {})
+    }, UPDATE_CHECK_STARTUP_DELAY_MS)
     await initGnomePanelBridge().catch(() => {})
     await initLinuxNativeUiBridge().catch(() => {})
     await initMacosMenuBarBridge().catch((error) => {
       console.error('[dictray] macOS menu bar setup failed:', error?.message || error)
+    })
+    await initWindowsTrayBridge().catch((error) => {
+      console.error('[dictray] Windows tray setup failed:', error?.message || error)
     })
     await createTray()
     await ensureVoiceWindow()

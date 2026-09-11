@@ -164,6 +164,8 @@ function plist(version) {
   <string>DicTray uses System Events to paste dictation into the focused app.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>DicTray records microphone audio for local speech-to-text dictation.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>DicTray uses your local network to pair nearby devices for LAN-only ducking.</string>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>
@@ -224,7 +226,7 @@ export STT_FFMPEG_BIN="$FFMPEG_BIN"
 export PYTHONDONTWRITEBYTECODE=1
 export PATH="$RUNTIME_DIR/ffmpeg/bin:$RUNTIME_DIR/node/bin:$PATH"
 
-exec "$NODE_BIN" "$APP_CORE/tray/main.mjs" "$@"
+exec -a "${appName}" "$NODE_BIN" "$APP_CORE/tray/main.mjs" "$@"
 `
 }
 

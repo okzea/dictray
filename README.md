@@ -83,6 +83,12 @@ pnpm bundle:runtime
 
 That stages bundle resources under `build/bundled-runtime/`, including the local STT runtime, the Linux headless core, and the Linux Node runtime when run on Linux. When packaged resources or a local staged runtime are present, DicTray automatically prefers those bundled assets over the user's global `python`.
 
+Build a portable Windows package (`dist/DicTray-windows-x64.zip`, extract and run `DicTray.cmd`):
+
+```bash
+pnpm dist:windows
+```
+
 Build Linux distributables:
 
 ```bash
@@ -105,6 +111,41 @@ pnpm icon:export
 
 The brand mark variants live under `assets/brand/`: `dictray-logo-dark.*` is white for dark surfaces, `dictray-logo-light.*` is black for light surfaces, `dictray-logo-active.*` is green for active states, and `dictray-logo-template.png` is used where the OS handles menu-bar tinting.
 
+### Releases
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, which packages all three
+platforms on their own runners and publishes the artifacts to a GitHub release:
+
+```bash
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The CUDA libraries are excluded from every package. They are around 2 GB, which
+alone exceeds the 2 GB GitHub release asset limit, and they are of no use without
+an NVIDIA GPU. Users enable GPU acceleration after installing:
+
+```bash
+node scripts/setup-gpu-acceleration.mjs
+```
+
+Speech models download on first use rather than shipping in the package.
+
+Builds are unsigned, so users see a SmartScreen prompt on Windows (**More info ->
+Run anyway**) and must right-click-Open on macOS the first time. Signing needs an
+Apple Developer Program membership and a Windows code-signing certificate; the
+workflow is structured so signing can be added without rework.
+
+### Updates
+
+DicTray checks GitHub Releases for a newer version 15 seconds after startup and
+from **Check for Updates** in the tray menu. When one is found the menu item
+becomes **Update Available (x.y.z)** and a notification appears; choosing it opens
+the release page.
+
+It never downloads or installs anything by itself. Replacing a running app in
+place is only safe with signed builds, so the update path stops at telling the
+user. The startup check is silent unless there is genuinely something newer.
+
 ## Advanced Config
 
 Default config path in development:
@@ -123,7 +164,16 @@ Current provider config shape:
 
 - `stt.provider`: `local` is the standard app path
 - `rewrite.provider`: currently `none` or `ollama`
+- `nearbyDucking.enabled`: opt-in LAN-only ducking between DicTray devices on the same network
 - legacy `speech.stt` and top-level `ollama` still load for backward compatibility
+
+Nearby ducking can be enabled on two machines on the same LAN:
+
+1. On the music computer, open Nearby Ducking and choose **Show Pairing Code**.
+2. On the speaking computer, choose **Connect with Code** and enter the short code.
+3. DicTray exchanges a real shared secret locally and stores it in local state for future signed messages.
+
+When one DicTray device starts push-to-talk, it broadcasts a small signed local-network event so paired peers can duck their own output. Heartbeats keep the remote ducking alive during recording, and receivers restore automatically if heartbeats stop. The short pairing code is temporary; it is not the long-term secret.
 
 Compatibility note:
 
@@ -133,6 +183,7 @@ The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use 
 
 - While push-to-talk is actively recording, output volume can be ducked and then restored to the exact prior level when capture stops.
 - Ducking defaults to enabled at `30%`, and you can change or disable it from the tray or via `dictation.duckingEnabled` / `dictation.duckingLevel` in config.
+- Nearby ducking is disabled by default and only sends start, heartbeat, and stop events; no audio, transcript, clipboard, or app content is sent.
 - The default config uses `stt.provider = local` with `scripts/faster_whisper_cli.py`.
 - Legacy `local-http` / `http` STT configs are treated as `local` during config loading so existing installations keep working.
 - Direct local STT currently expects a working local Python environment with `faster-whisper` installed. When `stt.local.device = auto`, it will choose CUDA automatically if it is available and otherwise fall back to CPU.

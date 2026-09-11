@@ -10,10 +10,12 @@ const SAMPLE_RATE = 44100
 const TARGET_PEAK = 0.36
 const FFMPEG_BIN = String(process.env.DICTATION_TRAY_FFMPEG_BIN || process.env.STT_FFMPEG_BIN || 'ffmpeg').trim() || 'ffmpeg'
 const EARCON_CACHE_DIR = path.join(os.tmpdir(), 'dictray-earcons')
+const EARCON_PLAYBACK_TIMEOUT_MS = 5000
 const EARCON_ASSET_DIR = path.join(__dirname, '..', 'assets', 'earcons')
 const EARCON_DEFINITIONS = {
   listen: {
     asset: 'listen.mp3',
+    wavAsset: 'listen.wav',
     pulses: [
       { wave: 'sine', fromHz: 520, toHz: 650, startMs: 0, durationMs: 110, level: 0.62 },
       { wave: 'sine', fromHz: 650, toHz: 760, startMs: 46, durationMs: 120, level: 0.28 }
@@ -27,6 +29,7 @@ const EARCON_DEFINITIONS = {
   },
   submit: {
     asset: 'submit.mp3',
+    wavAsset: 'submit.wav',
     pulses: [
       { wave: 'sine', fromHz: 640, toHz: 520, startMs: 0, durationMs: 130, level: 0.54 },
       { wave: 'sine', fromHz: 520, toHz: 390, startMs: 62, durationMs: 150, level: 0.34 }
@@ -59,6 +62,17 @@ const PLAYER_CANDIDATES = [
     command: 'canberra-gtk-play',
     platforms: ['linux'],
     args: (filePath) => ['-f', filePath]
+  },
+  {
+    command: 'powershell.exe',
+    platforms: ['win32'],
+    args: (filePath) => [
+      '-NoProfile',
+      '-ExecutionPolicy',
+      'Bypass',
+      '-Command',
+      `$player = New-Object System.Media.SoundPlayer ${powershellSingleQuoted(filePath)}; $player.PlaySync()`
+    ]
   }
 ]
 
@@ -66,9 +80,23 @@ function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`
 }
 
+function powershellSingleQuoted(value) {
+  return `'${String(value || '').replace(/'/g, "''")}'`
+}
+
 function commandAvailable(command) {
   if (!command) {
     return false
+  }
+  if (path.isAbsolute(command)) {
+    return existsSync(command)
+  }
+  if (process.platform === 'win32') {
+    const result = spawnSync('where.exe', [command], {
+      stdio: 'ignore',
+      windowsHide: true
+    })
+    return result.status === 0
   }
   const result = spawnSync('sh', ['-lc', `command -v ${shellQuote(command)} >/dev/null 2>&1`], {
     stdio: 'ignore',
@@ -219,20 +247,32 @@ export function createEarconPlayer({ logger = null } = {}) {
       return cachedFiles.get(kind)
     }
     const definition = EARCON_DEFINITIONS[kind]
+
+    // A ready-made WAV needs no decoding, so the designed cue plays everywhere.
+    // Without this, any platform lacking ffmpeg silently fell back to the
+    // synthesised tone below and never played the shipped asset at all.
+    const wavAssetPath = definition?.wavAsset ? path.join(EARCON_ASSET_DIR, definition.wavAsset) : ''
+    if (wavAssetPath && existsSync(wavAssetPath)) {
+      cachedFiles.set(kind, wavAssetPath)
+      return wavAssetPath
+    }
+
     const assetPath = definition?.asset ? path.join(EARCON_ASSET_DIR, definition.asset) : ''
     if (assetPath && existsSync(assetPath)) {
       if (process.platform === 'darwin') {
         cachedFiles.set(kind, assetPath)
         return assetPath
       }
-      await mkdir(EARCON_CACHE_DIR, { recursive: true })
-      const convertedPath = path.join(EARCON_CACHE_DIR, `${kind}-asset.wav`)
-      try {
-        await convertAudioToWav(assetPath, convertedPath)
-        cachedFiles.set(kind, convertedPath)
-        return convertedPath
-      } catch (error) {
-        log(`[dictray] Failed to convert earcon asset ${path.basename(assetPath)}: ${String(error?.message || error)}`)
+      if (commandAvailable(FFMPEG_BIN)) {
+        await mkdir(EARCON_CACHE_DIR, { recursive: true })
+        const convertedPath = path.join(EARCON_CACHE_DIR, `${kind}-asset.wav`)
+        try {
+          await convertAudioToWav(assetPath, convertedPath)
+          cachedFiles.set(kind, convertedPath)
+          return convertedPath
+        } catch (error) {
+          log(`[dictray] Failed to convert earcon asset ${path.basename(assetPath)}: ${String(error?.message || error)}`)
+        }
       }
     }
     await mkdir(EARCON_CACHE_DIR, { recursive: true })
@@ -255,7 +295,7 @@ export function createEarconPlayer({ logger = null } = {}) {
 
   async function play(kind) {
     const normalizedKind = normalizeKind(kind)
-    if (!normalizedKind || !['linux', 'darwin'].includes(process.platform)) {
+    if (!normalizedKind || !['linux', 'darwin', 'win32'].includes(process.platform)) {
       return { ok: false, skipped: true, reason: 'unsupported' }
     }
 
@@ -273,15 +313,32 @@ export function createEarconPlayer({ logger = null } = {}) {
 
     const filePath = await ensureEarconFile(normalizedKind)
     try {
+      // Windows: a detached+unref'd child is torn down before SoundPlayer
+      // finishes, so playback is silent. Keep it attached for its short life.
+      const detachPlayer = process.platform !== 'win32'
       const child = spawn(player.command, player.args(filePath), {
-        detached: true,
+        detached: detachPlayer,
         stdio: 'ignore',
         windowsHide: true
       })
       child.once('error', (error) => {
         log(`[dictray] Earcon playback failed: ${String(error?.message || error)}`)
       })
-      child.unref()
+      if (detachPlayer) {
+        child.unref()
+      } else {
+        // The attached child holds the event loop, so bound how long a wedged
+        // player (audio device enumeration stalling, say) can keep it alive.
+        const killTimer = setTimeout(() => {
+          try {
+            child.kill()
+          } catch {
+            // already gone
+          }
+        }, EARCON_PLAYBACK_TIMEOUT_MS)
+        killTimer.unref?.()
+        child.once('exit', () => clearTimeout(killTimer))
+      }
       return {
         ok: true,
         kind: normalizedKind,

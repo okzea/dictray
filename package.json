@@ -9,6 +9,10 @@
   },
   "scripts": {
     "bundle:runtime": "node scripts/prepare-bundled-runtime.mjs",
+    "gpu:setup": "node scripts/setup-gpu-acceleration.mjs",
+    "gpu:check": "node scripts/setup-gpu-acceleration.mjs --check",
+    "pack:windows": "node scripts/build-windows-package.mjs --dir",
+    "dist:windows": "node scripts/build-windows-package.mjs --archive",
     "pack:linux": "node scripts/build-linux-package.mjs --dir",
     "dist:linux": "node scripts/build-linux-package.mjs --archive",
     "pack:mac": "node scripts/build-macos-dmg.mjs --dir",
@@ -21,7 +25,7 @@
     "tray": "node scripts/run-tray.mjs",
     "tray:dev": "node --watch scripts/run-tray.mjs",
     "check": "node scripts/check.mjs",
-    "build:helpers": "dotnet build scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj -c Release && dotnet build scripts/windows-ui-automation/WindowsUiAutomation.csproj -c Release && dotnet build scripts/windows-system-volume/WindowsSystemVolume.csproj -c Release",
+    "build:helpers": "dotnet build scripts/windows-hotkey-hook/WindowsHotkeyHook.csproj -c Release && dotnet build scripts/windows-ui-automation/WindowsUiAutomation.csproj -c Release && dotnet build scripts/windows-system-volume/WindowsSystemVolume.csproj -c Release && dotnet build scripts/windows-native-capture/WindowsNativeCapture.csproj -c Release && dotnet build scripts/windows-tray-host/WindowsTrayHost.csproj -c Release && dotnet build scripts/windows-voice-overlay/WindowsVoiceOverlay.csproj -c Release",
     "tray:linux-headless": "DICTATION_TRAY_LINUX_HEADLESS=1 node tray/main.mjs"
   }
 }
