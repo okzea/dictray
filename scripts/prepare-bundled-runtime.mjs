@@ -225,12 +225,18 @@ async function main() {
     env: process.env
   })
 
-  if (hasCommand('dotnet')) {
+  // The helpers target net10.0-windows and reference the Windows Desktop
+  // framework, so they can only be published on a Windows host. Linux and macOS
+  // packages have no use for them: their own platform integration lives
+  // elsewhere.
+  if (process.platform !== 'win32') {
+    log('Skipping Windows helper publishing because this host is not Windows.')
+  } else if (!hasCommand('dotnet')) {
+    log('Skipping Windows helper publishing because dotnet is unavailable on this host.')
+  } else {
     for (const project of helperProjects) {
       await publishHelper(project)
     }
-  } else {
-    log('Skipping Windows helper publishing because dotnet is unavailable on this host.')
   }
 
   log('Bundled runtime is ready.')
