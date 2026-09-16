@@ -12,6 +12,7 @@
 // ever passed through a shell.
 
 import { spawn } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import path from 'node:path'
 
 const RUN_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
@@ -33,25 +34,46 @@ function runReg(args) {
 }
 
 /**
+ * Explorer runs a Run-key command with a visible window, and everything we can
+ * launch here is a console program: registered directly, node.exe would put a
+ * console window on screen for the whole session, and closing that window would
+ * take the tray with it. Handing off through `start "" /b` is what the packaged
+ * DicTray.cmd launcher already does.
+ */
+function detachedCommand(parts) {
+  return `cmd.exe /c start "" /b ${parts.map((part) => `"${part}"`).join(' ')}`
+}
+
+/**
  * The command the shell should run at sign-in.
  *
- * A packaged build launches its own executable. Running from a source checkout
- * there is no such executable, so the current interpreter is pointed at
- * scripts/start.mjs, which is what `pnpm start` does.
+ * A packaged build starts through its DicTray.cmd launcher, which is the only
+ * entry point that sets the packaging environment the tray expects. Its own
+ * executable is the bundled node.exe, so registering that alone would open a
+ * Node prompt rather than the app. Running from a source checkout there is no
+ * launcher, so the current interpreter is pointed at scripts/start.mjs, which is
+ * what `pnpm start` does.
  */
-export function windowsAutostartCommand({ packaged = false, rootDir = '', execPath = '' } = {}) {
+export function windowsAutostartCommand({ packaged = false, rootDir = '', execPath = '', packageHome = '' } = {}) {
   const binary = String(execPath || process.execPath || '').trim()
-  if (!binary) {
-    return ''
-  }
-  if (packaged) {
-    return `"${binary}"`
-  }
   const root = String(rootDir || '').trim()
-  if (!root) {
+
+  if (packaged) {
+    // rootDir is <package>/resources/app when packaged.
+    const home = String(packageHome || process.env.DICTRAY_HOME || '').trim()
+      || (root ? path.resolve(root, '..', '..') : '')
+    const launcher = home ? path.join(home, 'DicTray.cmd') : ''
+    if (launcher && existsSync(launcher)) {
+      return detachedCommand([launcher])
+    }
+    // No launcher next to the app: fall back to the entry point it would run.
+    return binary && root ? detachedCommand([binary, path.join(root, 'scripts', 'run-tray.mjs')]) : ''
+  }
+
+  if (!binary || !root) {
     return ''
   }
-  return `"${binary}" "${path.join(root, 'scripts', 'start.mjs')}"`
+  return detachedCommand([binary, path.join(root, 'scripts', 'start.mjs')])
 }
 
 export async function isWindowsAutostartEnabled() {

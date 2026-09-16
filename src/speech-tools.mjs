@@ -570,12 +570,24 @@ class LocalSttDaemonClient {
         env: childEnv
       })
 
+      // restart() drops its reference and kills the old daemon, but that child's
+      // exit event arrives later, often after a replacement has been spawned.
+      // Resetting unconditionally would wipe the replacement's handle, so the
+      // next request spawns yet another daemon and the replacement is orphaned,
+      // holding its port and GPU memory until the tray quits. Only the current
+      // child may reset the manager.
       child.on('error', (error) => {
+        if (this.child !== child) {
+          return
+        }
         this.recordStderr(`Speech to Text daemon failed to start: ${error?.message || error}`)
         this.reset()
       })
 
       child.on('exit', (code, signal) => {
+        if (this.child !== child) {
+          return
+        }
         this.recordStderr(`Speech to Text daemon exited with code ${code ?? 'unknown'}${signal ? ` (signal ${signal})` : ''}.`)
         this.reset()
       })
