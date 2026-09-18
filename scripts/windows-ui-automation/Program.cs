@@ -198,36 +198,82 @@ internal static class Program
         return exitCode;
     }
 
+    /// <summary>
+    /// Serves requests on this STA thread while keeping its message loop running.
+    ///
+    /// Pasting leaves this thread's OLE clipboard window as the clipboard owner, and
+    /// other processes reading or replacing the clipboard send that window messages
+    /// and wait for the answer. Blocking this thread on Console.ReadLine left those
+    /// messages unanswered between dictations, so Windows reported the helper hung
+    /// and every reader stalled until it timed out. Synergy reads the clipboard when
+    /// the cursor leaves the screen, and its input hook stalled with it, freezing the
+    /// mouse and keyboard for 10-20 seconds. Standard input is read on a background
+    /// thread instead, and each request is still handled here, one at a time.
+    /// </summary>
     private static int RunServer()
     {
-        string? line;
-        while ((line = Console.ReadLine()) is not null)
+        using var dispatcher = new System.Windows.Forms.Control();
+        _ = dispatcher.Handle;
+
+        var reader = new Thread(() =>
         {
-            if (string.IsNullOrWhiteSpace(line))
+            string? line;
+            while ((line = Console.ReadLine()) is not null)
             {
-                continue;
+                if (string.IsNullOrWhiteSpace(line))
+                {
+                    continue;
+                }
+
+                var request = line;
+                try
+                {
+                    dispatcher.Invoke(() => HandleServeLine(request));
+                }
+                catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException)
+                {
+                    return;
+                }
             }
 
-            object response;
             try
             {
-                var request = JsonSerializer.Deserialize<ServeRequest>(line, CompactJsonOptions)
-                    ?? throw new InvalidOperationException("Invalid server request.");
-                response = HandleServeRequest(request);
+                dispatcher.BeginInvoke(new Action(System.Windows.Forms.Application.ExitThread));
             }
-            catch (Exception error)
+            catch (Exception error) when (error is ObjectDisposedException or InvalidOperationException)
             {
-                response = new ServeResponse
-                {
-                    Ok = false,
-                    Error = error.Message
-                };
+                // The loop is already gone.
             }
+        })
+        {
+            IsBackground = true,
+            Name = "serve-stdin"
+        };
+        reader.Start();
 
-            Console.Out.WriteLine(JsonSerializer.Serialize(response, CompactJsonOptions));
+        System.Windows.Forms.Application.Run();
+        return 0;
+    }
+
+    private static void HandleServeLine(string line)
+    {
+        object response;
+        try
+        {
+            var request = JsonSerializer.Deserialize<ServeRequest>(line, CompactJsonOptions)
+                ?? throw new InvalidOperationException("Invalid server request.");
+            response = HandleServeRequest(request);
+        }
+        catch (Exception error)
+        {
+            response = new ServeResponse
+            {
+                Ok = false,
+                Error = error.Message
+            };
         }
 
-        return 0;
+        Console.Out.WriteLine(JsonSerializer.Serialize(response, CompactJsonOptions));
     }
 
     private static object HandleServeRequest(ServeRequest request)
@@ -775,7 +821,11 @@ internal static class UiAutomationActions
             }
 
             var clipboardSetTimer = Stopwatch.StartNew();
-            System.Windows.Forms.Clipboard.SetText(text);
+            // copy: true flushes the data onto the clipboard, so a reader never has
+            // to call back into this process to render it.
+            var pasteData = new System.Windows.Forms.DataObject();
+            pasteData.SetText(text, System.Windows.Forms.TextDataFormat.UnicodeText);
+            System.Windows.Forms.Clipboard.SetDataObject(pasteData, true, ClipboardRetryAttempts, ClipboardRetryDelayMs);
             System.Threading.Thread.Sleep(ClipboardSettleDelayMs);
             clipboardSetMs = clipboardSetTimer.ElapsedMilliseconds;
             var pasteTimer = Stopwatch.StartNew();
