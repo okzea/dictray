@@ -1,4 +1,5 @@
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -70,6 +71,14 @@ internal sealed class OverlayForm : Form
     private const int WsExTransparent = 0x20;
     private const int WsExNoActivate = 0x8000000;
     private const int WsExToolWindow = 0x80;
+    private const int WsExTopmost = 0x8;
+    private static readonly IntPtr HwndTopmost = new(-1);
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpNoActivate = 0x0010;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
 
     private static readonly Color BackgroundColor = Color.FromArgb(15, 15, 15);
     private static readonly Color BorderColor = Color.FromArgb(31, 255, 255, 255);
@@ -132,7 +141,10 @@ internal sealed class OverlayForm : Form
         get
         {
             var cp = base.CreateParams;
-            cp.ExStyle |= WsExTransparent | WsExNoActivate | WsExToolWindow;
+            // TopMost alone is not enough: with ShowWithoutActivation set, WinForms
+            // shows the window without ever applying it, so the overlay opened as a
+            // normal window and a maximized app on the same screen covered it.
+            cp.ExStyle |= WsExTransparent | WsExNoActivate | WsExToolWindow | WsExTopmost;
             return cp;
         }
     }
@@ -243,6 +255,12 @@ internal sealed class OverlayForm : Form
         var opacity = _payload.Visible ? VisibleOpacity : 0d;
         if (Math.Abs(Opacity - opacity) > 0.001)
         {
+            if (opacity > 0 && IsHandleCreated)
+            {
+                // Re-assert on every appearance: another topmost window activated
+                // since the last dictation can have been raised above the overlay.
+                SetWindowPos(Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+            }
             Opacity = opacity;
         }
 
