@@ -6570,6 +6570,11 @@ function beginTurnContextCapture({ defer = false } = {}) {
 }
 
 async function toggleDictationCapture({ pressEnterAfterInsert: overridePressEnter } = {}) {
+  // The submit shortcut also finishes a dictation started with the plain one: stopping with it
+  // presses Enter after the text is inserted, so you can decide to send when you're done talking.
+  if (overridePressEnter && voiceState.phase === 'listening') {
+    activePressEnterAfterInsert = true
+  }
   if (await stopOrCancelActiveDictation()) {
     return
   }
