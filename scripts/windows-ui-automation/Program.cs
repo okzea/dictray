@@ -1030,7 +1030,20 @@ internal static class UiAutomationActions
             throw new InvalidOperationException("A non-empty text value is required for send_keys.");
         }
 
-        SetFocus(window, target);
+        // Keys go to whatever has keyboard focus. With no element in the request the
+        // target is the whole window, and UIA SetFocus on a Chromium/Electron top-level
+        // window (Claude, Codex) can block for many seconds: Enter after an insert never
+        // came, and dictation sat in "inserting" until cancelled. Bring the window to the
+        // front instead, like PasteText, which also leaves focus in the field that was
+        // just pasted into. A specific element still gets focused through UIA.
+        if (ReferenceEquals(target, window.Element))
+        {
+            WindowCatalog.BringToFront(window);
+        }
+        else
+        {
+            SetFocus(window, target);
+        }
         System.Threading.Thread.Sleep(FocusSettleDelayMs);
 
         // SendKeys.SendWait drives a journal playback hook that only completes
