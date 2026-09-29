@@ -181,6 +181,14 @@ function cudaRuntimeUnavailable(error) {
   return /(cublas|cudnn|cublaslt).*?(not found|cannot be loaded|load failed)|cuda.*?(not found|cannot be loaded|load failed)/i.test(raw)
 }
 
+// A fault inside a running CUDA context, as opposed to a missing CUDA runtime.
+// Most are sticky: every later call in the same process fails too, typically
+// after sleep/resume or a driver reset, so only a fresh process recovers.
+function cudaContextFault(error) {
+  const raw = speechErrorText(error)
+  return /cuda failed with error|cuda error|cublas_status_|cudnn_status_|illegal memory access|device-side assert|launch failure/i.test(raw)
+}
+
 function explicitMissingScriptError(error, scriptName) {
   const stderr = String(error?.stderr || '').trim()
   const stdout = String(error?.stdout || '').trim()
@@ -508,6 +516,7 @@ class LocalSttDaemonClient {
   shouldRestartAfterError(error) {
     const text = speechErrorText(error)
     return /timed out|fetch failed|econnrefused|socket hang up|daemon exited|daemon failed to start|networkerror|terminated|aborted/i.test(text)
+      || cudaContextFault(error)
   }
 
   async waitUntilReachable(baseUrl, timeoutMs = 10000) {
@@ -685,6 +694,12 @@ class LocalSttDaemonClient {
       if (retry && this.shouldRestartAfterError(error)) {
         this.restart()
         return await this.transcribe(audioBuffer, contentType, payload, options, false)
+      }
+      // A fresh daemon still hit a CUDA fault, so the GPU itself is unusable for
+      // now. Transcribe this recording on the CPU rather than lose it; the next
+      // one tries the GPU again.
+      if (cudaContextFault(error) && String(payload?.device || '').trim().toLowerCase() !== 'cpu') {
+        return await this.transcribe(audioBuffer, contentType, { ...payload, device: 'cpu', computeType: 'int8' }, options, false)
       }
       throw error
     }
