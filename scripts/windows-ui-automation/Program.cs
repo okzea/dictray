@@ -833,7 +833,9 @@ internal static class UiAutomationActions
         long pasteShortcutMs = 0;
         long clipboardRestoreMs = 0;
         int clipboardRestoreAttempts = 0;
-        bool clipboardRestoreSuccess = false;
+        // Null while a deferred restore is pending: the outcome is not known yet,
+        // and the tray reads false as a failed restore.
+        bool? clipboardRestoreSuccess = null;
         string? clipboardRestoreError = null;
         var clipboardRestoreDeferred = false;
         uint pastedSequenceNumber = 0;
