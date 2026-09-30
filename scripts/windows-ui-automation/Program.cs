@@ -253,6 +253,7 @@ internal static class Program
         reader.Start();
 
         System.Windows.Forms.Application.Run();
+        UiAutomationActions.FlushPendingClipboardRestore();
         return 0;
     }
 
@@ -933,21 +934,28 @@ internal static class UiAutomationActions
             SequenceNumber = sequenceNumber,
             Timer = timer
         };
-        timer.Tick += (_, _) =>
-        {
-            var pending = TakePendingClipboardRestore();
-            if (pending is null || pending.SequenceNumber != GetClipboardSequenceNumber())
-            {
-                return;
-            }
-
-            var result = RestoreClipboard(pending.Previous, pending.PreviousText, pending.HadClipboard);
-            if (!result.Success)
-            {
-                Console.Error.WriteLine($"[dictray] Deferred clipboard restore failed: {result.Error}");
-            }
-        };
+        timer.Tick += (_, _) => FlushPendingClipboardRestore();
         timer.Start();
+    }
+
+    /// <summary>
+    /// Runs a pending restore now. The serve loop calls this on its way out, so the
+    /// helper stopping inside the delay does not leave the dictated text on the
+    /// clipboard in place of the user's own.
+    /// </summary>
+    public static void FlushPendingClipboardRestore()
+    {
+        var pending = TakePendingClipboardRestore();
+        if (pending is null || pending.SequenceNumber != GetClipboardSequenceNumber())
+        {
+            return;
+        }
+
+        var result = RestoreClipboard(pending.Previous, pending.PreviousText, pending.HadClipboard);
+        if (!result.Success)
+        {
+            Console.Error.WriteLine($"[dictray] Deferred clipboard restore failed: {result.Error}");
+        }
     }
 
     [DllImport("user32.dll")]
