@@ -29,10 +29,17 @@ struct OnboardingState: Decodable {
   let typingBenchmark: BenchmarkState?
 }
 
+struct LanguageOption: Decodable {
+  let code: String?
+  let label: String?
+}
+
 struct RuntimeState: Decodable {
   let rewriteProvider: String?
   let speechEffort: String?
   let sttPromptContext: String?
+  let sttLanguages: [String]?
+  let sttLanguageOptions: [LanguageOption]?
   let hotkey: String?
   let hotkeyManagedByEnv: Bool?
   let hotkeyPresets: [HotkeyPreset]?
@@ -58,6 +65,7 @@ struct CommandProfile: Encodable {
 struct CommandChoices: Encodable {
   let rewriteCleanup: Bool
   let speechEffort: String
+  let sttLanguages: [String]
   let pushToTalkHotkey: String
   let sttPromptContext: String
 }
@@ -374,6 +382,8 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
   private let resetBenchmarkButton = NSButton(title: "Restart", target: nil, action: nil)
   private let rewriteCheckbox = NSButton(checkboxWithTitle: "Polish transcript text before inserting", target: nil, action: nil)
   private let effortControl = NSSegmentedControl(labels: ["Faster", "Balanced", "Quality"], trackingMode: .selectOne, target: nil, action: nil)
+  private let languageStack = makeStack(.horizontal, spacing: 14)
+  private var languageCheckboxes: [(code: String, label: String, button: NSButton)] = []
   private let hotkeyPopup = NSPopUpButton()
   private let hotkeyHintLabel = makeLabel("", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
   private let runtimeLabel = makeLabel("", font: .systemFont(ofSize: 13), color: .secondaryLabelColor)
@@ -720,7 +730,9 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
     effortControl.segmentStyle = .rounded
     effortControl.translatesAutoresizingMaskIntoConstraints = false
     effortControl.heightAnchor.constraint(equalToConstant: 32).isActive = true
-    let effortHint = makeLabel("Faster uses tiny.en, Balanced uses base.en, and Quality uses small.en.", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+    let effortHint = makeLabel("Faster uses the tiny model, Balanced the base model, and Quality the small model.", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+    let languageTitle = makeLabel("Languages you dictate in", font: .systemFont(ofSize: 13, weight: .medium))
+    let languageHint = makeLabel("With one language, DicTray always writes in it. With several, each dictation is written in the one you speak. English alone uses the fastest models.", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
     sttContextView.minSize = NSSize(width: 0, height: 82)
     sttContextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
     sttContextView.isVerticallyResizable = true
@@ -740,7 +752,7 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
     let dictationSection = makeSectionBox(
       title: "Dictation",
       subtitle: "Choose the speed/quality balance and whether transcripts should be cleaned up before insertion.",
-      views: [makeInsetControl(effortControl, fixedWidth: 360), effortHint, contextTitle, makeInsetControl(contextScroll), contextHint, rewriteCheckbox]
+      views: [makeInsetControl(effortControl, fixedWidth: 360), effortHint, languageTitle, languageStack, languageHint, contextTitle, makeInsetControl(contextScroll), contextHint, rewriteCheckbox]
     )
 
     hotkeyPopup.target = self
@@ -879,6 +891,40 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
     return typingScoreLabel(benchmarkStats(elapsedMs: benchmarkElapsedMs).wordsPerMinute)
   }
 
+  private func languageOptions() -> [(code: String, label: String)] {
+    let options = (latestPayload.runtime?.sttLanguageOptions ?? []).compactMap { option -> (code: String, label: String)? in
+      let code = compactSpaces(option.code ?? "").lowercased()
+      let label = compactSpaces(option.label ?? "")
+      return code.isEmpty || label.isEmpty ? nil : (code: code, label: label)
+    }
+    return options.isEmpty ? [(code: "en", label: "English"), (code: "fr", label: "French")] : options
+  }
+
+  private func rebuildLanguageCheckboxes(active: [String]) {
+    for view in languageStack.arrangedSubviews {
+      languageStack.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+    languageCheckboxes = languageOptions().map { option in
+      let button = NSButton(checkboxWithTitle: option.label, target: self, action: #selector(formChanged(_:)))
+      button.state = active.contains(option.code) ? .on : .off
+      languageStack.addArrangedSubview(button)
+      return (code: option.code, label: option.label, button: button)
+    }
+  }
+
+  private func selectedLanguages() -> [String] {
+    return languageCheckboxes.filter { $0.button.state == .on }.map { $0.code }
+  }
+
+  private func languagesSummary() -> String {
+    let labels = languageCheckboxes.filter { $0.button.state == .on }.map { $0.label }
+    if labels.isEmpty {
+      return "None"
+    }
+    return labels.count > 1 ? "Auto-detect (\(labels.joined(separator: " / ")))" : labels[0]
+  }
+
   private func validationError() -> String {
     if normalizeProfileName(nameField.stringValue).isEmpty {
       return "Add your name before finishing Quick Start."
@@ -888,6 +934,9 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
     }
     if normalizeTypedText(typingText()) != normalizeTypedText(latestPayload.sampleText ?? "") {
       return "Type the sample sentence exactly once before finishing Quick Start."
+    }
+    if selectedLanguages().isEmpty {
+      return "Pick at least one language you dictate in."
     }
     return ""
   }
@@ -998,6 +1047,7 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
       "Profile: \(name.isEmpty ? "Anonymous" : name)",
       "Text improvement: \(rewriteCheckbox.state == .on ? "On" : "Off")",
       "Speech effort: \(speechEffortLabel(selectedSpeechEffort()))",
+      "Languages: \(languagesSummary())",
       "Speech context: \(sttContextText().isEmpty ? "Empty" : "Added")",
       "Push-to-talk: \(presetLabel)"
     ].joined(separator: "\n")
@@ -1017,6 +1067,8 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
     rewriteCheckbox.state = rewriteCleanup ? .on : .off
     effortControl.selectedSegment = speechEffort == "low" ? 0 : speechEffort == "high" ? 2 : 1
     sttContextView.string = sttPromptContext
+    let sttLanguages = latestPayload.runtime?.sttLanguages ?? []
+    rebuildLanguageCheckboxes(active: sttLanguages.isEmpty ? ["en"] : sttLanguages)
 
     hotkeyPresets = resolvedPresets()
     hotkeyPopup.removeAllItems()
@@ -1060,6 +1112,7 @@ final class QuickStartController: NSObject, NSApplicationDelegate, NSTextViewDel
         choices: CommandChoices(
           rewriteCleanup: rewriteCheckbox.state == .on,
           speechEffort: selectedSpeechEffort(),
+          sttLanguages: selectedLanguages(),
           pushToTalkHotkey: selectedHotkeyValue(),
           sttPromptContext: sttContextText()
         ),

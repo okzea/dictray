@@ -24,7 +24,10 @@ const DEFAULTS = {
       model: 'base.en',
       modelDir: '',
       device: 'auto',
-      computeType: 'auto'
+      computeType: 'auto',
+      // A Whisper language code such as 'fr', a list such as 'en,fr' to detect
+      // among per dictation, or empty to detect any language.
+      language: 'en'
     },
     http: {
       baseUrl: 'http://127.0.0.1:4593',
