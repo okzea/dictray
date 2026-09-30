@@ -258,6 +258,10 @@ let availableUpdateVersion = ''
 let windowsOverlayProcess = null
 let windowsOverlayEnabled = false
 let windowsOverlayLastPayload = ''
+let windowsOverlayStatusWriter = null
+let windowsOverlayResyncTimer = null
+let windowsOverlayWriteFailures = 0
+let windowsTrayStatusWriter = null
 let windowsTrayProcess = null
 let windowsTrayPollTimer = null
 let windowsTrayCommandWatcher = null
@@ -1767,11 +1771,13 @@ async function syncWindowsTrayState() {
   if (!windowsTrayBridgeEnabled) {
     return
   }
+  windowsTrayStatusWriter ||= createStatusFileWriter(WINDOWS_TRAY_STATE_PATH, (error) => {
+    void appendDiagnosticsLog('tray-sync-error', {
+      error: String(error?.message || error)
+    })
+  })
   try {
-    // Write and rename so the polling helper never reads a partial payload.
-    const tempPath = `${WINDOWS_TRAY_STATE_PATH}.tmp`
-    await writeFile(tempPath, JSON.stringify(buildWindowsTrayPayload()), { encoding: 'utf8' })
-    await rename(tempPath, WINDOWS_TRAY_STATE_PATH)
+    await windowsTrayStatusWriter(JSON.stringify(buildWindowsTrayPayload()))
   } catch (error) {
     void appendDiagnosticsLog('tray-sync-error', {
       error: String(error?.message || error)
@@ -2928,6 +2934,53 @@ async function writeJsonFile(filePath, payload) {
   await writeFile(filePath, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
 }
 
+// Replaces a file that a helper polls, via a temporary file and a rename, so the
+// helper never reads a partial payload. Writes to one path run one at a time:
+// overlapping writes shared the temporary file, so one rename moved it away and
+// the next failed with ENOENT, and an older payload could land after a newer
+// one. While a write runs, only the latest pending payload is kept. A rename
+// can also hit EPERM while the helper has the file open, so it is retried.
+function createStatusFileWriter(filePath, onError, onWritten = () => {}) {
+  const tempPath = `${filePath}.tmp`
+  let pending = null
+  let running = null
+
+  async function replaceFile(serialized) {
+    await writeFile(tempPath, serialized, { encoding: 'utf8' })
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await rename(tempPath, filePath)
+        return
+      } catch (error) {
+        if (attempt >= 5 || !['EPERM', 'EBUSY', 'EACCES'].includes(error?.code)) {
+          throw error
+        }
+        await new Promise((resolve) => setTimeout(resolve, 15 * attempt))
+      }
+    }
+  }
+
+  async function drain() {
+    while (pending !== null) {
+      const serialized = pending
+      pending = null
+      try {
+        await replaceFile(serialized)
+        onWritten()
+      } catch (error) {
+        onError(error)
+      }
+    }
+    running = null
+  }
+
+  return function write(serialized) {
+    pending = serialized
+    running ||= drain()
+    return running
+  }
+}
+
 function linuxNativeUtilityWindowsEnabled() {
   return process.platform === 'linux' && linuxNativeUiEnabled()
 }
@@ -3084,18 +3137,25 @@ async function syncWindowsOverlayState({ force = false } = {}) {
     return
   }
   windowsOverlayLastPayload = dedupKey
-  try {
-    // Write through a temporary file and rename over the target. A plain write is
-    // not atomic, so the helper polling this path could observe a truncated
-    // payload, and its read would collide with the next write during a turn.
-    const tempPath = `${WINDOWS_OVERLAY_STATE_PATH}.tmp`
-    await writeFile(tempPath, serialized, { encoding: 'utf8' })
-    await rename(tempPath, WINDOWS_OVERLAY_STATE_PATH)
-  } catch (error) {
+  windowsOverlayStatusWriter ||= createStatusFileWriter(WINDOWS_OVERLAY_STATE_PATH, (error) => {
     void appendDiagnosticsLog('overlay-sync-error', {
       error: String(error?.message || error)
     })
-  }
+    // The dedup key already claims this payload was delivered. If it was the
+    // last state of a turn, nothing else would resend it and the overlay would
+    // sit on "Inserting" or stay hidden, so forget the key and try again.
+    windowsOverlayLastPayload = ''
+    windowsOverlayWriteFailures += 1
+    if (windowsOverlayWriteFailures <= 5 && !windowsOverlayResyncTimer) {
+      windowsOverlayResyncTimer = setTimeout(() => {
+        windowsOverlayResyncTimer = null
+        void syncWindowsOverlayState()
+      }, 200)
+    }
+  }, () => {
+    windowsOverlayWriteFailures = 0
+  })
+  await windowsOverlayStatusWriter(serialized)
 }
 
 async function initWindowsVoiceOverlayBridge() {

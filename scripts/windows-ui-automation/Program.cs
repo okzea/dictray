@@ -214,6 +214,7 @@ internal static class Program
     {
         using var dispatcher = new System.Windows.Forms.Control();
         _ = dispatcher.Handle;
+        UiAutomationActions.DeferClipboardRestore = true;
 
         var reader = new Thread(() =>
         {
@@ -252,6 +253,7 @@ internal static class Program
         reader.Start();
 
         System.Windows.Forms.Application.Run();
+        UiAutomationActions.FlushPendingClipboardRestore();
         return 0;
     }
 
@@ -680,6 +682,37 @@ internal static class UiAutomationActions
     private const int PasteSettleDelayMs = 40;
     private const int ClipboardRetryAttempts = 8;
     private const int ClipboardRetryDelayMs = 20;
+    private const int DeferredClipboardRestoreDelayMs = 750;
+    private const int DeferredClipboardRestoreRetries = 3;
+
+    /// <summary>
+    /// Set by the serve loop, whose message loop can run a restore later.
+    ///
+    /// Restoring the previous clipboard straight after Ctrl+V broke insertion two
+    /// ways. The target reads the clipboard whenever it gets to the keystroke, and
+    /// a busy Electron window (Claude, Codex) often got there after the restore, so
+    /// it pasted the old clipboard or nothing while the insert reported success.
+    /// And the restore re-renders every format of the other application's data,
+    /// which took seconds, sometimes past the tray's timeout, with dictation stuck
+    /// on "Inserting" meanwhile. In serve mode the paste now answers at once and
+    /// the restore runs on a timer once the target has had time to read.
+    /// </summary>
+    public static bool DeferClipboardRestore { get; set; }
+
+    private static PendingClipboardRestore? pendingClipboardRestore;
+    private static string? unreportedClipboardRestoreError;
+
+    private sealed class PendingClipboardRestore
+    {
+        public required System.Windows.Forms.IDataObject? Previous { get; init; }
+        public required string? PreviousText { get; init; }
+        public required bool HadClipboard { get; init; }
+        // The clipboard sequence number just after our text went on. Any other
+        // value means someone copied since, and their data must not be replaced.
+        public required uint SequenceNumber { get; init; }
+        public required int RetriesLeft { get; init; }
+        public required System.Windows.Forms.Timer Timer { get; init; }
+    }
 
     public static object? Perform(string action, WindowMatch window, AutomationElement target, ActionRequest request)
     {
@@ -804,20 +837,36 @@ internal static class UiAutomationActions
         long pasteShortcutMs = 0;
         long clipboardRestoreMs = 0;
         int clipboardRestoreAttempts = 0;
-        bool clipboardRestoreSuccess = false;
+        // Null while a deferred restore is pending: the outcome is not known yet,
+        // and the tray reads false as a failed restore.
+        bool? clipboardRestoreSuccess = null;
         string? clipboardRestoreError = null;
+        var clipboardRestoreDeferred = false;
+        uint pastedSequenceNumber = 0;
         try
         {
-            try
+            // A restore still pending from the previous paste holds the user's own
+            // clipboard; what is on the clipboard now is only our earlier text.
+            var pending = TakePendingClipboardRestore();
+            if (pending is not null && pending.SequenceNumber == GetClipboardSequenceNumber())
             {
-                previousClipboard = System.Windows.Forms.Clipboard.GetDataObject();
-                hadClipboard = previousClipboard is not null;
-                previousClipboardText = GetClipboardText(previousClipboard);
+                previousClipboard = pending.Previous;
+                hadClipboard = pending.HadClipboard;
+                previousClipboardText = pending.PreviousText;
             }
-            catch
+            else
             {
-                previousClipboard = null;
-                hadClipboard = false;
+                try
+                {
+                    previousClipboard = System.Windows.Forms.Clipboard.GetDataObject();
+                    hadClipboard = previousClipboard is not null;
+                    previousClipboardText = GetClipboardText(previousClipboard);
+                }
+                catch
+                {
+                    previousClipboard = null;
+                    hadClipboard = false;
+                }
             }
 
             var clipboardSetTimer = Stopwatch.StartNew();
@@ -826,6 +875,7 @@ internal static class UiAutomationActions
             var pasteData = new System.Windows.Forms.DataObject();
             pasteData.SetText(text, System.Windows.Forms.TextDataFormat.UnicodeText);
             System.Windows.Forms.Clipboard.SetDataObject(pasteData, true, ClipboardRetryAttempts, ClipboardRetryDelayMs);
+            pastedSequenceNumber = GetClipboardSequenceNumber();
             System.Threading.Thread.Sleep(ClipboardSettleDelayMs);
             clipboardSetMs = clipboardSetTimer.ElapsedMilliseconds;
             var pasteTimer = Stopwatch.StartNew();
@@ -835,12 +885,26 @@ internal static class UiAutomationActions
         }
         finally
         {
-            var clipboardRestoreTimer = Stopwatch.StartNew();
-            var restoreResult = RestoreClipboard(previousClipboard, previousClipboardText, hadClipboard);
-            clipboardRestoreMs = clipboardRestoreTimer.ElapsedMilliseconds;
-            clipboardRestoreAttempts = restoreResult.Attempts;
-            clipboardRestoreSuccess = restoreResult.Success;
-            clipboardRestoreError = restoreResult.Error;
+            if (DeferClipboardRestore && pastedSequenceNumber != 0)
+            {
+                ScheduleClipboardRestore(previousClipboard, previousClipboardText, hadClipboard, pastedSequenceNumber);
+                clipboardRestoreDeferred = true;
+                if (unreportedClipboardRestoreError is not null)
+                {
+                    clipboardRestoreSuccess = false;
+                    clipboardRestoreError = unreportedClipboardRestoreError;
+                    unreportedClipboardRestoreError = null;
+                }
+            }
+            else
+            {
+                var clipboardRestoreTimer = Stopwatch.StartNew();
+                var restoreResult = RestoreClipboard(previousClipboard, previousClipboardText, hadClipboard);
+                clipboardRestoreMs = clipboardRestoreTimer.ElapsedMilliseconds;
+                clipboardRestoreAttempts = restoreResult.Attempts;
+                clipboardRestoreSuccess = restoreResult.Success;
+                clipboardRestoreError = restoreResult.Error;
+            }
         }
 
         return new
@@ -849,11 +913,78 @@ internal static class UiAutomationActions
             clipboardSet = clipboardSetMs,
             paste = pasteShortcutMs,
             clipboardRestore = clipboardRestoreMs,
+            clipboardRestoreDeferred,
             clipboardRestoreSuccess,
             clipboardRestoreAttempts,
             clipboardRestoreError
         };
     }
+
+    private static PendingClipboardRestore? TakePendingClipboardRestore()
+    {
+        var pending = pendingClipboardRestore;
+        pendingClipboardRestore = null;
+        if (pending is not null)
+        {
+            pending.Timer.Stop();
+            pending.Timer.Dispose();
+        }
+        return pending;
+    }
+
+    private static void ScheduleClipboardRestore(System.Windows.Forms.IDataObject? previous, string? previousText, bool hadClipboard, uint sequenceNumber, int retriesLeft = DeferredClipboardRestoreRetries)
+    {
+        var timer = new System.Windows.Forms.Timer { Interval = DeferredClipboardRestoreDelayMs };
+        pendingClipboardRestore = new PendingClipboardRestore
+        {
+            Previous = previous,
+            PreviousText = previousText,
+            HadClipboard = hadClipboard,
+            SequenceNumber = sequenceNumber,
+            RetriesLeft = retriesLeft,
+            Timer = timer
+        };
+        timer.Tick += (_, _) => FlushPendingClipboardRestore(allowRetry: true);
+        timer.Start();
+    }
+
+    /// <summary>
+    /// Runs a pending restore now. The serve loop calls this on its way out, so the
+    /// helper stopping inside the delay does not leave the dictated text on the
+    /// clipboard in place of the user's own.
+    ///
+    /// A clipboard held busy by another application is retried on the timer. If it
+    /// stays busy, the failure is kept for the next paste response, since nothing
+    /// else carries it back to the tray.
+    /// </summary>
+    public static void FlushPendingClipboardRestore(bool allowRetry = false)
+    {
+        var pending = TakePendingClipboardRestore();
+        if (pending is null || pending.SequenceNumber != GetClipboardSequenceNumber())
+        {
+            return;
+        }
+
+        var result = RestoreClipboard(pending.Previous, pending.PreviousText, pending.HadClipboard);
+        if (result.Success)
+        {
+            return;
+        }
+
+        // A failed restore leaves the clipboard untouched, so the sequence number
+        // still identifies our text and a retry cannot clobber a newer copy.
+        if (allowRetry && pending.RetriesLeft > 0)
+        {
+            ScheduleClipboardRestore(pending.Previous, pending.PreviousText, pending.HadClipboard, pending.SequenceNumber, pending.RetriesLeft - 1);
+            return;
+        }
+
+        unreportedClipboardRestoreError = $"previous dictation: {result.Error}";
+        Console.Error.WriteLine($"[dictray] Deferred clipboard restore failed: {result.Error}");
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
 
     private static string? GetClipboardText(System.Windows.Forms.IDataObject? clipboardData)
     {
