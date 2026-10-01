@@ -1431,7 +1431,9 @@ async function handleExternalMenuCommand(command = {}) {
       void updateWindowsAutostart(Boolean(command?.value))
       break
     case 'check_for_updates':
-      void runUpdateCheck({ announce: true })
+      void runUpdateCheck({ announce: true }).catch((error) => {
+        void appendDiagnosticsLog('update-check-error', { reason: String(error?.message || error) })
+      })
       break
     case 'set_press_enter_after_insert':
       void updatePressEnterAfterInsert(Boolean(command?.value))
