@@ -54,8 +54,14 @@ if (cli.selfTest) {
 
   const widgets = {
     effortButtons: new Map(),
+    languageButtons: new Map(),
     hotkeyPresets: []
   }
+
+  const FALLBACK_LANGUAGE_OPTIONS = [
+    { code: 'en', label: 'English' },
+    { code: 'fr', label: 'French' }
+  ]
 
   function normalizeTypedText(value) {
     return compactSpaces(value)
@@ -179,6 +185,47 @@ if (cli.selfTest) {
     return 'mid'
   }
 
+  function languageOptions() {
+    const options = Array.isArray(latestPayload.runtime?.sttLanguageOptions)
+      ? latestPayload.runtime.sttLanguageOptions
+        .map((option) => ({ code: compactSpaces(option?.code).toLowerCase(), label: compactSpaces(option?.label) }))
+        .filter((option) => option.code && option.label)
+      : []
+    return options.length ? options : FALLBACK_LANGUAGE_OPTIONS
+  }
+
+  function selectedLanguages() {
+    return [...widgets.languageButtons.entries()]
+      .filter(([, button]) => button.get_active())
+      .map(([code]) => code)
+  }
+
+  function languagesSummary(codes) {
+    const labels = codes.map((code) => languageOptions().find((option) => option.code === code)?.label || code)
+    if (!labels.length) {
+      return 'None'
+    }
+    return labels.length > 1 ? `Auto-detect (${labels.join(' / ')})` : labels[0]
+  }
+
+  function rebuildLanguageButtons(activeCodes) {
+    let child = widgets.languageBox.get_first_child()
+    while (child) {
+      const next = child.get_next_sibling()
+      widgets.languageBox.remove(child)
+      child = next
+    }
+    widgets.languageButtons.clear()
+    for (const option of languageOptions()) {
+      const button = new Gtk.CheckButton({ label: option.label, active: activeCodes.includes(option.code) })
+      button.connect('toggled', () => {
+        updateSummary()
+      })
+      widgets.languageButtons.set(option.code, button)
+      widgets.languageBox.append(button)
+    }
+  }
+
   function selectedHotkeyValue() {
     const presets = widgets.hotkeyPresets.length ? widgets.hotkeyPresets : hotkeyPresets()
     const index = widgets.hotkeyDropdown.get_selected()
@@ -247,6 +294,10 @@ if (cli.selfTest) {
 
     if (normalizeTypedText(typingBufferText()) !== normalizeTypedText(latestPayload.sampleText || '')) {
       return 'Type the sample sentence exactly once before finishing Quick Start.'
+    }
+
+    if (!selectedLanguages().length) {
+      return 'Pick at least one language you dictate in.'
     }
 
     return ''
@@ -339,6 +390,7 @@ if (cli.selfTest) {
       `Profile: ${name}`,
       `Text improvement: ${rewriteCleanup ? 'On' : 'Off'}`,
       `Speech effort: ${speechEffortLabel(selectedSpeechEffort())}`,
+      `Languages: ${languagesSummary(selectedLanguages())}`,
       `Speech context: ${sttContextText() ? 'Added' : 'Empty'}`,
       `Push-to-talk: ${widgets.hotkeyPresets[widgets.hotkeyDropdown.get_selected()]?.label || 'Unknown'}`
     ]
@@ -361,6 +413,11 @@ if (cli.selfTest) {
     for (const [value, button] of widgets.effortButtons.entries()) {
       button.set_active(value === speechEffort)
     }
+
+    const sttLanguages = Array.isArray(latestPayload.runtime?.sttLanguages) && latestPayload.runtime.sttLanguages.length
+      ? latestPayload.runtime.sttLanguages
+      : ['en']
+    rebuildLanguageButtons(sttLanguages)
 
     const presets = hotkeyPresets()
     widgets.hotkeyPresets = presets
@@ -402,6 +459,7 @@ if (cli.selfTest) {
         choices: {
           rewriteCleanup: widgets.rewriteSwitch.get_active(),
           speechEffort: selectedSpeechEffort(),
+          sttLanguages: selectedLanguages(),
           pushToTalkHotkey: selectedHotkeyValue(),
           sttPromptContext: sttContextText()
         },
@@ -627,6 +685,14 @@ if (cli.selfTest) {
     )
     effortCard.add_css_class('card')
 
+    widgets.languageBox = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
+    const languageCard = buildChoiceCard(
+      'Which languages do you dictate in?',
+      'With one language, DicTray always writes in it. With several, each dictation is written in the one you speak. English alone uses the fastest models.',
+      widgets.languageBox
+    )
+    languageCard.add_css_class('card')
+
     const contextCard = new Gtk.Box({ orientation: Gtk.Orientation.VERTICAL, spacing: 10 })
     contextCard.add_css_class('card')
     const contextTitle = new Gtk.Label({ label: 'Speech context', xalign: 0 })
@@ -676,6 +742,7 @@ if (cli.selfTest) {
     form.append(benchmarkCard)
     form.append(rewriteCard)
     form.append(effortCard)
+    form.append(languageCard)
     form.append(contextCard)
     form.append(hotkeyCard)
     form.append(summaryCard)

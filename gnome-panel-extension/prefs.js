@@ -168,6 +168,7 @@ function legacyPreferencesFromMenu(status = {}) {
       templateSupported: true,
       deviceOptions: commandOptions(findMenuItem(menu, 'Speech to Text Device')?.submenu, 'set_stt_device'),
       modelOptions: commandOptions(findMenuItem(menu, 'Speech to Text Model')?.submenu, 'set_stt_model'),
+      languageOptions: commandOptions(findMenuItem(menu, 'Speech to Text Language')?.submenu, 'set_stt_language_enabled'),
       templateOptions: commandOptions(findMenuItem(menu, 'Speech to Text Template')?.submenu, 'set_stt_prompt_template'),
     },
     rewrite: {
@@ -316,6 +317,16 @@ export default class DicTrayPreferences extends ExtensionPreferences {
     addCommandCombo(inputGroup, _('Speech to Text Device'), preferences.stt?.supported === false ? _('Not available for this provider') : '', preferences.stt?.deviceOptions);
     addCommandCombo(inputGroup, _('Speech to Text Model'), preferences.stt?.supported === false ? _('Not available for this provider') : '', preferences.stt?.modelOptions);
     addCommandCombo(inputGroup, _('Speech to Text Template'), preferences.stt?.templateSupported === false ? _('Only available for local Speech to Text') : '', preferences.stt?.templateOptions);
+
+    const languageGroup = new Adw.PreferencesGroup({
+      title: _('Dictation Languages'),
+      description: preferences.stt?.supported === false
+        ? _('Not available for this provider')
+        : _('One language is always used as is. With several, each dictation is written in the one you speak.'),
+    });
+    page.add(languageGroup);
+    for (const option of preferences.stt?.languageOptions || [])
+      addSwitchRow(languageGroup, option.label, '', option.checked, option.command);
 
     const outputGroup = new Adw.PreferencesGroup({
       title: _('Output'),

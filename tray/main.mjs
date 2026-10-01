@@ -163,6 +163,16 @@ const STT_MODEL_TINY = 'tiny'
 const STT_MODEL_MIDDLE = 'middle'
 const STT_MODEL_ADVANCED = 'advanced'
 const STT_MODEL_PRECISE = 'precise'
+const STT_LANGUAGE_EN = 'en'
+const STT_LANGUAGE_OPTIONS = [
+  { code: STT_LANGUAGE_EN, label: 'English' },
+  { code: 'fr', label: 'French' },
+  { code: 'es', label: 'Spanish' },
+  { code: 'de', label: 'German' },
+  { code: 'it', label: 'Italian' },
+  { code: 'pt', label: 'Portuguese' },
+  { code: 'nl', label: 'Dutch' }
+]
 const SPEECH_EFFORT_LOW = 'low'
 const SPEECH_EFFORT_MID = 'mid'
 const SPEECH_EFFORT_HIGH = 'high'
@@ -290,10 +300,12 @@ let sttPreferences = {
   supported: false,
   options: [],
   modelOptions: [],
+  languageOptions: [],
   templateSupported: false,
   templateOptions: [],
   selectedDevice: '',
   selectedModel: '',
+  selectedLanguages: [STT_LANGUAGE_EN],
   selectedTemplate: defaultSttPromptTemplate(),
   selectedPromptContext: '',
   currentDevice: '',
@@ -845,6 +857,29 @@ function buildDetailedControlMenu(options = {}) {
         enabled: false
       }]
 
+  const sttLanguageMenu = sttPreferences.supported
+    ? [
+        { label: sttLanguagesLabel(sttPreferences.selectedLanguages), enabled: false },
+        { type: 'separator' },
+        ...sttPreferences.languageOptions.map((code) => {
+          const enabled = sttPreferences.selectedLanguages.includes(code)
+          return {
+            label: sttLanguageLabel(code),
+            type: 'checkbox',
+            checked: enabled,
+            command: {
+              action: 'set_stt_language_enabled',
+              language: code,
+              value: !enabled
+            }
+          }
+        })
+      ]
+    : [{
+        label: 'Not available for this STT provider',
+        enabled: false
+      }]
+
   const sttPromptTemplateMenu = sttPreferences.templateSupported
     ? sttPreferences.templateOptions.map((value) => ({
         label: sttPromptTemplateMenuLabel(value),
@@ -969,6 +1004,10 @@ function buildDetailedControlMenu(options = {}) {
     {
       label: 'Speech to Text Model',
       submenu: sttModelMenu
+    },
+    {
+      label: 'Speech to Text Language',
+      submenu: sttLanguageMenu
     },
     {
       label: 'Speech to Text Template',
@@ -1203,6 +1242,17 @@ function buildGnomePanelPreferencesPayload() {
           sttPreferences.selectedModel
         )
         : [],
+      languageOptions: sttPreferences.supported
+        ? sttPreferences.languageOptions.map((code) => ({
+          label: sttLanguageLabel(code),
+          value: code,
+          checked: sttPreferences.selectedLanguages.includes(code),
+          command: {
+            action: 'set_stt_language_enabled',
+            language: code
+          }
+        }))
+        : [],
       templateOptions: sttPreferences.templateSupported
         ? buildCommandOptions(
           buildPreferenceOptions(sttPreferences.templateOptions, sttPromptTemplateMenuLabel, sttPreferences.selectedTemplate),
@@ -1435,6 +1485,9 @@ async function handleExternalMenuCommand(command = {}) {
       break
     case 'set_stt_model':
       void updateSttPreferences({ sttModel: command?.value })
+      break
+    case 'set_stt_language_enabled':
+      void setSttLanguageEnabled(command?.language, command?.value)
       break
     case 'set_stt_prompt_template':
       void updateSttPromptTemplate(command?.value)
@@ -2218,7 +2271,8 @@ function normalizeSttModelPreference(value) {
   if (lowered === STT_MODEL_ADVANCED || lowered === 'small' || lowered === 'small.en') {
     return STT_MODEL_ADVANCED
   }
-  if (lowered === STT_MODEL_PRECISE || lowered === 'distil' || lowered === 'distil-large-v3.5') {
+  if (lowered === STT_MODEL_PRECISE || lowered === 'distil' || lowered === 'distil-large-v3.5'
+    || lowered === 'turbo' || lowered === 'large-v3-turbo') {
     return STT_MODEL_PRECISE
   }
   return ''
@@ -2228,31 +2282,83 @@ function sttModelPreferenceOptions() {
   return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED, STT_MODEL_PRECISE]
 }
 
-function sttModelNameForPreference(value) {
+// The `.en` checkpoints and distil-large-v3.5 only know English: any other
+// language needs the multilingual checkpoint of the same size.
+function sttModelNameForPreference(value, languages = sttPreferences.selectedLanguages) {
+  const english = sttLanguagesAreEnglishOnly(languages)
   switch (String(value || '').trim().toLowerCase()) {
     case STT_MODEL_TINY:
-      return 'tiny.en'
+      return english ? 'tiny.en' : 'tiny'
     case STT_MODEL_MIDDLE:
-      return 'base.en'
+      return english ? 'base.en' : 'base'
     case STT_MODEL_ADVANCED:
-      return 'small.en'
+      return english ? 'small.en' : 'small'
     case STT_MODEL_PRECISE:
-      return 'distil-large-v3.5'
+      return english ? 'distil-large-v3.5' : 'large-v3-turbo'
     default:
       return ''
   }
 }
 
-function applySttPromptTemplateToConfig(templateId) {
-  if (!runtimeConfig?.stt?.local) {
+function sttLanguageOptionCodes() {
+  return STT_LANGUAGE_OPTIONS.map((option) => option.code)
+}
+
+// Kept in option order so the saved list and the runtime value stay stable.
+function normalizeSttLanguages(value) {
+  const requested = new Set(
+    (Array.isArray(value) ? value : String(value || '').split(','))
+      .map((code) => String(code || '').trim().toLowerCase())
+      .filter(Boolean)
+  )
+  return sttLanguageOptionCodes().filter((code) => requested.has(code))
+}
+
+function sttLanguagesAreEnglishOnly(languages) {
+  const normalized = normalizeSttLanguages(languages)
+  return !normalized.length || (normalized.length === 1 && normalized[0] === STT_LANGUAGE_EN)
+}
+
+function sttLanguageLabel(code) {
+  return STT_LANGUAGE_OPTIONS.find((option) => option.code === code)?.label || String(code || '')
+}
+
+function sttLanguagesLabel(languages) {
+  const normalized = normalizeSttLanguages(languages)
+  if (normalized.length > 1) {
+    return `Auto-detect: ${normalized.map(sttLanguageLabel).join(' / ')}`
+  }
+  return sttLanguageLabel(normalized[0] || STT_LANGUAGE_EN)
+}
+
+// The daemon forces a single code and detects among a comma-separated list
+// on each dictation.
+function applySttLanguagesToConfig(languages) {
+  const runtimeLanguage = normalizeSttLanguages(languages).join(',') || STT_LANGUAGE_EN
+  if (runtimeConfig?.stt?.local) {
+    runtimeConfig.stt.local.language = runtimeLanguage
+  }
+  if (speech?.config?.stt?.local) {
+    speech.config.stt.local.language = runtimeLanguage
+  }
+}
+
+async function setSttLanguageEnabled(code, enabled) {
+  const language = normalizeSttLanguages([code])[0]
+  if (!language) {
     return
   }
-
-  const initialPrompt = sttPromptTextForPreferences(templateId, sttPreferences.selectedPromptContext)
-  runtimeConfig.stt.local.initialPrompt = initialPrompt
-  if (speech?.config?.stt?.local) {
-    speech.config.stt.local.initialPrompt = initialPrompt
+  const current = normalizeSttLanguages(sttPreferences.selectedLanguages)
+  const next = normalizeSttLanguages(enabled ? [...current, language] : current.filter((item) => item !== language))
+  if (!next.length) {
+    showNotification(APP_NAME, 'Keep at least one dictation language enabled.')
+    rebuildMenu()
+    return
   }
+  if (next.join(',') === current.join(',')) {
+    return
+  }
+  await updateSttPreferences({ sttLanguages: next })
 }
 
 function normalizeSpeechEffort(value) {
@@ -2290,12 +2396,12 @@ function speechEffortForModel(value) {
 function sttModelForSpeechEffort(value) {
   switch (normalizeSpeechEffort(value)) {
     case SPEECH_EFFORT_LOW:
-      return 'tiny.en'
+      return sttModelNameForPreference(STT_MODEL_TINY)
     case SPEECH_EFFORT_HIGH:
-      return 'small.en'
+      return sttModelNameForPreference(STT_MODEL_ADVANCED)
     case SPEECH_EFFORT_MID:
     default:
-      return 'base.en'
+      return sttModelNameForPreference(STT_MODEL_MIDDLE)
   }
 }
 
@@ -3735,6 +3841,7 @@ async function readSharedSpeechPreferences() {
   return {
     sttDevice: normalizeSttDevicePreference(parsed?.sttDevice),
     sttModel: normalizeSttModelPreference(parsed?.sttModel),
+    sttLanguages: normalizeSttLanguages(parsed?.sttLanguages),
     sttPromptTemplate: normalizeSttPromptTemplate(parsed?.sttPromptTemplate, defaultSttPromptTemplate()),
     sttPromptContext: normalizeSttPromptContext(parsed?.sttPromptContext)
   }
@@ -3745,6 +3852,7 @@ async function writeSharedSpeechPreferences(input = {}) {
   const payload = {
     sttDevice: normalizeSttDevicePreference(input?.sttDevice ?? previous?.sttDevice),
     sttModel: normalizeSttModelPreference(input?.sttModel ?? previous?.sttModel),
+    sttLanguages: normalizeSttLanguages(input?.sttLanguages ?? previous?.sttLanguages),
     sttPromptTemplate: normalizeSttPromptTemplate(input?.sttPromptTemplate ?? previous?.sttPromptTemplate, defaultSttPromptTemplate()),
     sttPromptContext: normalizeSttPromptContext(input?.sttPromptContext ?? previous?.sttPromptContext)
   }
@@ -4090,6 +4198,8 @@ function onboardingStatePayload() {
       speechEffort: currentSpeechEffort,
       sttPromptTemplate: sttPreferences.selectedTemplate,
       sttPromptContext: sttPreferences.selectedPromptContext || onboardingState?.choices?.sttPromptContext || '',
+      sttLanguages: normalizeSttLanguages(sttPreferences.selectedLanguages),
+      sttLanguageOptions: STT_LANGUAGE_OPTIONS,
       hotkey: trayHotkey,
       hotkeyManagedByEnv: hotkeyManagedByEnv(),
       hotkeyPresets: HOTKEY_PRESETS
@@ -4105,6 +4215,10 @@ async function completeOnboarding(input = {}) {
     || speechEffortForModel(runtimeConfig?.stt?.local?.model || sttPreferences.currentModel || 'base.en')
   const pushToTalkHotkey = normalizeTrayHotkey(input?.choices?.pushToTalkHotkey || trayHotkey || DEFAULT_HOTKEY)
   const sttPromptContext = normalizeSttPromptContext(input?.choices?.sttPromptContext)
+  const requestedSttLanguages = normalizeSttLanguages(input?.choices?.sttLanguages)
+  const sttLanguages = requestedSttLanguages.length
+    ? requestedSttLanguages
+    : normalizeSttLanguages(sttPreferences.selectedLanguages)
   const typingBenchmark = buildTypingBenchmark({
     ...input?.typingBenchmark,
     measuredAt
@@ -4134,11 +4248,13 @@ async function completeOnboarding(input = {}) {
     typingBenchmark
   })
 
-  runtimeConfig.stt.local.model = sttModelForSpeechEffort(onboardingState.choices.speechEffort)
   sttPreferences = {
     ...sttPreferences,
+    selectedLanguages: sttLanguages.length ? sttLanguages : [STT_LANGUAGE_EN],
     selectedPromptContext: sttPromptContext
   }
+  runtimeConfig.stt.local.model = sttModelForSpeechEffort(onboardingState.choices.speechEffort)
+  applySttLanguagesToConfig(sttPreferences.selectedLanguages)
   applySttPromptTemplateToConfig(sttPreferences.selectedTemplate || defaultSttPromptTemplate())
   await replaceSpeechProvider(runtimeConfig.stt)
   sttReadyForDictation = false
@@ -4161,7 +4277,8 @@ async function completeOnboarding(input = {}) {
     temperature: currentRewriteTemperature
   })
   await writeSharedSpeechPreferences({
-    sttPromptContext
+    sttPromptContext,
+    sttLanguages: sttPreferences.selectedLanguages
   })
   await saveTraySettings()
   await saveOnboardingState()
@@ -4253,15 +4370,17 @@ function sttDeviceMenuLabel(value) {
 }
 
 function sttModelMenuLabel(value) {
-  switch (String(value || '').trim().toLowerCase()) {
+  const normalized = String(value || '').trim().toLowerCase()
+  const modelName = sttModelNameForPreference(normalized)
+  switch (normalized) {
     case STT_MODEL_TINY:
-      return 'Tiny (tiny.en)'
+      return `Tiny (${modelName})`
     case STT_MODEL_MIDDLE:
-      return 'Middle (base.en)'
+      return `Middle (${modelName})`
     case STT_MODEL_ADVANCED:
-      return 'Advanced (small.en)'
+      return `Advanced (${modelName})`
     case STT_MODEL_PRECISE:
-      return 'Precise (distil-large-v3.5)'
+      return `Precise (${modelName})`
     default:
       return String(value || 'Unknown')
   }
@@ -4270,10 +4389,10 @@ function sttModelMenuLabel(value) {
 function sttModelMenuOptionLabel(value) {
   const normalized = normalizeSttModelPreference(value) || String(value || '').trim().toLowerCase()
   if (normalized === STT_MODEL_TINY) {
-    return 'tiny (tiny.en) - fastest, lower detail'
+    return `tiny (${sttModelNameForPreference(normalized)}) - fastest, lower detail`
   }
   if (normalized === STT_MODEL_MIDDLE) {
-    return 'middle (base.en) - balanced speed and accuracy'
+    return `middle (${sttModelNameForPreference(normalized)}) - balanced speed and accuracy`
   }
   if (normalized === STT_MODEL_PRECISE) {
     return `${sttModelMenuLabel(normalized)} - most accurate, heavier on CPU`
@@ -4552,6 +4671,24 @@ function rebuildMenu() {
         enabled: false
       }]
 
+  const sttLanguageMenu = sttPreferences.supported
+    ? [
+        { label: sttLanguagesLabel(sttPreferences.selectedLanguages), enabled: false },
+        { type: 'separator' },
+        ...sttPreferences.languageOptions.map((code) => ({
+          label: sttLanguageLabel(code),
+          type: 'checkbox',
+          checked: sttPreferences.selectedLanguages.includes(code),
+          click: (item) => {
+            void setSttLanguageEnabled(code, Boolean(item.checked))
+          }
+        }))
+      ]
+    : [{
+        label: 'Not available for this STT provider',
+        enabled: false
+      }]
+
   const sttPromptTemplateMenu = sttPreferences.templateSupported
     ? sttPreferences.templateOptions.map((value) => ({
         label: sttPromptTemplateMenuLabel(value),
@@ -4618,6 +4755,10 @@ function rebuildMenu() {
     {
       label: 'Speech to Text Model',
       submenu: sttModelMenu
+    },
+    {
+      label: 'Speech to Text Language',
+      submenu: sttLanguageMenu
     },
     {
       label: 'Speech to Text Template',
@@ -5133,12 +5274,14 @@ async function refreshRuntimeState(notify = false) {
     ? await readSharedSpeechPreferences().catch(() => ({
         sttDevice: '',
         sttModel: '',
+        sttLanguages: [],
         sttPromptTemplate: defaultSttPromptTemplate(),
         sttPromptContext: ''
       }))
     : {
         sttDevice: '',
         sttModel: '',
+        sttLanguages: [],
         sttPromptTemplate: defaultSttPromptTemplate(),
         sttPromptContext: ''
       }
@@ -5161,10 +5304,12 @@ async function refreshRuntimeState(notify = false) {
     supported,
     options: availableDevices,
     modelOptions: sttModelPreferenceOptions(),
+    languageOptions: sttLanguageOptionCodes(),
     templateSupported,
     templateOptions: sttPromptTemplateOptions(),
     selectedDevice: selectedStoredDevice || currentDevice || availableDevices[0] || '',
     selectedModel: currentModelPreference || storedPreferences.sttModel || STT_MODEL_MIDDLE,
+    selectedLanguages: storedPreferences.sttLanguages.length ? storedPreferences.sttLanguages : [STT_LANGUAGE_EN],
     selectedTemplate,
     selectedPromptContext,
     provider: String(sttHealth?.providerLabel || speech?.label || runtimeConfig?.stt?.provider || '').trim(),
@@ -5655,7 +5800,9 @@ async function updateSttPromptTemplate(value) {
 async function updateSttPreferences(input = {}) {
   const requestedDevice = normalizeSttDevicePreference(input?.sttDevice)
   const requestedModel = normalizeSttModelPreference(input?.sttModel)
-  if (!requestedDevice && !requestedModel) {
+  const requestedLanguages = normalizeSttLanguages(input?.sttLanguages)
+  const languagesRequested = requestedLanguages.length > 0
+  if (!requestedDevice && !requestedModel && !languagesRequested) {
     return
   }
 
@@ -5667,15 +5814,20 @@ async function updateSttPreferences(input = {}) {
   const stored = await readSharedSpeechPreferences()
   const nextSelectedDevice = requestedDevice || stored.sttDevice || sttPreferences.selectedDevice
   const nextSelectedModel = requestedModel || stored.sttModel || sttPreferences.selectedModel
+  const nextSelectedLanguages = languagesRequested
+    ? requestedLanguages
+    : stored.sttLanguages.length ? stored.sttLanguages : normalizeSttLanguages(sttPreferences.selectedLanguages)
   const requestedParts = [
     requestedDevice ? `device ${sttDeviceLabel(requestedDevice)}` : '',
-    requestedModel ? `model ${sttModelMenuLabel(requestedModel)}` : ''
+    requestedModel ? `model ${sttModelMenuLabel(requestedModel)}` : '',
+    languagesRequested ? `language ${sttLanguagesLabel(requestedLanguages)}` : ''
   ].filter(Boolean)
 
   sttPreferences = {
     ...sttPreferences,
     selectedDevice: nextSelectedDevice,
     selectedModel: nextSelectedModel,
+    selectedLanguages: nextSelectedLanguages.length ? nextSelectedLanguages : [STT_LANGUAGE_EN],
     error: ''
   }
   rebuildMenu()
@@ -5688,8 +5840,10 @@ async function updateSttPreferences(input = {}) {
     const runtimePatch = requestedDevice
       ? speechPreferenceRuntimePatch(requestedDevice)
       : {}
-    if (requestedModel) {
-      runtimePatch.model = sttModelNameForPreference(requestedModel)
+    if (requestedModel || languagesRequested) {
+      // The language decides between the English-only and multilingual
+      // checkpoint, so a language change reloads the model too.
+      runtimePatch.model = sttModelNameForPreference(nextSelectedModel, nextSelectedLanguages)
     }
 
     const result = await speech.updateSttRuntime(runtimePatch)
@@ -5705,10 +5859,12 @@ async function updateSttPreferences(input = {}) {
     }
 
     applySttRuntimePatchToConfig(result)
+    applySttLanguagesToConfig(nextSelectedLanguages)
 
     await writeSharedSpeechPreferences({
       sttDevice: nextSelectedDevice,
-      sttModel: nextSelectedModel
+      sttModel: nextSelectedModel,
+      sttLanguages: nextSelectedLanguages
     })
     sttReadyForDictation = false
     await waitForPendingSttWarmup().catch(() => null)
@@ -5745,15 +5901,26 @@ async function applySharedSpeechPreferencesOnStartup() {
     }
     applySttPromptTemplateToConfig(stored.sttPromptTemplate)
   }
-  if ((!stored.sttDevice && !stored.sttModel) || typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
+  const hasStoredLanguages = stored.sttLanguages.length > 0
+  if (hasStoredLanguages) {
+    sttPreferences = {
+      ...sttPreferences,
+      selectedLanguages: stored.sttLanguages
+    }
+    applySttLanguagesToConfig(stored.sttLanguages)
+  }
+  if ((!stored.sttDevice && !stored.sttModel && !hasStoredLanguages) || typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
     return
   }
 
   const runtimePatch = stored.sttDevice
     ? speechPreferenceRuntimePatch(stored.sttDevice)
     : {}
-  if (stored.sttModel) {
-    runtimePatch.model = sttModelNameForPreference(stored.sttModel)
+  if (stored.sttModel || hasStoredLanguages) {
+    const modelPreference = stored.sttModel
+      || runtimeSttModelPreference(runtimeConfig?.stt?.local?.model)
+      || STT_MODEL_MIDDLE
+    runtimePatch.model = sttModelNameForPreference(modelPreference, stored.sttLanguages)
   }
   const currentRuntime = await speech.getSttRuntime().catch(() => null)
   if (currentRuntime?.ok && sttRuntimeMatchesPatch(currentRuntime, runtimePatch)) {

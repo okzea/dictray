@@ -674,6 +674,7 @@ class LocalSttDaemonClient {
           'x-stt-model-dir': String(payload?.modelDir || '').trim(),
           'x-stt-device': String(payload?.device || '').trim() || 'auto',
           'x-stt-compute-type': String(payload?.computeType || '').trim() || 'auto',
+          'x-stt-language': String(payload?.language || '').trim(),
           'x-stt-initial-prompt-b64': encodeHeaderBase64(payload?.initialPrompt)
         },
         signal: options?.signal || null,
@@ -932,6 +933,7 @@ export class SpeechTools {
             modelDir: String(stt.modelDir || '').trim(),
             device: String(stt.device || '').trim() || 'auto',
             computeType: String(stt.computeType || '').trim() || 'auto',
+            language: String(stt.language || '').trim(),
             initialPrompt: String(stt.initialPrompt || '').trim()
           }, 120000)
           if (!payload?.ok) {
@@ -1326,6 +1328,7 @@ export class SpeechTools {
         modelDir: String(stt.modelDir || '').trim(),
         device: String(stt.device || '').trim() || 'auto',
         computeType: String(stt.computeType || '').trim() || 'auto',
+        language: String(stt.language || '').trim(),
         initialPrompt: String(stt.initialPrompt || '').trim()
       }, {
         signal: options?.signal || null,

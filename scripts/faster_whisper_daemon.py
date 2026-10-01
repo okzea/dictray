@@ -353,6 +353,7 @@ def resolve_runtime_command(command: dict) -> dict:
         "device": requested_device or str(snapshot.get("device") or "auto").strip() or "auto",
         "computeType": requested_compute_type,
         "initialPrompt": str(command.get("initialPrompt") or "").strip(),
+        "language": str(command.get("language") or "").strip(),
     }
 
 
@@ -440,7 +441,26 @@ def clear_vad_cache() -> None:
         pass
 
 
-def run_transcribe(model, input_path: str, vad_filter: bool, initial_prompt: str = ""):
+def parse_language_candidates(language: str) -> list[str]:
+    return [code for code in (part.strip().lower() for part in str(language or "").split(",")) if code]
+
+
+def pick_candidate_language(model, audio, candidates: list[str]) -> str:
+    # Free detection weighs every Whisper language, so a short or accented
+    # clip can come back as a language the speaker never uses. Score the audio
+    # once and keep the likeliest of the allowed ones instead.
+    detect_language = getattr(model, "detect_language", None)
+    if detect_language is None:  # faster-whisper < 1.1
+        return ""
+    try:
+        _language, _probability, all_probabilities = detect_language(audio)
+    except Exception:
+        return ""
+    probabilities = dict(all_probabilities or [])
+    return max(candidates, key=lambda code: probabilities.get(code, 0.0))
+
+
+def run_transcribe(model, input_path: str, vad_filter: bool, initial_prompt: str = "", language: str = ""):
     transcribe_kwargs = {
         "beam_size": 1,
         "best_of": 1,
@@ -451,8 +471,22 @@ def run_transcribe(model, input_path: str, vad_filter: bool, initial_prompt: str
     normalized_prompt = str(initial_prompt or "").strip()
     if normalized_prompt:
         transcribe_kwargs["initial_prompt"] = normalized_prompt
+    # `language` is one code to force it, several ("en,fr") to detect among
+    # them, or empty to detect freely from the first 30 s. English-only (.en)
+    # models ignore it and always transcribe English.
+    audio = input_path
+    candidates = parse_language_candidates(language)
+    if len(candidates) == 1:
+        transcribe_kwargs["language"] = candidates[0]
+    elif len(candidates) > 1 and getattr(getattr(model, "model", None), "is_multilingual", True):
+        from faster_whisper.audio import decode_audio
+
+        audio = decode_audio(input_path, sampling_rate=model.feature_extractor.sampling_rate)
+        picked = pick_candidate_language(model, audio, candidates)
+        if picked:
+            transcribe_kwargs["language"] = picked
     segments, info = model.transcribe(
-        input_path,
+        audio,
         **transcribe_kwargs,
     )
     # Fully consume the generator to release internal ctranslate2 resources.
@@ -465,30 +499,30 @@ def run_transcribe(model, input_path: str, vad_filter: bool, initial_prompt: str
     return transcript, language
 
 
-def perform_transcribe(model, input_path: str, initial_prompt: str = ""):
+def perform_transcribe(model, input_path: str, initial_prompt: str = "", language: str = ""):
     # Press-to-talk dictation is sensitive to clipped starts and ends. Running
     # faster-whisper with VAD enabled as the primary pass can return a non-empty
     # transcript while still trimming quiet edge words, so prefer the full-audio
     # pass here. The VAD cache is still cleared to keep Windows runtime behavior
     # stable even when the model internals touch the VAD module.
-    transcript, language = run_transcribe(model, input_path, False, initial_prompt)
+    transcript, detected_language = run_transcribe(model, input_path, False, initial_prompt, language)
     clear_vad_cache()
     gc.collect()
-    return transcript, language
+    return transcript, detected_language
 
 
-def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str, input_path: str, initial_prompt: str = ""):
+def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: str, requested_compute_type: str, input_path: str, initial_prompt: str = "", language: str = ""):
     model, runtime = load_model(model_name, model_dir, requested_device, requested_compute_type)
     fallback_allowed = allow_cpu_fallback(requested_device)
     try:
-        transcript, language = perform_transcribe(model, input_path, initial_prompt)
-        return runtime, transcript, language
+        transcript, detected_language = perform_transcribe(model, input_path, initial_prompt, language)
+        return runtime, transcript, detected_language
     except Exception as error:
         if fallback_allowed and runtime.get("device") != "cpu" and cuda_runtime_unavailable(error_text(error)):
             discard_runtime(runtime)
             fallback_model, fallback_runtime = load_model(model_name, model_dir, "cpu", "int8")
-            transcript, language = perform_transcribe(fallback_model, input_path, initial_prompt)
-            return fallback_runtime, transcript, language
+            transcript, detected_language = perform_transcribe(fallback_model, input_path, initial_prompt, language)
+            return fallback_runtime, transcript, detected_language
         raise
 
 
@@ -534,6 +568,7 @@ def warm_runtime(command: dict) -> dict:
                 str(resolved.get("computeType") or "auto").strip() or "auto",
                 temp_path,
                 str(resolved.get("initialPrompt") or "").strip(),
+                str(resolved.get("language") or "").strip(),
             )
         set_active_runtime(runtime)
         return {
@@ -572,6 +607,7 @@ def transcribe_audio(command: dict, audio_bytes: bytes, content_type: str) -> di
                 str(command.get("computeType") or "auto").strip() or "auto",
                 str(wav_path),
                 str(command.get("initialPrompt") or "").strip(),
+                str(command.get("language") or "").strip(),
             )
             transcribe_ms = round((time.perf_counter() - transcribe_started) * 1000)
 
@@ -647,6 +683,7 @@ class Handler(BaseHTTPRequestHandler):
                     "device": self.headers.get("X-Stt-Device", "auto"),
                     "computeType": self.headers.get("X-Stt-Compute-Type", "auto"),
                     "initialPrompt": initial_prompt,
+                    "language": self.headers.get("X-Stt-Language", ""),
                 }
                 result = transcribe_audio(payload, raw_body, self.headers.get("Content-Type", "application/octet-stream"))
                 self.send_json(200, result)
