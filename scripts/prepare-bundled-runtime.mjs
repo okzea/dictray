@@ -38,6 +38,11 @@ const helperProjects = [
     name: 'windows-voice-overlay',
     projectPath: path.join(rootDir, 'scripts', 'windows-voice-overlay', 'WindowsVoiceOverlay.csproj'),
     exeName: 'WindowsVoiceOverlay.exe'
+  },
+  {
+    name: 'windows-onboarding',
+    projectPath: path.join(rootDir, 'scripts', 'windows-onboarding', 'WindowsOnboarding.csproj'),
+    exeName: 'WindowsOnboarding.exe'
   }
 ]
 

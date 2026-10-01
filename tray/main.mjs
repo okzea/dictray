@@ -105,6 +105,11 @@ const WINDOWS_TRAY_COMMAND_PATH = path.join(WINDOWS_TRAY_DIR, 'command.json')
 const WINDOWS_TRAY_HELPER = resolveBundledHelperExecutable('windows-tray-host', 'WindowsTrayHost.exe')
   || path.join(__dirname, '..', 'scripts', 'windows-tray-host', 'bin', 'Release', 'net10.0-windows', 'WindowsTrayHost.exe')
 const WINDOWS_TRAY_POLL_INTERVAL_MS = 500
+const WINDOWS_ONBOARDING_DIR = path.join(WINDOWS_APPDATA_HOME, 'DicTray', 'onboarding')
+const WINDOWS_ONBOARDING_STATE_PATH = path.join(WINDOWS_ONBOARDING_DIR, 'status.json')
+const WINDOWS_ONBOARDING_COMMAND_PATH = path.join(WINDOWS_ONBOARDING_DIR, 'command.json')
+const WINDOWS_ONBOARDING_HELPER = resolveBundledHelperExecutable('windows-onboarding', 'WindowsOnboarding.exe')
+  || path.join(__dirname, '..', 'scripts', 'windows-onboarding', 'bin', 'Release', 'net10.0-windows', 'WindowsOnboarding.exe')
 const DEFAULT_HOTKEY = 'CommandOrControl+Space'
 const DEFAULT_PROMPT_HOTKEY = 'Alt+Shift+Space'
 const SHORTCUT_MODE_TOGGLE = 'toggle'
@@ -277,6 +282,13 @@ let windowsTrayPollTimer = null
 let windowsTrayCommandWatcher = null
 let windowsTrayCommandProcessing = false
 let windowsTrayBridgeEnabled = false
+let windowsOnboardingProcess = null
+let windowsOnboardingStatusWriter = null
+let windowsOnboardingPollTimer = null
+let windowsOnboardingCommandWatcher = null
+let windowsOnboardingCommandProcessing = false
+let windowsOnboardingUiPending = false
+let windowsOnboardingUiError = ''
 let trayHotkey = DEFAULT_HOTKEY
 let promptTrayHotkey = DEFAULT_PROMPT_HOTKEY
 let rewriteEnabled = false
@@ -1971,6 +1983,7 @@ function stopWindowsTrayBridge() {
   } catch {
     // best-effort — the process is exiting
   }
+  stopWindowsOnboardingWindow()
 }
 
 function timingColor(value, warnMs, badMs) {
@@ -3150,6 +3163,28 @@ async function syncMacosOnboardingState() {
   await writeJsonFile(MACOS_ONBOARDING_STATE_PATH, buildMacosOnboardingState())
 }
 
+function buildWindowsOnboardingState() {
+  return {
+    ...onboardingStatePayload(),
+    platform: 'win32',
+    ui: {
+      pending: windowsOnboardingUiPending,
+      error: windowsOnboardingUiError
+    }
+  }
+}
+
+// Only written while the Quick Start window is open: nothing reads it otherwise.
+async function syncWindowsOnboardingState({ force = false } = {}) {
+  if (process.platform !== 'win32' || (!force && !windowsOnboardingProcess)) {
+    return
+  }
+  windowsOnboardingStatusWriter ||= createStatusFileWriter(WINDOWS_ONBOARDING_STATE_PATH, (error) => {
+    console.error('[dictray] Failed to write Windows Quick Start state:', error?.message || error)
+  })
+  await windowsOnboardingStatusWriter(JSON.stringify(buildWindowsOnboardingState()))
+}
+
 function buildMacosOverlayPayload() {
   const payload = buildVoiceOverlayPayload()
   return {
@@ -3428,6 +3463,107 @@ async function launchMacosNativeOnboardingWindow() {
   })
 }
 
+async function launchWindowsNativeOnboardingWindow() {
+  if (windowsOnboardingProcess && !windowsOnboardingProcess.killed) {
+    // Reopening Quick Start should surface the window the user may have hidden.
+    windowsOnboardingProcess.stdin?.write('focus\n')
+    return
+  }
+  await access(WINDOWS_ONBOARDING_HELPER)
+  await mkdir(WINDOWS_ONBOARDING_DIR, { recursive: true })
+  // A command from a window that closed before the tray read it would
+  // otherwise be applied as soon as this window opens.
+  await unlink(WINDOWS_ONBOARDING_COMMAND_PATH).catch(() => null)
+  windowsOnboardingUiPending = false
+  windowsOnboardingUiError = ''
+  await syncWindowsOnboardingState({ force: true })
+
+  // stdin stays open: the helper exits on EOF if the tray dies without writing
+  // a quit payload, and a "focus" line brings the window back when reopened.
+  windowsOnboardingProcess = spawn(WINDOWS_ONBOARDING_HELPER, [WINDOWS_ONBOARDING_STATE_PATH, WINDOWS_ONBOARDING_COMMAND_PATH, APP_ICON_ICO_PATH], {
+    stdio: ['pipe', 'ignore', 'pipe'],
+    windowsHide: false
+  })
+  windowsOnboardingProcess.stdin.on('error', () => {})
+
+  const stderr = readline.createInterface({ input: windowsOnboardingProcess.stderr })
+  stderr.on('line', (line) => {
+    const message = String(line || '').trim()
+    if (message) {
+      console.error(`[dictray] Windows Quick Start: ${message}`)
+    }
+  })
+
+  const helper = windowsOnboardingProcess
+  helper.on('exit', (code) => {
+    if (windowsOnboardingProcess === helper) {
+      windowsOnboardingProcess = null
+      stopWindowsOnboardingCommandWatch()
+    }
+    if (!isQuitting && code && code !== 0) {
+      console.error(`[dictray] Windows Quick Start helper exited with code ${code}.`)
+    }
+  })
+  helper.on('error', (error) => {
+    if (windowsOnboardingProcess === helper) {
+      windowsOnboardingProcess = null
+      stopWindowsOnboardingCommandWatch()
+    }
+    console.error('[dictray] Failed to start Windows Quick Start helper:', error?.message || error)
+  })
+
+  startWindowsOnboardingCommandWatch()
+}
+
+function startWindowsOnboardingCommandWatch() {
+  if (!windowsOnboardingPollTimer) {
+    windowsOnboardingPollTimer = setInterval(() => {
+      void processWindowsOnboardingCommand().catch(() => {})
+    }, WINDOWS_TRAY_POLL_INTERVAL_MS)
+  }
+  if (!windowsOnboardingCommandWatcher) {
+    try {
+      windowsOnboardingCommandWatcher = fsWatch(WINDOWS_ONBOARDING_DIR, { persistent: false }, (_eventType, filename) => {
+        if (filename === path.basename(WINDOWS_ONBOARDING_COMMAND_PATH)) {
+          void processWindowsOnboardingCommand().catch(() => {})
+        }
+      })
+      windowsOnboardingCommandWatcher.on('error', () => {})
+    } catch {
+      windowsOnboardingCommandWatcher = null
+    }
+  }
+}
+
+function stopWindowsOnboardingCommandWatch() {
+  if (windowsOnboardingPollTimer) {
+    clearInterval(windowsOnboardingPollTimer)
+    windowsOnboardingPollTimer = null
+  }
+  if (windowsOnboardingCommandWatcher) {
+    windowsOnboardingCommandWatcher.close()
+    windowsOnboardingCommandWatcher = null
+  }
+}
+
+function stopWindowsOnboardingWindow() {
+  stopWindowsOnboardingCommandWatch()
+  if (!windowsOnboardingProcess) {
+    return
+  }
+  try {
+    writeFileSync(WINDOWS_ONBOARDING_STATE_PATH, JSON.stringify({ version: 1, quit: true }), 'utf8')
+  } catch {
+    // best-effort — the process is exiting
+  }
+  try {
+    windowsOnboardingProcess.kill()
+  } catch {
+    // ignore
+  }
+  windowsOnboardingProcess = null
+}
+
 async function handleLinuxNativeInputSourceCommand(command = {}) {
   switch (String(command?.action || '').trim()) {
     case 'set_input_source':
@@ -3480,6 +3616,43 @@ async function handleMacosNativeOnboardingCommand(command = {}) {
     }
     default:
       return
+  }
+}
+
+async function handleWindowsNativeOnboardingCommand(command = {}) {
+  switch (String(command?.action || '').trim()) {
+    case 'complete_onboarding': {
+      windowsOnboardingUiPending = true
+      windowsOnboardingUiError = ''
+      await syncWindowsOnboardingState().catch(() => null)
+      try {
+        await completeOnboarding(command?.payload || {})
+      } catch (error) {
+        windowsOnboardingUiError = compactText(error?.message || error || 'Failed to finish Quick Start.', 160)
+      } finally {
+        windowsOnboardingUiPending = false
+        await syncWindowsOnboardingState().catch(() => null)
+      }
+      return
+    }
+    default:
+      return
+  }
+}
+
+async function processWindowsOnboardingCommand() {
+  if (process.platform !== 'win32' || windowsOnboardingCommandProcessing) {
+    return
+  }
+  windowsOnboardingCommandProcessing = true
+  try {
+    const command = await readJsonFile(WINDOWS_ONBOARDING_COMMAND_PATH, null)
+    if (command && typeof command === 'object') {
+      await unlink(WINDOWS_ONBOARDING_COMMAND_PATH).catch(() => null)
+      await handleWindowsNativeOnboardingCommand(command)
+    }
+  } finally {
+    windowsOnboardingCommandProcessing = false
   }
 }
 
@@ -4156,7 +4329,12 @@ async function openOnboardingWindow({ markSeen = false } = {}) {
   }
 
   if (process.platform === 'win32') {
-    showNotification(APP_NAME, 'Quick Start is not available in the native Windows tray yet.')
+    try {
+      await launchWindowsNativeOnboardingWindow()
+    } catch (error) {
+      console.error('[dictray] Failed to open native Windows Quick Start window:', error?.message || error)
+      showNotification(APP_NAME, compactText(error?.message || error || 'Failed to open Quick Start.', 180))
+    }
     return null
   }
 
@@ -4289,8 +4467,10 @@ async function completeOnboarding(input = {}) {
   rebuildMenu()
   linuxOnboardingUiError = ''
   macosOnboardingUiError = ''
+  windowsOnboardingUiError = ''
   await syncLinuxOnboardingState().catch(() => null)
   await syncMacosOnboardingState().catch(() => null)
+  await syncWindowsOnboardingState().catch(() => null)
   return onboardingStatePayload()
 }
 
@@ -4860,6 +5040,7 @@ function rebuildMenu() {
   void syncGnomePanelState()
   void syncMacosMenuState()
   void syncMacosOnboardingState()
+  void syncWindowsOnboardingState()
   void syncWindowsTrayState()
 }
 
