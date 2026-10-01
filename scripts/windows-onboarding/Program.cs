@@ -112,6 +112,8 @@ internal sealed record BenchmarkStats(
 internal static class QuickStartText
 {
     public const double LargeStudyAverageWpm = 52.0;
+    // Above the fastest recorded sustained typing; anything quicker was pasted.
+    public const double MaxPlausibleWpm = 250.0;
 
     public static readonly ResolvedHotkeyPreset[] FallbackHotkeyPresets =
     [
@@ -1019,6 +1021,11 @@ internal sealed class QuickStartForm : Form
         return Math.Max(1, (int)(DateTime.UtcNow - startedAt).TotalMilliseconds);
     }
 
+    private bool PlausibleTypingTime(int elapsedMs)
+    {
+        return elapsedMs > 0 && ComputeBenchmarkStats(elapsedMs).WordsPerMinute <= QuickStartText.MaxPlausibleWpm;
+    }
+
     private void UpdateBenchmarkSummary()
     {
         var typed = QuickStartText.NormalizeTypedText(_typingBox.Text);
@@ -1041,9 +1048,24 @@ internal sealed class QuickStartForm : Form
             return;
         }
 
+        if (TypedTextMatchesSample() && _benchmarkElapsedMs <= 0 && !PlausibleTypingTime(ActiveBenchmarkElapsedMs()))
+        {
+            // The phrase arrived faster than anyone types it, from a paste or
+            // autofill: a near-zero time would inflate the savings estimates.
+            _benchmarkStartedAt = null;
+            _benchmarkTimer.Stop();
+            _typingBox.ForeColor = ErrorColor;
+            _benchmarkSummaryLabel.ForeColor = ErrorColor;
+            _benchmarkHintLabel.ForeColor = SecondaryColor;
+            _benchmarkSummaryLabel.Text = "Pasted text cannot be timed.";
+            _benchmarkHintLabel.Text = "Press Restart, then type the phrase yourself.";
+            _toolTip.SetToolTip(_benchmarkInfoButton, QuickStartText.TypingScoreTooltip());
+            UpdateSummary();
+            return;
+        }
+
         if (TypedTextMatchesSample())
         {
-            _benchmarkStartedAt ??= DateTime.UtcNow;
             if (_benchmarkElapsedMs <= 0)
             {
                 _benchmarkElapsedMs = ActiveBenchmarkElapsedMs();

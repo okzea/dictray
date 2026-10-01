@@ -7,6 +7,7 @@
 // which alone exceeds the 2 GB GitHub release asset limit, and they are useless
 // on machines without an NVIDIA GPU. `pnpm gpu:setup` installs them on demand.
 
+import { existsSync } from 'node:fs'
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
@@ -103,6 +104,15 @@ async function stagePackage(outputDir, version, { skipRuntime = false } = {}) {
 
   if (skipRuntime) {
     log('Reusing the existing bundled runtime (--skip-runtime).')
+    // The package runs the helpers published into the runtime, not the dotnet
+    // build output below, so a runtime prepared before a helper was added would
+    // ship without it.
+    const missing = HELPER_PROJECTS.filter((project) => !existsSync(
+      path.join(bundledRuntimeRoot, 'helpers', project.dir, project.csproj.replace(/\.csproj$/, '.exe'))
+    ))
+    if (missing.length) {
+      throw new Error(`The bundled runtime lacks ${missing.map((project) => project.dir).join(', ')}. Run without --skip-runtime to rebuild it.`)
+    }
   } else {
     log('Preparing bundled runtime.')
     await run(process.execPath, [bundleRuntimeScript])
