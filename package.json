@@ -1,7 +1,7 @@
 {
   "name": "dictray",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Tray app for local speech-to-text dictation with focused-window-aware text insertion",
   "type": "module",
   "engines": {
