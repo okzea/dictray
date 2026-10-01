@@ -349,6 +349,17 @@ internal sealed class QuickStartForm : Form
     protected override void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        BringWindowForward();
+        _nameField.Focus();
+        WatchParentProcess();
+    }
+
+    private void BringWindowForward()
+    {
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+        }
         BringToFront();
         // The helper is spawned by the tray core, which does not own the
         // foreground, so Windows would otherwise open the window behind others.
@@ -356,7 +367,48 @@ internal sealed class QuickStartForm : Form
         TopMost = false;
         Activate();
         NativeMethods.SetForegroundWindow(Handle);
-        _nameField.Focus();
+    }
+
+    /// <summary>
+    /// The tray keeps standard input open: a "focus" line asks this window to come
+    /// forward again when Quick Start is reopened, and EOF means the tray died
+    /// without writing a quit payload, which Windows would not reap us for.
+    /// </summary>
+    private void WatchParentProcess()
+    {
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var reader = new StreamReader(Console.OpenStandardInput(), Encoding.UTF8);
+                string? line;
+                while ((line = reader.ReadLine()) is not null)
+                {
+                    if (line.Trim() == "focus")
+                    {
+                        BeginInvoke(BringWindowForward);
+                    }
+                }
+            }
+            catch
+            {
+                // treat a broken pipe as parent death
+            }
+
+            try
+            {
+                BeginInvoke(Close);
+            }
+            catch (InvalidOperationException)
+            {
+                // the window is already gone
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "parent-watch"
+        };
+        thread.Start();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)

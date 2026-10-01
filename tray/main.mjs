@@ -3463,6 +3463,8 @@ async function launchMacosNativeOnboardingWindow() {
 
 async function launchWindowsNativeOnboardingWindow() {
   if (windowsOnboardingProcess && !windowsOnboardingProcess.killed) {
+    // Reopening Quick Start should surface the window the user may have hidden.
+    windowsOnboardingProcess.stdin?.write('focus\n')
     return
   }
   await access(WINDOWS_ONBOARDING_HELPER)
@@ -3474,10 +3476,13 @@ async function launchWindowsNativeOnboardingWindow() {
   windowsOnboardingUiError = ''
   await syncWindowsOnboardingState({ force: true })
 
+  // stdin stays open: the helper exits on EOF if the tray dies without writing
+  // a quit payload, and a "focus" line brings the window back when reopened.
   windowsOnboardingProcess = spawn(WINDOWS_ONBOARDING_HELPER, [WINDOWS_ONBOARDING_STATE_PATH, WINDOWS_ONBOARDING_COMMAND_PATH, APP_ICON_ICO_PATH], {
-    stdio: ['ignore', 'ignore', 'pipe'],
+    stdio: ['pipe', 'ignore', 'pipe'],
     windowsHide: false
   })
+  windowsOnboardingProcess.stdin.on('error', () => {})
 
   const stderr = readline.createInterface({ input: windowsOnboardingProcess.stderr })
   stderr.on('line', (line) => {
