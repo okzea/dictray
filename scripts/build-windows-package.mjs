@@ -28,7 +28,8 @@ const HELPER_PROJECTS = [
   { dir: 'windows-system-volume', csproj: 'WindowsSystemVolume.csproj' },
   { dir: 'windows-native-capture', csproj: 'WindowsNativeCapture.csproj' },
   { dir: 'windows-tray-host', csproj: 'WindowsTrayHost.csproj' },
-  { dir: 'windows-voice-overlay', csproj: 'WindowsVoiceOverlay.csproj' }
+  { dir: 'windows-voice-overlay', csproj: 'WindowsVoiceOverlay.csproj' },
+  { dir: 'windows-onboarding', csproj: 'WindowsOnboarding.csproj' }
 ]
 
 function log(message) {
