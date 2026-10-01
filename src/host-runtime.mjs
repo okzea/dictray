@@ -435,6 +435,32 @@ function powershellSingleQuoted(value) {
   return `'${String(value || '').replace(/'/g, "''")}'`
 }
 
+// Hands a path or URL to the desktop's default handler, the way Electron's
+// shell.openPath and shell.openExternal would.
+function openWithSystemHandler(target) {
+  const value = String(target || '')
+  if (!value) {
+    return
+  }
+  try {
+    if (process.platform === 'darwin') {
+      spawnDetached('open', [value])
+    } else if (process.platform === 'win32') {
+      spawnDetached('powershell.exe', [
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-Command',
+        `Start-Process -FilePath ${powershellSingleQuoted(value)}`
+      ])
+    } else {
+      spawnDetached('xdg-open', [value])
+    }
+  } catch {
+    // ignore
+  }
+}
+
 class HeadlessNotification {
   constructor({ title = '', body = '' } = {}) {
     this.title = String(title || '').trim() || 'DicTray'
@@ -967,26 +993,14 @@ function createHeadlessRuntime({
     },
     shell: {
       openPath(targetPath) {
-        if (process.platform === 'darwin') {
-          try {
-            spawnDetached('open', [String(targetPath || '')])
-          } catch {
-            // ignore
-          }
-        } else if (process.platform === 'win32') {
-          try {
-            spawnDetached('powershell.exe', [
-              '-NoProfile',
-              '-ExecutionPolicy',
-              'Bypass',
-              '-Command',
-              `Start-Process -FilePath ${powershellSingleQuoted(String(targetPath || ''))}`
-            ])
-          } catch {
-            // ignore
-          }
-        }
+        openWithSystemHandler(targetPath)
         return Promise.resolve('')
+      },
+      // The tray calls this to show the release page. Without it the call threw
+      // and took the whole headless tray down with it.
+      openExternal(url) {
+        openWithSystemHandler(url)
+        return Promise.resolve()
       }
     },
     Tray: HeadlessTray,
