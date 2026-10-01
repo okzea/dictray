@@ -2315,6 +2315,18 @@ function sttModelNameForPreference(value, languages = sttPreferences.selectedLan
   }
 }
 
+function applySttPromptTemplateToConfig(templateId) {
+  if (!runtimeConfig?.stt?.local) {
+    return
+  }
+
+  const initialPrompt = sttPromptTextForPreferences(templateId, sttPreferences.selectedPromptContext)
+  runtimeConfig.stt.local.initialPrompt = initialPrompt
+  if (speech?.config?.stt?.local) {
+    speech.config.stt.local.initialPrompt = initialPrompt
+  }
+}
+
 function sttLanguageOptionCodes() {
   return STT_LANGUAGE_OPTIONS.map((option) => option.code)
 }
