@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -8,12 +9,30 @@ if (args.Length < 2)
     return;
 }
 
+// The optional fourth argument is the tray process id. Nothing else ends this
+// helper when that process dies without writing a quit state (a closed console,
+// a crash, a kill), and an orphaned icon looks like a DicTray that has stopped
+// answering. Holding the handle rather than the id makes pid reuse harmless.
+Process? parent = null;
+if (args.Length > 3 && int.TryParse(args[3], out var parentPid))
+{
+    try
+    {
+        parent = Process.GetProcessById(parentPid);
+    }
+    catch (ArgumentException)
+    {
+        return;
+    }
+}
+
 Application.EnableVisualStyles();
 Application.SetCompatibleTextRenderingDefault(false);
 Application.Run(new TrayHostContext(
     statePath: args[0],
     commandPath: args[1],
-    iconPath: args.Length > 2 ? args[2] : ""));
+    iconPath: args.Length > 2 ? args[2] : "",
+    parent: parent));
 
 internal sealed class TrayHostContext : ApplicationContext
 {
@@ -28,12 +47,14 @@ internal sealed class TrayHostContext : ApplicationContext
     private readonly ContextMenuStrip _contextMenuTrigger;
     private readonly NativeMenuWindow _menuWindow = new();
     private readonly System.Windows.Forms.Timer _timer;
+    private readonly Process? _parent;
     private string _lastStateJson = "";
     private TrayState? _state;
     private bool _disposed;
 
-    public TrayHostContext(string statePath, string commandPath, string iconPath)
+    public TrayHostContext(string statePath, string commandPath, string iconPath, Process? parent)
     {
+        _parent = parent;
         _statePath = Path.GetFullPath(statePath);
         _commandPath = Path.GetFullPath(commandPath);
         Directory.CreateDirectory(Path.GetDirectoryName(_statePath) ?? ".");
@@ -59,7 +80,7 @@ internal sealed class TrayHostContext : ApplicationContext
         {
             Interval = 500
         };
-        _timer.Tick += (_, _) => RefreshFromState();
+        _timer.Tick += (_, _) => OnTick();
         _timer.Start();
 
         RefreshFromState();
@@ -102,6 +123,34 @@ internal sealed class TrayHostContext : ApplicationContext
         if (!string.IsNullOrWhiteSpace(commandJson))
         {
             WriteCommand(commandJson);
+        }
+    }
+
+    private void OnTick()
+    {
+        if (ParentHasExited())
+        {
+            ExitThread();
+            return;
+        }
+
+        RefreshFromState();
+    }
+
+    private bool ParentHasExited()
+    {
+        try
+        {
+            return _parent?.HasExited ?? false;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+        catch (System.ComponentModel.Win32Exception)
+        {
+            // No access to the handle: keep running rather than guess.
+            return false;
         }
     }
 
@@ -207,6 +256,7 @@ internal sealed class TrayHostContext : ApplicationContext
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
             _menuWindow.DestroyHandle();
+            _parent?.Dispose();
         }
 
         base.Dispose(disposing);

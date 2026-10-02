@@ -37,6 +37,30 @@ import {
   sttPromptTextForPreferences
 } from '../src/stt-prompt-templates.mjs'
 import { createSttProvider } from '../src/stt-provider.mjs'
+import {
+  SPEECH_EFFORT_HIGH,
+  SPEECH_EFFORT_LOW,
+  SPEECH_EFFORT_MID,
+  STT_DEVICE_CPU,
+  STT_DEVICE_GPU,
+  STT_LANGUAGE_EN,
+  STT_LANGUAGE_OPTIONS,
+  STT_MODEL_ADVANCED,
+  STT_MODEL_MIDDLE,
+  STT_MODEL_PRECISE,
+  STT_MODEL_TINY,
+  normalizeSpeechEffort,
+  normalizeSttDevicePreference,
+  normalizeSttLanguages,
+  normalizeSttModelPreference,
+  onboardingSttModelPreference,
+  speechEffortForModel,
+  speechPreferenceRuntimePatch,
+  startupSttRuntimePatch,
+  sttLanguageOptionCodes,
+  sttModelNameForPreference,
+  sttModelPreferenceOptions
+} from '../src/stt-preferences.mjs'
 import { SystemVolumeBridge } from '../src/system-volume.mjs'
 import { UiAutomationBridge } from '../src/ui-automation.mjs'
 
@@ -162,25 +186,6 @@ const HOTKEY_BRIDGE = String(process.env.DICTATION_TRAY_HOTKEY_HELPER || '').tri
       || path.join(__dirname, '..', 'scripts', 'windows-hotkey-hook', 'bin', 'Release', 'net10.0-windows', 'WindowsHotkeyHook.exe'))
 const ALLOWED_PERMISSIONS = new Set(['media', 'microphone'])
 const FORCE_ONBOARDING = /^(1|true|yes)$/i.test(String(process.env.DICTATION_TRAY_FORCE_ONBOARDING || '').trim())
-const STT_DEVICE_CPU = 'cpu'
-const STT_DEVICE_GPU = 'gpu'
-const STT_MODEL_TINY = 'tiny'
-const STT_MODEL_MIDDLE = 'middle'
-const STT_MODEL_ADVANCED = 'advanced'
-const STT_MODEL_PRECISE = 'precise'
-const STT_LANGUAGE_EN = 'en'
-const STT_LANGUAGE_OPTIONS = [
-  { code: STT_LANGUAGE_EN, label: 'English' },
-  { code: 'fr', label: 'French' },
-  { code: 'es', label: 'Spanish' },
-  { code: 'de', label: 'German' },
-  { code: 'it', label: 'Italian' },
-  { code: 'pt', label: 'Portuguese' },
-  { code: 'nl', label: 'Dutch' }
-]
-const SPEECH_EFFORT_LOW = 'low'
-const SPEECH_EFFORT_MID = 'mid'
-const SPEECH_EFFORT_HIGH = 'high'
 const SPEECH_TO_TEXT_LABEL = 'Speech to Text'
 const TEXT_IMPROVEMENT_LABEL = 'Text Improvement'
 const DAILY_CHARACTER_STATS_RETENTION_DAYS = 7
@@ -1894,6 +1899,11 @@ async function initWindowsTrayBridge() {
     await access(WINDOWS_TRAY_HELPER)
   } catch (error) {
     console.error('[dictray] Windows tray helper is unavailable:', error?.message || error)
+    void appendDiagnosticsLog('windows-tray-error', {
+      stage: 'helper-unavailable',
+      helper: WINDOWS_TRAY_HELPER,
+      error: String(error?.message || error)
+    })
     return false
   }
 
@@ -1902,7 +1912,7 @@ async function initWindowsTrayBridge() {
 
   if (!windowsTrayProcess || windowsTrayProcess.killed) {
     try {
-      windowsTrayProcess = spawn(WINDOWS_TRAY_HELPER, [WINDOWS_TRAY_STATE_PATH, WINDOWS_TRAY_COMMAND_PATH, APP_ICON_ICO_PATH], {
+      windowsTrayProcess = spawn(WINDOWS_TRAY_HELPER, [WINDOWS_TRAY_STATE_PATH, WINDOWS_TRAY_COMMAND_PATH, APP_ICON_ICO_PATH, String(process.pid)], {
         stdio: ['ignore', 'ignore', 'pipe'],
         windowsHide: true
       })
@@ -1922,6 +1932,10 @@ async function initWindowsTrayBridge() {
         }
         if (!isQuitting) {
           console.error(`[dictray] Windows tray helper exited with code ${code ?? 0}.`)
+          void appendDiagnosticsLog('windows-tray-error', {
+            stage: 'helper-exited',
+            code: code ?? 0
+          })
         }
       })
       helper.on('error', (error) => {
@@ -1929,6 +1943,10 @@ async function initWindowsTrayBridge() {
           windowsTrayProcess = null
         }
         console.error('[dictray] Failed to start Windows tray helper:', error?.message || error)
+        void appendDiagnosticsLog('windows-tray-error', {
+          stage: 'helper-spawn',
+          error: String(error?.message || error)
+        })
       })
     } catch (error) {
       console.error('[dictray] Failed to launch Windows tray helper:', error?.message || error)
@@ -2246,18 +2264,6 @@ function inputSourcePrimaryActionLabel() {
   return linuxNativeUtilityWindowsEnabled() ? 'Open Microphone Setup' : 'Open Live Preview'
 }
 
-function normalizeSttDevicePreference(value) {
-  switch (String(value || '').trim().toLowerCase()) {
-    case 'gpu':
-    case 'cuda':
-      return STT_DEVICE_GPU
-    case 'cpu':
-      return STT_DEVICE_CPU
-    default:
-      return ''
-  }
-}
-
 function runtimeSttDevicePreference(value) {
   return normalizeSttDevicePreference(value) || STT_DEVICE_CPU
 }
@@ -2271,50 +2277,6 @@ function runtimeSttDeviceOptions(values) {
   return options.length ? [...new Set(options)] : [STT_DEVICE_CPU]
 }
 
-function normalizeSttModelPreference(value) {
-  const lowered = String(value || '').trim().toLowerCase()
-  if (!lowered) {
-    return ''
-  }
-
-  if (lowered === STT_MODEL_TINY || lowered === 'tiny.en') {
-    return STT_MODEL_TINY
-  }
-  if (lowered === STT_MODEL_MIDDLE || lowered === 'base' || lowered === 'base.en') {
-    return STT_MODEL_MIDDLE
-  }
-  if (lowered === STT_MODEL_ADVANCED || lowered === 'small' || lowered === 'small.en') {
-    return STT_MODEL_ADVANCED
-  }
-  if (lowered === STT_MODEL_PRECISE || lowered === 'distil' || lowered === 'distil-large-v3.5'
-    || lowered === 'turbo' || lowered === 'large-v3-turbo') {
-    return STT_MODEL_PRECISE
-  }
-  return ''
-}
-
-function sttModelPreferenceOptions() {
-  return [STT_MODEL_TINY, STT_MODEL_MIDDLE, STT_MODEL_ADVANCED, STT_MODEL_PRECISE]
-}
-
-// The `.en` checkpoints and distil-large-v3.5 only know English: any other
-// language needs the multilingual checkpoint of the same size.
-function sttModelNameForPreference(value, languages = sttPreferences.selectedLanguages) {
-  const english = sttLanguagesAreEnglishOnly(languages)
-  switch (String(value || '').trim().toLowerCase()) {
-    case STT_MODEL_TINY:
-      return english ? 'tiny.en' : 'tiny'
-    case STT_MODEL_MIDDLE:
-      return english ? 'base.en' : 'base'
-    case STT_MODEL_ADVANCED:
-      return english ? 'small.en' : 'small'
-    case STT_MODEL_PRECISE:
-      return english ? 'distil-large-v3.5' : 'large-v3-turbo'
-    default:
-      return ''
-  }
-}
-
 function applySttPromptTemplateToConfig(templateId) {
   if (!runtimeConfig?.stt?.local) {
     return
@@ -2325,25 +2287,6 @@ function applySttPromptTemplateToConfig(templateId) {
   if (speech?.config?.stt?.local) {
     speech.config.stt.local.initialPrompt = initialPrompt
   }
-}
-
-function sttLanguageOptionCodes() {
-  return STT_LANGUAGE_OPTIONS.map((option) => option.code)
-}
-
-// Kept in option order so the saved list and the runtime value stay stable.
-function normalizeSttLanguages(value) {
-  const requested = new Set(
-    (Array.isArray(value) ? value : String(value || '').split(','))
-      .map((code) => String(code || '').trim().toLowerCase())
-      .filter(Boolean)
-  )
-  return sttLanguageOptionCodes().filter((code) => requested.has(code))
-}
-
-function sttLanguagesAreEnglishOnly(languages) {
-  const normalized = normalizeSttLanguages(languages)
-  return !normalized.length || (normalized.length === 1 && normalized[0] === STT_LANGUAGE_EN)
 }
 
 function sttLanguageLabel(code) {
@@ -2388,50 +2331,6 @@ async function setSttLanguageEnabled(code, enabled) {
   await updateSttPreferences({ sttLanguages: next })
 }
 
-function normalizeSpeechEffort(value) {
-  switch (String(value || '').trim().toLowerCase()) {
-    case SPEECH_EFFORT_LOW:
-    case 'fast':
-    case 'faster':
-      return SPEECH_EFFORT_LOW
-    case SPEECH_EFFORT_HIGH:
-    case 'quality':
-      return SPEECH_EFFORT_HIGH
-    case SPEECH_EFFORT_MID:
-    case 'medium':
-    case 'middle':
-    case 'balanced':
-      return SPEECH_EFFORT_MID
-    default:
-      return ''
-  }
-}
-
-function speechEffortForModel(value) {
-  switch (normalizeSttModelPreference(value)) {
-    case STT_MODEL_TINY:
-      return SPEECH_EFFORT_LOW
-    case STT_MODEL_ADVANCED:
-    case STT_MODEL_PRECISE:
-      return SPEECH_EFFORT_HIGH
-    case STT_MODEL_MIDDLE:
-    default:
-      return SPEECH_EFFORT_MID
-  }
-}
-
-function sttModelForSpeechEffort(value) {
-  switch (normalizeSpeechEffort(value)) {
-    case SPEECH_EFFORT_LOW:
-      return sttModelNameForPreference(STT_MODEL_TINY)
-    case SPEECH_EFFORT_HIGH:
-      return sttModelNameForPreference(STT_MODEL_ADVANCED)
-    case SPEECH_EFFORT_MID:
-    default:
-      return sttModelNameForPreference(STT_MODEL_MIDDLE)
-  }
-}
-
 function speechEffortLabel(value) {
   switch (normalizeSpeechEffort(value)) {
     case SPEECH_EFFORT_LOW:
@@ -2446,20 +2345,6 @@ function speechEffortLabel(value) {
 
 function runtimeSttModelPreference(value) {
   return normalizeSttModelPreference(value) || ''
-}
-
-function speechPreferenceRuntimePatch(devicePreference) {
-  const normalized = normalizeSttDevicePreference(devicePreference)
-  if (normalized === STT_DEVICE_GPU) {
-    return {
-      device: 'cuda',
-      computeType: 'float16'
-    }
-  }
-  return {
-    device: 'cpu',
-    computeType: 'int8'
-  }
 }
 
 function applySttRuntimePatchToConfig(runtimePatch = {}) {
@@ -4445,7 +4330,11 @@ async function completeOnboarding(input = {}) {
     selectedLanguages: sttLanguages.length ? sttLanguages : [STT_LANGUAGE_EN],
     selectedPromptContext: sttPromptContext
   }
-  runtimeConfig.stt.local.model = sttModelForSpeechEffort(onboardingState.choices.speechEffort)
+  // Saved with the other speech preferences: otherwise the next start would
+  // bring back whatever model was stored before Quick Start.
+  const storedSpeechPreferences = await readSharedSpeechPreferences().catch(() => ({ sttModel: '' }))
+  const sttModel = onboardingSttModelPreference(onboardingState.choices.speechEffort, storedSpeechPreferences.sttModel)
+  runtimeConfig.stt.local.model = sttModelNameForPreference(sttModel, sttPreferences.selectedLanguages)
   applySttLanguagesToConfig(sttPreferences.selectedLanguages)
   applySttPromptTemplateToConfig(sttPreferences.selectedTemplate || defaultSttPromptTemplate())
   await replaceSpeechProvider(runtimeConfig.stt)
@@ -4469,6 +4358,7 @@ async function completeOnboarding(input = {}) {
     temperature: currentRewriteTemperature
   })
   await writeSharedSpeechPreferences({
+    sttModel,
     sttPromptContext,
     sttLanguages: sttPreferences.selectedLanguages
   })
@@ -4565,7 +4455,7 @@ function sttDeviceMenuLabel(value) {
 
 function sttModelMenuLabel(value) {
   const normalized = String(value || '').trim().toLowerCase()
-  const modelName = sttModelNameForPreference(normalized)
+  const modelName = sttModelNameForPreference(normalized, sttPreferences.selectedLanguages)
   switch (normalized) {
     case STT_MODEL_TINY:
       return `Tiny (${modelName})`
@@ -4583,10 +4473,10 @@ function sttModelMenuLabel(value) {
 function sttModelMenuOptionLabel(value) {
   const normalized = normalizeSttModelPreference(value) || String(value || '').trim().toLowerCase()
   if (normalized === STT_MODEL_TINY) {
-    return `tiny (${sttModelNameForPreference(normalized)}) - fastest, lower detail`
+    return `tiny (${sttModelNameForPreference(normalized, sttPreferences.selectedLanguages)}) - fastest, lower detail`
   }
   if (normalized === STT_MODEL_MIDDLE) {
-    return `middle (${sttModelNameForPreference(normalized)}) - balanced speed and accuracy`
+    return `middle (${sttModelNameForPreference(normalized, sttPreferences.selectedLanguages)}) - balanced speed and accuracy`
   }
   if (normalized === STT_MODEL_PRECISE) {
     return `${sttModelMenuLabel(normalized)} - most accurate, heavier on CPU`
@@ -6087,9 +5977,14 @@ async function updateSttPreferences(input = {}) {
   }
 }
 
+// The local daemon is not running yet here, so the stored device and model go
+// straight into the config its first warmup loads. Switching it through PUT
+// /runtime instead raced a cold load of a large model (Precise) against the
+// request timeout, and a timeout silently left the configured default running.
 async function applySharedSpeechPreferencesOnStartup() {
   const stored = await readSharedSpeechPreferences()
-  if (String(speech?.id || '').trim() === 'local') {
+  const local = String(speech?.id || '').trim() === 'local'
+  if (local) {
     sttPreferences = {
       ...sttPreferences,
       selectedPromptContext: stored.sttPromptContext
@@ -6104,19 +5999,21 @@ async function applySharedSpeechPreferencesOnStartup() {
     }
     applySttLanguagesToConfig(stored.sttLanguages)
   }
-  if ((!stored.sttDevice && !stored.sttModel && !hasStoredLanguages) || typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
-    return
+  if (typeof speech?.supportsRuntimePreferences !== 'function' || !speech.supportsRuntimePreferences()) {
+    return null
   }
 
-  const runtimePatch = stored.sttDevice
-    ? speechPreferenceRuntimePatch(stored.sttDevice)
-    : {}
-  if (stored.sttModel || hasStoredLanguages) {
-    const modelPreference = stored.sttModel
-      || runtimeSttModelPreference(runtimeConfig?.stt?.local?.model)
-      || STT_MODEL_MIDDLE
-    runtimePatch.model = sttModelNameForPreference(modelPreference, stored.sttLanguages)
+  const runtimePatch = startupSttRuntimePatch(stored, runtimeConfig?.stt?.local?.model)
+  if (!Object.keys(runtimePatch).length) {
+    return null
   }
+  if (local) {
+    applySttRuntimePatchToConfig(runtimePatch)
+    void appendDiagnosticsLog('stt-startup-preferences', runtimePatch)
+    return runtimePatch
+  }
+
+  // A remote HTTP service keeps its own runtime, so it has to be asked.
   const currentRuntime = await speech.getSttRuntime().catch(() => null)
   if (currentRuntime?.ok && sttRuntimeMatchesPatch(currentRuntime, runtimePatch)) {
     applySttRuntimePatchToConfig(currentRuntime)
@@ -6125,6 +6022,11 @@ async function applySharedSpeechPreferencesOnStartup() {
   const result = await speech.updateSttRuntime(runtimePatch).catch(() => null)
   if (result?.ok && sttRuntimeMatchesPatch(result, runtimePatch)) {
     applySttRuntimePatchToConfig(result)
+  } else {
+    void appendDiagnosticsLog('stt-startup-preferences-error', {
+      ...runtimePatch,
+      error: String(result?.error || 'requested runtime was not applied')
+    })
   }
   return result
 }
@@ -7808,6 +7710,10 @@ if (!shouldExitEarly) {
     })
     await initWindowsTrayBridge().catch((error) => {
       console.error('[dictray] Windows tray setup failed:', error?.message || error)
+      void appendDiagnosticsLog('windows-tray-error', {
+        stage: 'init',
+        error: String(error?.message || error)
+      })
     })
     await createTray()
     await ensureVoiceWindow()
@@ -7827,8 +7733,13 @@ if (!shouldExitEarly) {
     if (rewriteEnabled) {
       void warmSelectedModel().catch(() => {})
     }
-  }).catch((error) => {
+  }).catch(async (error) => {
+    // A packaged Windows build has no visible console: the log is the only
+    // trace a failed start leaves.
     console.error('[dictray] Failed to start:', error)
+    await appendDiagnosticsLog('startup-error', {
+      error: String(error?.stack || error?.message || error)
+    })
     app.quit()
   })
 }
