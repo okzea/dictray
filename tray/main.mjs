@@ -10,6 +10,13 @@ import { loadConfig, normalizeRewriteProviderId } from '../src/config.mjs'
 import { createCaptureBridge } from '../src/capture-bridge.mjs'
 import { createEarconPlayer } from '../src/earcon-player.mjs'
 import {
+  CONTROL_ERROR_BUSY,
+  CONTROL_ERROR_NOT_READY,
+  createControlService,
+  resolveControlPipePath
+} from '../src/control-protocol.mjs'
+import { startControlServer } from '../src/control-server.mjs'
+import {
   CAPTURE_BACKEND_NATIVE,
   CAPTURE_EVENT_ERROR,
   CAPTURE_EVENT_INPUT_DEVICES,
@@ -349,6 +356,11 @@ let voiceState = {
   error: ''
 }
 let activeTurnContext = null
+// A dictation started over the control pipe (src/control-protocol.mjs): its
+// text goes back to the pipe client instead of being pasted. See
+// startControlCapture().
+let controlCapture = null
+let controlServer = null
 let activeSubmission = null
 let nextSubmissionId = 0
 let sttWarmupInFlight = null
@@ -2777,6 +2789,10 @@ function computeVoiceOverlayBounds(state = voiceState) {
 }
 
 function voiceOverlayVisible(state = voiceState) {
+  // A pipe client that asked for overlay:false draws its own listening UI.
+  if (controlOverlaySuppressed()) {
+    return false
+  }
   return state.phase !== 'idle' || Boolean(state.error || state.note)
 }
 
@@ -2879,6 +2895,9 @@ async function refreshVoiceOverlayFocusedBounds() {
 function syncVoiceInputLevel(level = 0) {
   const normalizedLevel = Math.max(0, Math.min(1, Number(level) || 0))
   gnomePanelInputLevel = normalizedLevel
+  if (controlCapture && !controlCapture.settled) {
+    controlCapture.onLevel?.(normalizedLevel)
+  }
 
   if (gnomeNativeOverlayActive()) {
     scheduleGnomePanelStateSync(GNOME_PANEL_LEVEL_SYNC_MS)
@@ -6577,7 +6596,13 @@ function logDictationTiming(payload) {
   console.log(lines.join('\n'))
 }
 
-async function processAudioSubmission(payload = {}) {
+// `control` is set when the turn belongs to a control pipe client: the text
+// goes through the same STT, normalization and rewrite, then comes back in the
+// result instead of being inserted. No focus wait, clipboard or keystroke.
+async function processAudioSubmission(payload = {}, { control = null } = {}) {
+  const rewriteForSubmission = control && typeof control.refine === 'boolean'
+    ? control.refine
+    : rewriteEnabled
   if (activeSubmission && !activeSubmission.controller.signal.aborted) {
     return {
       ok: false,
@@ -6721,7 +6746,7 @@ async function processAudioSubmission(payload = {}) {
     const windowContext = await contextPromise.catch(() => null)
     throwIfSubmissionCancelled(submission)
     updateVoiceState({
-      phase: rewriteEnabled ? 'rewriting' : (process.platform === 'darwin' ? 'transcribing' : 'inserting'),
+      phase: rewriteForSubmission ? 'rewriting' : (process.platform === 'darwin' ? 'transcribing' : 'inserting'),
       transcript,
       finalText: '',
       targetWindow: formatTargetWindow(windowContext),
@@ -6733,7 +6758,7 @@ async function processAudioSubmission(payload = {}) {
     let rewriteMs = 0
     let note = ''
 
-    if (rewriteEnabled) {
+    if (rewriteForSubmission) {
       const rewriteStartedAt = performance.now()
       try {
         const rewritten = await rewriteTranscript(transcript, windowContext, { signal })
@@ -6752,38 +6777,46 @@ async function processAudioSubmission(payload = {}) {
     }
 
     throwIfSubmissionCancelled(submission)
-    const focusedWindowForInsert = await waitForTargetWindowFocus(windowContext, submission)
-    throwIfSubmissionCancelled(submission)
-    const insertState = {
-      transcript,
-      finalText,
-      targetWindow: formatTargetWindow(windowContext),
-      targetBounds: normalizeOverlayBounds(focusedWindowForInsert?.bounds) || windowContext?.windowBounds || null,
-      targetElementBounds: windowContext?.focusedElement?.bounds || null,
-      note,
-      error: ''
-    }
-    updateVoiceState(process.platform === 'darwin'
-      ? insertState
-      : {
-          phase: 'inserting',
-          ...insertState
-        })
+    let insertResult
+    let insertMs = 0
+    if (control) {
+      // The pipe client inserts the text itself; nothing is pasted, copied
+      // or typed here.
+      insertResult = { ok: true, method: 'control-pipe', timingsMs: null }
+    } else {
+      const focusedWindowForInsert = await waitForTargetWindowFocus(windowContext, submission)
+      throwIfSubmissionCancelled(submission)
+      const insertState = {
+        transcript,
+        finalText,
+        targetWindow: formatTargetWindow(windowContext),
+        targetBounds: normalizeOverlayBounds(focusedWindowForInsert?.bounds) || windowContext?.windowBounds || null,
+        targetElementBounds: windowContext?.focusedElement?.bounds || null,
+        note,
+        error: ''
+      }
+      updateVoiceState(process.platform === 'darwin'
+        ? insertState
+        : {
+            phase: 'inserting',
+            ...insertState
+          })
 
-    // On Wayland, the voice overlay can steal focus from the target window
-    // even with showInactive/setIgnoreMouseEvents. Hide it before pasting so
-    // wtype sends Ctrl+V to the user's app, not the overlay.
-    if (process.platform === 'linux' && voiceWindow && !voiceWindow.isDestroyed() && voiceWindow.isVisible()) {
-      voiceWindow.hide()
-    }
+      // On Wayland, the voice overlay can steal focus from the target window
+      // even with showInactive/setIgnoreMouseEvents. Hide it before pasting so
+      // wtype sends Ctrl+V to the user's app, not the overlay.
+      if (process.platform === 'linux' && voiceWindow && !voiceWindow.isDestroyed() && voiceWindow.isVisible()) {
+        voiceWindow.hide()
+      }
 
-    const insertStartedAt = performance.now()
-    const insertResult = await insertText(finalText, windowContext, {
-      signal,
-      pressEnterAfterInsert: pressEnterAfterInsertForSubmission
-    })
-    throwIfSubmissionCancelled(submission)
-    const insertMs = nowMs(insertStartedAt)
+      const insertStartedAt = performance.now()
+      insertResult = await insertText(finalText, windowContext, {
+        signal,
+        pressEnterAfterInsert: pressEnterAfterInsertForSubmission
+      })
+      throwIfSubmissionCancelled(submission)
+      insertMs = nowMs(insertStartedAt)
+    }
     if (insertResult.note) {
       const insertNote = compactText(String(insertResult.note), 120)
       note = note ? `${note} ${insertNote}` : insertNote
@@ -6807,7 +6840,7 @@ async function processAudioSubmission(payload = {}) {
       error: ''
     })
     await recordOutputHistory(finalText, {
-      improved: rewriteEnabled && finalText !== transcript
+      improved: rewriteForSubmission && finalText !== transcript
     }).catch((error) => {
       console.error(`[dictray] Failed to record output history: ${error?.message || error}`)
     })
@@ -6922,7 +6955,7 @@ async function stopOrCancelActiveDictation() {
 async function startDictationCapture({
   pressEnterAfterInsert: forcePressEnterAfterInsert
 } = {}) {
-  if (voiceState.phase !== 'idle' || activeSubmission) {
+  if (voiceState.phase !== 'idle' || activeSubmission || controlCapture) {
     return
   }
   activePressEnterAfterInsert = Boolean(forcePressEnterAfterInsert ?? pressEnterAfterInsert)
@@ -6932,6 +6965,17 @@ async function startDictationCapture({
     return
   }
 
+  try {
+    await beginCaptureTurn()
+  } catch (error) {
+    showNotification(APP_NAME, compactText(error?.message || error || 'Failed to start recording.', 180))
+  }
+}
+
+// Everything between "start" and an open microphone, shared by the shortcut and
+// the control pipe. Throws if recording could not start, after resetting the
+// voice state and the ducked volume.
+async function beginCaptureTurn() {
   cancelActiveSubmission()
   voiceOverlayFocusedBounds = null
   beginTurnContextCapture({ defer: process.platform === 'darwin' })
@@ -6967,7 +7011,200 @@ async function startDictationCapture({
   } catch (error) {
     clearVoiceState(String(error?.message || error || 'Failed to start recording.'))
     void restoreSystemVolumeAfterPushToTalk().catch(() => {})
-    showNotification(APP_NAME, compactText(error?.message || error || 'Failed to start recording.', 180))
+    throw error
+  }
+}
+
+function controlOverlaySuppressed() {
+  return Boolean(controlCapture && !controlCapture.overlay)
+}
+
+function controlDictationReady() {
+  return Boolean(speech) && (sttReadyForDictation || !speech.config?.enabled)
+}
+
+// The live settings a pipe client mirrors, read from memory on every request
+// so a change in the tray menu shows up on the next one. `mode` is what the
+// shortcut actually does: hold falls back to toggle without release events.
+function controlPipeConfig() {
+  return {
+    hotkey: trayHotkey,
+    mode: shortcutMode === SHORTCUT_MODE_HOLD && shortcutHoldModeAvailable()
+      ? SHORTCUT_MODE_HOLD
+      : SHORTCUT_MODE_TOGGLE,
+    promptHotkey: promptTrayHotkey,
+    ready: controlDictationReady()
+  }
+}
+
+function settleControlCapture(control, outcome) {
+  if (!control || control.settled) {
+    return
+  }
+  control.settled = true
+  control.resolveResult(outcome)
+  // Normally released by the capture backend's final idle event; this is the
+  // backstop so a missing event cannot leave the overlay suppressed for good.
+  control.releaseTimer = setTimeout(() => {
+    releaseControlCapture(control)
+  }, 3000)
+  control.releaseTimer.unref?.()
+}
+
+function releaseControlCapture(control) {
+  if (control?.releaseTimer) {
+    clearTimeout(control.releaseTimer)
+    control.releaseTimer = null
+  }
+  if (!control || controlCapture !== control) {
+    return
+  }
+  settleControlCapture(control, { type: 'error', message: 'Dictation ended.' })
+  clearTimeout(control.releaseTimer)
+  controlCapture = null
+  if (!control.overlay && voiceState.phase === 'idle') {
+    // Drop this turn's leftover note ("No speech detected.", "Dictation was
+    // cancelled.") so the overlay does not pop up once suppression ends.
+    updateVoiceState({ note: '', error: '' })
+  } else {
+    syncVoiceOverlay()
+  }
+}
+
+function controlOutcomeFromSubmission(result) {
+  if (result?.ok) {
+    return { type: 'final', text: String(result.finalText ?? '') }
+  }
+  // Silence is an answer, not a failure: the client gets empty text.
+  if (result?.reason === 'empty_transcript') {
+    return { type: 'final', text: '' }
+  }
+  if (result?.cancelled) {
+    return { type: 'cancelled' }
+  }
+  return { type: 'error', message: String(result?.error || 'Dictation failed.') }
+}
+
+// Starts a dictation for a control pipe client, exactly as the shortcut would
+// (same readiness rule, earcons, ducking, window context and rewrite), except
+// that the text is handed back instead of inserted and, with overlay:false,
+// DicTray's own overlay stays hidden. DicTray shows no notification for it
+// either; every failure goes back to the client.
+async function startControlCapture({ id, overlay = true, refine = null, onLevel = null } = {}) {
+  if (controlCapture || activeSubmission || voiceState.phase !== 'idle') {
+    throw new Error(CONTROL_ERROR_BUSY)
+  }
+  if (!controlDictationReady()) {
+    if (speech && !sttWarmupInFlight) {
+      void scheduleSttWarmup().catch(() => {})
+    }
+    throw new Error(CONTROL_ERROR_NOT_READY)
+  }
+
+  const control = {
+    id,
+    overlay: overlay !== false,
+    refine: typeof refine === 'boolean' ? refine : null,
+    onLevel: typeof onLevel === 'function' ? onLevel : null,
+    settled: false,
+    sawListening: false,
+    submitting: false,
+    cancelRequested: false,
+    cancelling: false,
+    releaseTimer: null,
+    resolveResult: null,
+    result: null
+  }
+  control.result = new Promise((resolve) => {
+    control.resolveResult = resolve
+  })
+  controlCapture = control
+  activePressEnterAfterInsert = false
+
+  try {
+    await beginCaptureTurn()
+  } catch (error) {
+    settleControlCapture(control, { type: 'error', message: String(error?.message || error) })
+    releaseControlCapture(control)
+    throw error
+  }
+
+  return {
+    result: control.result,
+    async stop() {
+      if (control.settled || control.submitting || controlCapture !== control) {
+        return
+      }
+      await stopDictationCapture()
+    },
+    async cancel() {
+      if (control.settled || controlCapture !== control) {
+        return
+      }
+      control.cancelRequested = true
+      control.cancelling = true
+      try {
+        await cancelDictationCapture('Dictation was cancelled.')
+      } finally {
+        control.cancelling = false
+        settleControlCapture(control, { type: 'cancelled' })
+        // Released here rather than on the idle event: cancelDictationCapture
+        // sets its "cancelled" note after that event, and the overlay must
+        // still be suppressed when it does.
+        releaseControlCapture(control)
+      }
+    }
+  }
+}
+
+// Called for every recording-state event from the capture backend.
+function trackControlCaptureRecordingState(phase) {
+  const control = controlCapture
+  if (!control) {
+    return
+  }
+  if (phase === 'listening') {
+    control.sawListening = true
+    return
+  }
+  if (phase !== 'idle' || !control.sawListening) {
+    return
+  }
+  // Recording ended without a submission (too short, or cancelled).
+  if (!control.settled && !control.submitting) {
+    settleControlCapture(control, control.cancelRequested
+      ? { type: 'cancelled' }
+      : { type: 'final', text: '' })
+  }
+  if (control.settled && !activeSubmission && !control.cancelling) {
+    releaseControlCapture(control)
+  }
+}
+
+async function startControlPipe() {
+  if (controlServer) {
+    return
+  }
+  const pipePath = resolveControlPipePath()
+  const logger = (message) => {
+    console.log(`[dictray] control pipe: ${message}`)
+  }
+  const service = createControlService({
+    backend: {
+      getConfig: controlPipeConfig,
+      startListen: startControlCapture
+    },
+    logger
+  })
+  try {
+    controlServer = await startControlServer({ service, pipePath, logger })
+    console.log(`[dictray] Control pipe listening on ${controlServer.path}`)
+  } catch (error) {
+    console.error(`[dictray] Control pipe unavailable: ${error?.message || error}`)
+    void appendDiagnosticsLog('control-pipe-error', {
+      pipe: pipePath,
+      error: String(error?.message || error)
+    })
   }
 }
 
@@ -7203,18 +7440,35 @@ async function registerHotkey() {
 }
 
 async function handleCaptureSubmitAudio(payload = {}) {
+  // Whoever started the recording owns its audio, however it was stopped.
+  const control = controlCapture && !controlCapture.settled ? controlCapture : null
+  if (control) {
+    control.submitting = true
+  }
   try {
-    const result = await processAudioSubmission(payload)
+    const result = await processAudioSubmission(payload, { control })
+    if (control) {
+      settleControlCapture(control, controlOutcomeFromSubmission(result))
+    }
     if (result?.cancelled && result?.earcon === 'cancel') {
       maybePlayCaptureEarcon('cancel')
     }
     return result
   } catch (error) {
     if (isAbortError(error)) {
+      settleControlCapture(control, { type: 'cancelled' })
       return {
         ok: false,
         cancelled: true,
         error: String(error?.message || 'Dictation was cancelled.')
+      }
+    }
+    if (control) {
+      settleControlCapture(control, { type: 'error', message: String(error?.message || error) })
+      clearVoiceState('')
+      return {
+        ok: false,
+        error: String(error?.message || error)
       }
     }
     clearVoiceState(String(error?.message || error))
@@ -7246,6 +7500,7 @@ async function handleCaptureBackendEvent(message = {}) {
         error: '',
         note: voiceState.note
       })
+      trackControlCaptureRecordingState(nextPhase)
       return
     }
     case CAPTURE_EVENT_INPUT_LEVEL:
@@ -7272,6 +7527,16 @@ async function handleCaptureBackendEvent(message = {}) {
     }
     case CAPTURE_EVENT_ERROR:
       captureRecordingPhase = 'idle'
+      if (controlCapture) {
+        // The pipe client reports it; no DicTray notification or overlay.
+        settleControlCapture(controlCapture, {
+          type: 'error',
+          message: String(payload?.message || 'Unknown dictation error')
+        })
+        clearVoiceState('')
+        void restoreSystemVolumeAfterPushToTalk().catch(() => {})
+        return
+      }
       clearVoiceState(String(payload?.message || 'Unknown dictation error'))
       void restoreSystemVolumeAfterPushToTalk().catch(() => {})
       showNotification(APP_NAME, compactText(payload?.message || 'Unknown dictation error', 180))
@@ -7652,6 +7917,11 @@ async function performQuitCleanup() {
   globalShortcut.unregisterAll()
 
   quitCleanupPromise = (async () => {
+    const server = controlServer
+    controlServer = null
+    await server?.close?.().catch((error) => {
+      console.error('[dictray] Failed to close the control pipe during quit:', error?.message || error)
+    })
     await captureBridge?.dispose?.().catch((error) => {
       console.error('[dictray] Failed to dispose capture bridge during quit:', error?.message || error)
     })
@@ -7718,6 +7988,7 @@ if (!shouldExitEarly) {
     await createTray()
     await ensureVoiceWindow()
     await maybeShowOnboarding()
+    await startControlPipe()
     await scheduleSttWarmup({ notifyReady: true }).catch(() => null)
     await refreshRuntimeState(false)
     await registerHotkey()

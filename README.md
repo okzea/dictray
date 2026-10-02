@@ -179,6 +179,134 @@ Compatibility note:
 
 The config filename, state filenames, and `DICTATION_TRAY_*` env vars still use `dictation-tray` for backward compatibility.
 
+## Control pipe & CLI
+
+Another local app can drive a dictation and get the text back instead of having
+it pasted. This exists for apps DicTray cannot reach: an elevated window (such as
+Superview, which runs elevated) blocks DicTray's keyboard hook and its paste,
+because a normal-integrity process cannot hook or inject into it. Such an app
+mirrors DicTray's shortcut itself, asks DicTray to listen, and shows its own
+listening UI.
+
+### Endpoint
+
+- Windows: named pipe `\\.\pipe\dictray-control-<username>`, username in lower
+  case (`%USERNAME%`).
+- Linux/macOS: Unix socket `$XDG_RUNTIME_DIR/dictray-control.sock` (mode `0600`),
+  or `<tmpdir>/dictray-control-<uid>.sock` without `XDG_RUNTIME_DIR`.
+- `DICTRAY_CONTROL_PIPE` replaces the whole name or path, e.g. to run a dev
+  instance beside the installed one. The tray and `dictray-ctl` both honour it.
+
+On Windows the pipe is owned by a small helper, `scripts/windows-control-pipe`
+(built by `pnpm build:helpers` and packaged with the others), because Node cannot
+set a named pipe's security descriptor. The helper gives the pipe an explicit,
+protected DACL: full access for the current user's SID, nothing else, plus a deny
+entry for `NETWORK` so remote clients are refused. Elevated processes of the same
+user carry the same SID and connect normally. If the helper has not been built
+the tray logs `Control pipe unavailable` and runs without it.
+
+### Messages
+
+UTF-8 JSON, one object per line (`\n`). One request per connection: the client
+writes one line, the server answers with one or more lines and closes the
+connection. A connection that sends no complete line within 10 s gets
+`{"ok":false,"error":"request timeout"}`. Lines are limited to 64 KiB.
+
+**`config`**, DicTray's live settings (read from memory on every request, so a
+change in the tray menu shows up on the next one):
+
+```text
+→ {"cmd":"config"}
+← {"ok":true,"version":1,"hotkey":"CommandOrControl+Space","mode":"hold","promptHotkey":"Alt+Shift+Space","ready":true}
+```
+
+- `hotkey`, `promptHotkey`: accelerator strings as shown in the tray menu.
+- `mode`: `hold` (record while the shortcut is held) or `toggle` (press to start,
+  press again to stop). This is what the shortcut actually does: `hold` falls
+  back to `toggle` when the shortcut helper cannot report key releases.
+- `ready`: the speech engine is loaded and a `listen` would start.
+
+**`listen`**, start a capture now, as the shortcut would, with the text returned
+on this connection:
+
+```text
+→ {"cmd":"listen","overlay":false,"partials":true,"levels":true,"refine":true}
+← {"event":"started","id":"0b0f5f9e-…"}
+← {"event":"level","value":0.31}
+← …
+← {"event":"final","text":"Hello world."}
+```
+
+Options, all optional booleans:
+
+- `overlay` (default `true`): `false` keeps DicTray's own voice overlay hidden for
+  the whole turn, including the closing "No speech detected" or "cancelled" note.
+- `levels` (default `true`): stream `{"event":"level","value":0..1}` microphone
+  levels while recording, about 11 per second on Windows.
+- `partials` (default `true`): stream `{"event":"partial","text":"…"}` interim text.
+  The faster-whisper engine transcribes once the recording ends, so no partials
+  are sent today; clients must not depend on them.
+- `refine` (default: DicTray's current Text Improvement setting): `true` or
+  `false` forces the rewrite step on or off for this turn. `true` has no effect
+  when no rewrite provider is configured.
+
+The stream ends with exactly one of these, then the server closes:
+
+- `{"event":"final","text":"…"}`: exactly the text a dictation would have
+  inserted (same normalization and rewrite). Empty when no speech was detected.
+- `{"event":"cancelled"}`
+- `{"event":"error","message":"…"}`: `busy` when DicTray is already dictating
+  (its own shortcut or another listen), `not ready` while the speech engine is
+  still loading (DicTray starts loading it), or a capture or transcription error.
+
+A pipe-driven capture never pastes, never touches the clipboard and never sends
+keystrokes, and DicTray shows no notification for it; failures go to the client.
+It otherwise behaves like a shortcut capture: start and end earcons, volume
+ducking, nearby ducking, the output history and the time-saved counter.
+
+The capture ends when:
+
+- a `stop` request names its id: the audio is transcribed and `final` follows;
+- a `cancel` request names its id, or the client disconnects: `cancelled` (not
+  sent when the client is gone);
+- DicTray's own shortcut or tray click stops it: `final`, as with `stop`;
+- it has run for 5 minutes: stopped, `final` follows.
+
+Do not half-close the connection after writing the request; that reads as a
+disconnect and cancels the capture.
+
+**`stop`** / **`cancel`**, on a second connection:
+
+```text
+→ {"cmd":"stop","id":"0b0f5f9e-…"}
+← {"ok":true}
+```
+
+```text
+→ {"cmd":"cancel","id":"0b0f5f9e-…"}
+← {"ok":true}
+```
+
+**Errors.** A request that is not valid JSON, has an unknown `cmd`, a non-boolean
+option, or names an unknown or finished id gets `{"ok":false,"error":"…"}` and
+the connection closes.
+
+### CLI
+
+`scripts/dictray-ctl.mjs` (`pnpm ctl`, or the `dictray-ctl` bin) speaks the same
+protocol, for testing and scripting:
+
+```bash
+pnpm ctl config                 # prints the config JSON
+pnpm ctl listen                 # prints events as JSON lines; Enter stops, Ctrl+C cancels
+pnpm ctl listen --no-partials --no-levels --overlay --refine
+pnpm ctl stop <id>
+pnpm ctl cancel <id>
+```
+
+Exit status: `0` after `final` or `ok:true`, `130` after `cancelled`, `1` on
+errors.
+
 ## Platform Notes
 
 - While push-to-talk is actively recording, output volume can be ducked and then restored to the exact prior level when capture stops.

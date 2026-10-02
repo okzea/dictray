@@ -43,6 +43,11 @@ const helperProjects = [
     name: 'windows-onboarding',
     projectPath: path.join(rootDir, 'scripts', 'windows-onboarding', 'WindowsOnboarding.csproj'),
     exeName: 'WindowsOnboarding.exe'
+  },
+  {
+    name: 'windows-control-pipe',
+    projectPath: path.join(rootDir, 'scripts', 'windows-control-pipe', 'WindowsControlPipe.csproj'),
+    exeName: 'WindowsControlPipe.exe'
   }
 ]
 
