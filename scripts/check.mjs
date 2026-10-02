@@ -72,6 +72,8 @@ async function main() {
   }
   log(`Checked ${scripts.length} JavaScript files.`)
 
+  await run(process.execPath, [path.join(rootDir, 'scripts', 'check-stt-preferences.mjs')])
+
   if (process.platform === 'darwin' && hasCommand('swiftc')) {
     await run('swiftc', ['-typecheck', path.join(rootDir, 'scripts', 'macos-hotkey-hook.swift')])
     await run('swiftc', ['-typecheck', path.join(rootDir, 'scripts', 'macos-menu-bar.swift')])
