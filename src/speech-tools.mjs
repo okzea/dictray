@@ -8,6 +8,12 @@ import readline from 'node:readline'
 import { promisify } from 'node:util'
 
 const execFileAsync = promisify(execFile)
+// Switching or warming the model loads it, and a cold load of a large model
+// (Precise on GPU, or a first download into the Hugging Face cache) outlasts
+// the request timeout. An abort only stops the client waiting: the daemon
+// finishes loading anyway, so a short limit reported a failure for a switch
+// that then took effect.
+const STT_MODEL_LOAD_TIMEOUT_MS = 10 * 60 * 1000
 
 function nowMs(started) {
   return Math.round(performance.now() - started)
@@ -935,7 +941,7 @@ export class SpeechTools {
             computeType: String(stt.computeType || '').trim() || 'auto',
             language: String(stt.language || '').trim(),
             initialPrompt: String(stt.initialPrompt || '').trim()
-          }, 120000)
+          }, STT_MODEL_LOAD_TIMEOUT_MS)
           if (!payload?.ok) {
             return {
               ok: false,
@@ -1246,7 +1252,7 @@ export class SpeechTools {
           },
           body: JSON.stringify(payload)
         },
-        endpoint.timeoutMs
+        Math.max(Number(endpoint.timeoutMs) || 0, STT_MODEL_LOAD_TIMEOUT_MS)
       )
       if (!result.ok) {
         throw new Error(result.payload?.detail || result.payload?.error || `STT runtime update failed with ${result.status}`)
