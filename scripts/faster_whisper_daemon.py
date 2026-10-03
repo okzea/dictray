@@ -87,6 +87,7 @@ else:
 
 MODEL_CACHE = {}
 ACTIVE_RUNTIME = None
+CUDA_RUNTIME_UNAVAILABLE = False
 STATE_LOCK = threading.Lock()
 TRANSCRIBE_LOCK = threading.Lock()
 FFMPEG_BIN = os.getenv("STT_FFMPEG_BIN", "ffmpeg")
@@ -131,12 +132,21 @@ def cuda_device_count() -> int:
         return 0
 
 
+def mark_cuda_runtime_unavailable() -> None:
+    # A CUDA device can be present while its runtime libraries (cuBLAS, cuDNN)
+    # are not. Once that has failed, "auto" must stay on the CPU: retrying CUDA
+    # in the same process hangs inside model.transcribe() instead of raising,
+    # which wedges TRANSCRIBE_LOCK and every request after it.
+    global CUDA_RUNTIME_UNAVAILABLE
+    CUDA_RUNTIME_UNAVAILABLE = True
+
+
 def normalize_device(value: str) -> str:
     requested = (value or "auto").strip().lower()
     if requested == "gpu":
         requested = "cuda"
     if requested == "auto":
-        return "cuda" if cuda_device_count() > 0 else "cpu"
+        return "cuda" if cuda_device_count() > 0 and not CUDA_RUNTIME_UNAVAILABLE else "cpu"
     if requested not in {"cpu", "cuda"}:
         raise ValueError("device must be one of: auto, cpu, cuda")
     if requested == "cuda" and cuda_device_count() <= 0:
@@ -408,6 +418,7 @@ def load_model(model_name: str, model_dir: str, requested_device: str, requested
         except Exception as error:  # pragma: no cover - native runtime surface
             last_error = error
             if fallback_allowed and attempt_device != "cpu" and cuda_runtime_unavailable(error_text(error)):
+                mark_cuda_runtime_unavailable()
                 continue
             raise
 
@@ -519,6 +530,7 @@ def transcribe_with_runtime(model_name: str, model_dir: str, requested_device: s
         return runtime, transcript, detected_language
     except Exception as error:
         if fallback_allowed and runtime.get("device") != "cpu" and cuda_runtime_unavailable(error_text(error)):
+            mark_cuda_runtime_unavailable()
             discard_runtime(runtime)
             fallback_model, fallback_runtime = load_model(model_name, model_dir, "cpu", "int8")
             transcript, detected_language = perform_transcribe(fallback_model, input_path, initial_prompt, language)
